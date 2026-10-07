@@ -2,12 +2,15 @@ import itertools
 import logging
 
 from miles.rollout.filter_hub.snr_filter import group_reward_variance, snr_aware_filter, variance_metrics
+from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
 
 def postprocess_rollout_data(args, data, train_parallel_config):
     metadata = {}
+
+    validate_compact_rollout_ids(data)
 
     variances = [group_reward_variance(args, group) for group in data]
     metrics = variance_metrics(variances)
@@ -20,7 +23,11 @@ def postprocess_rollout_data(args, data, train_parallel_config):
     while isinstance(data[0], list):
         data = list(itertools.chain.from_iterable(data))
 
-    if not args.disable_rollout_trim_samples:
+    # Compact rollouts must not be trimmed by sample count; the schedule drops
+    # whole trailing rollouts instead.
+    is_compact = any(s.rollout_id is not None for s in data)
+
+    if not args.disable_rollout_trim_samples and not is_compact:
         global_batch_size = args.global_batch_size
         if args.use_dynamic_global_batch_size:
             logger.info(f"Collected {len(data)} samples from rollout to train with dynamic global batch size")
@@ -40,6 +47,37 @@ def postprocess_rollout_data(args, data, train_parallel_config):
         logger.info(f"Final collected {len(data)} samples from rollout to train")
 
     return data, metadata
+
+
+def validate_compact_rollout_ids(node, depth=0):
+    """Require compact leaves (``list[Sample]`` at depth >= 2, >1 sibling) to
+    share a non-None ``rollout_id``; default rollout shapes skip validation."""
+    if isinstance(node, Sample):
+        return
+    assert isinstance(node, list), f"unexpected rollout output node type: {type(node).__name__}"
+    if node and isinstance(node[0], Sample):
+        if depth >= 2 and len(node) > 1:
+            rids = [s.rollout_id for s in node]
+            missing = [i for i, r in enumerate(rids) if r is None]
+            assert not missing, (
+                f"Compact rollout returned {len(node)} samples but rollout_id is unset on "
+                f"positions {missing}. Set Sample.rollout_id on every sibling so the loss "
+                "reducer can aggregate them as one rollout instead of N."
+            )
+            assert len(set(rids)) == 1, f"Sibling samples from one compact rollout must share rollout_id; got {rids}."
+        return
+    for item in node:
+        validate_compact_rollout_ids(item, depth + 1)
+
+
+def _first_sample(group):
+    return _first_sample(group[0]) if isinstance(group[0], list) else group[0]
+
+
+def _nested_sample_count(group) -> int:
+    if not isinstance(group, list):
+        return 1
+    return sum(_nested_sample_count(item) for item in group)
 
 
 def _compute_dynamic_global_batch_size(args, train_parallel_config, num_samples: int) -> int:

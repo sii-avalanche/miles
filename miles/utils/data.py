@@ -5,9 +5,18 @@ import logging
 import os
 import random
 import re
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
-import ray
+
+from miles.ray.rollout.train_data_conversion import split_train_data_by_dp_raw
+from miles.utils import object_store
+from miles.utils.pydantic_utils import StrictBaseModel
+from .audit_utils.witness.allocator import WitnessInfo
+
+if TYPE_CHECKING:
+    from miles.backends.training_utils.types import TrainStepOutput
 
 try:
     import pyarrow.parquet as pq
@@ -15,10 +24,7 @@ except ImportError:
     pq = None
 
 from miles.utils import chat_template_utils
-from miles.utils.processing_utils import call_processor
 from miles.utils.types import MultimodalTypes, Sample
-
-from .timer import Timer
 
 __all__ = ["Dataset"]
 
@@ -301,15 +307,52 @@ def get_minimum_num_micro_batch_size(total_lengths, max_tokens_per_gpu):
     return len(batches)
 
 
-def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
-    assert len(rollout_data_ref) == dp_size
-    rollout_data = ray.get(rollout_data_ref[dp_rank].inner)
+def process_rollout_data(
+    args,
+    rollout_data_ref,
+    dp_rank,
+    dp_size,
+    witness_info: WitnessInfo | None,
+) -> tuple[dict, object_store.ObjectStoreGetResult]:
+    from miles.ray.rollout.train_data_conversion import process_rollout_data_shard
 
-    partition = rollout_data.pop("partition")
-    total_lengths = rollout_data["total_lengths"]
+    store = object_store.get_instance()
 
-    # save the seqlen of the whole rollout batch
-    Timer().seq_lens = total_lengths
-    rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
+    if args.delay_split_train_data_by_dp:
+        get_result = store.get(rollout_data_ref)
+        raw = get_result.value
+        if (x := witness_info) is not None:
+            raw = {**raw, "seq_witness_ids": x.witness_ids}
+        raw = split_train_data_by_dp_raw(args, raw, dp_size=dp_size)
+        rollout_data = raw[dp_rank]
+    else:
+        assert len(rollout_data_ref) == dp_size
+        assert witness_info is None
+        get_result = store.get(rollout_data_ref[dp_rank])
+        rollout_data = dict(get_result.value)
 
-    return rollout_data
+    return process_rollout_data_shard(args, rollout_data), get_result
+
+
+class RolloutDataPack(StrictBaseModel):
+    sample_indices: list[int] | None = None
+    data_ref: object_store.StoreObjectRef | list[object_store.StoreObjectRef] | None = None
+
+    @property
+    def data_refs(self) -> list[object_store.StoreObjectRef]:
+        if (ref := self.data_ref) is None:
+            return []
+        return ref if isinstance(ref, list) else [ref]
+
+
+def remove_rollout_data_refs(args, rollout_data_pack: RolloutDataPack) -> None:
+    store = object_store.get_instance()
+    for ref in rollout_data_pack.data_refs:
+        store.remove(ref)
+
+
+def remove_train_output_refs(train_outputs: Sequence["TrainStepOutput"]) -> None:
+    store = object_store.get_instance()
+    for train_output in train_outputs:
+        if (ref := train_output.values) is not None:
+            store.remove(ref)

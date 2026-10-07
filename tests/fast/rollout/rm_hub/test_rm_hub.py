@@ -21,6 +21,12 @@ class TestAsyncRm:
         "rm_type,response,label,expected",
         [
             ("math", r"\boxed{42}", "42", 1),
+            (
+                "math",
+                r"<|open|>think<|sep|>work<|close|>think<|open|>response<|sep|>Answer: \boxed{42}<|close|>response",
+                "42",
+                1,
+            ),
             ("math", r"\boxed{wrong}", "42", 0),
             ("f1", "hello world", "hello world", 1.0),
             ("dapo", "Answer: 42", "42", {"score": 1.0}),
@@ -50,6 +56,31 @@ class TestAsyncRm:
         sample = Sample(prompt="", response="anything", label="anything")
         reward = run(async_rm(mock_args, sample))
         assert reward in [0, 1]
+
+    def test_deterministic_random_rm_returns_binary(self, mock_args):
+        mock_args.rm_type = "deterministic_random"
+        sample = Sample(prompt="", response="hello", label="", tokens=[1, 2, 3])
+        reward = run(async_rm(mock_args, sample))
+        assert reward in [0, 1]
+
+    def test_deterministic_random_rm_is_deterministic(self, mock_args):
+        mock_args.rm_type = "deterministic_random"
+        sample = Sample(prompt="", response="hello world", label="", tokens=[10, 20])
+        rewards = [run(async_rm(mock_args, sample)) for _ in range(5)]
+        assert len(set(rewards)) == 1
+
+    def test_deterministic_random_rm_differs_by_response(self, mock_args):
+        mock_args.rm_type = "deterministic_random"
+        samples = [Sample(prompt="", response=f"response_{i}", label="", tokens=[1, 2, 3]) for i in range(20)]
+        rewards = [run(async_rm(mock_args, s)) for s in samples]
+        assert 0 in rewards and 1 in rewards
+
+    def test_deterministic_random_rm_differs_by_tokens(self, mock_args):
+        """Same response with different tokens yields both reward values across many samples."""
+        mock_args.rm_type = "deterministic_random"
+        samples = [Sample(prompt="", response="same", label="", tokens=[i, i + 1, i + 2]) for i in range(20)]
+        rewards = [run(async_rm(mock_args, s)) for s in samples]
+        assert 0 in rewards and 1 in rewards
 
     def test_rm_type_from_metadata(self, mock_args):
         mock_args.rm_type = None

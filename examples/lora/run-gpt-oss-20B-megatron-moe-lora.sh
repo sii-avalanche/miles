@@ -10,14 +10,14 @@ pkill -9 python
 set -ex
 
 # will prevent ray from buffering stdout/stderr
-export PYTHONBUFFERED=16
+export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 GPUS_PER_NODE=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 
 # Load model architecture config
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/../../scripts/models/gpt-oss-20b.sh"
-
+MODEL_ARGS_LINE="$(python3 "${SCRIPT_DIR}/../../miles/utils/external_utils/model_args_utils.py" "gpt-oss-20b")" || exit 1
+read -ra MODEL_ARGS <<< "${MODEL_ARGS_LINE}"
 CKPT_ARGS=(
    --hf-checkpoint /root/models/gpt-oss-20b
    --megatron-to-hf-mode bridge
@@ -29,7 +29,7 @@ LORA_ARGS=(
    --lora-rank 32                    # LoRA rank (typical values: 8, 16, 32, 64)
    --lora-alpha 32                   # LoRA alpha (usually 2x rank)
    --lora-dropout 0.0                # LoRA dropout (0.0 for RL training)
-   --target-modules "gate_proj,up_proj,down_proj"
+   --target-modules "gate_up_proj,down_proj"
    --sglang-lora-backend triton      # !!! must for moe-lora !!!, else display "Current LoRA backend does not support LoRA on MoE layers; skipping MoE layer"
 )
 

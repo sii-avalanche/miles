@@ -2,11 +2,9 @@
 title: Monitoring & Logging
 description: wandb, structured logs, profiling, and what to look at when something looks off.
 ---
-
-# Monitoring & Logging
-
 Miles emits per-rollout metrics to stdout and (optionally) Weights & Biases. SGLang and
 Ray write their own logs to their default directories.
+
 
 ## What gets logged by default
 
@@ -20,7 +18,7 @@ fields depend on backend and config):
 ```
 
 When `--use-wandb` is set, metrics also go to wandb under the `train/`, `rollout/`,
-and `perf/` namespaces (see `miles/utils/wandb_utils.py`).
+and `perf/` namespaces (see `miles/utils/tracking_utils/wandb_utils.py`).
 
 ## Enabling wandb
 
@@ -115,6 +113,3 @@ The router exposes a small FastAPI surface used internally by Miles:
 | `/add_worker` | POST | Register an SGLang engine |
 | `/list_workers` | GET | List registered workers |
 | any other path | GET / POST / PUT / DELETE | Proxied to a selected SGLang worker — e.g. `/generate`, `/v1/chat/completions`, `/health`. |
-
-Middleware plugins (e.g. radix-tree caching) can mount additional routes — see
-`miles/router/middleware_hub/`.

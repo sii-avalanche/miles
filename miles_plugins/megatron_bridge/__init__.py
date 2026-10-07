@@ -30,6 +30,7 @@ def _install_bridge_pp_group_unwrap() -> None:
     wrapper is not in ``pg_group_ranks`` so ``get_group_rank`` raises
     ``"Group ... is not registered"``. Temporarily swap in the inner group for
     the duration of the broadcast.
+    Extra arguments such as Bridge's ``cache_key`` are forwarded untouched.
     """
     from megatron.bridge.models.conversion.param_mapping import MegatronParamMapping
 
@@ -40,13 +41,13 @@ def _install_bridge_pp_group_unwrap() -> None:
 
     _orig = MegatronParamMapping.broadcast_obj_from_pp_rank
 
-    def broadcast_obj_from_pp_rank(self, obj, name=None):
+    def broadcast_obj_from_pp_rank(self, obj, *args, **kwargs):
         if not isinstance(self.pp_group, ReloadableProcessGroup):
-            return _orig(self, obj, name)
+            return _orig(self, obj, *args, **kwargs)
         saved = self.pp_group
         self.pp_group = saved.group
         try:
-            return _orig(self, obj, name)
+            return _orig(self, obj, *args, **kwargs)
         finally:
             self.pp_group = saved
 
@@ -60,6 +61,14 @@ except Exception as _e:  # best-effort
     logger.warning("miles bridge shim _install_bridge_pp_group_unwrap not applied: %s", _e)
 
 
+try:
+    from miles_plugins.models.qwen3_vl import install_qwen3_vl_packed_mrope_patch
+
+    install_qwen3_vl_packed_mrope_patch()
+except Exception as _e:  # best-effort; Qwen3-VL may be unavailable in some envs
+    logger.warning("miles Qwen3-VL THD packed mRoPE patch not applied: %s", _e)
+
+
 # Model-specific bridge subclasses. Each submodule self-installs on import.
 # Keep imports here so merely importing ``miles_plugins.megatron_bridge`` is
 # enough to pick up every miles bridge (mirrors ``miles_plugins.mbridge``).
@@ -67,3 +76,8 @@ try:
     from . import nemotron_h  # noqa: F401
 except Exception as _e:  # pragma: no cover - defensive
     logger.warning("miles nemotron_h plugin failed to load: %s", _e)
+
+try:
+    from . import mimo_v2  # noqa: F401
+except Exception as _e:  # pragma: no cover - defensive
+    logger.warning("miles mimo_v2 plugin failed to load: %s", _e)

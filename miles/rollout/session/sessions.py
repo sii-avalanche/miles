@@ -1,249 +1,247 @@
+"""Single-process FastAPI adapter for the session server.
+
+Thin layer: converts each HTTP request to primitive inputs, calls
+``SessionCore``. All session/TITO logic lives in ``core``.
+"""
+
 import json
 import logging
-import time
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionResponse
+from sglang.srt.parser.template_detection import detect_inline_system_support
 from starlette.responses import Response
 
-from miles.rollout.session.linear_trajectory import SessionRegistry
-from miles.rollout.session.session_errors import (
-    SessionError,
-    SessionNotFoundError,
-    TokenizationError,
-    UpstreamResponseError,
+try:
+    from sglang.srt.entrypoints.anthropic import utils as anthropic_utils
+    from sglang.srt.entrypoints.anthropic.serving import convert_response, convert_to_chat_completion_request
+except ImportError:
+    anthropic_utils = None
+    convert_response = None
+    convert_to_chat_completion_request = None
+
+from miles.rollout.session.anthropic_adapter import (
+    _ANTHROPIC_ERROR_HEADER_ALLOWLIST as _ANTHROPIC_ERROR_HEADER_ALLOWLIST,
 )
-from miles.rollout.session.session_types import GetSessionResponse, SessionRecord
+from miles.rollout.session.anthropic_adapter import (
+    _ANTHROPIC_ERROR_HEADER_PREFIXES as _ANTHROPIC_ERROR_HEADER_PREFIXES,
+)
+from miles.rollout.session.anthropic_adapter import (
+    _anthropic_error_response,
+    _anthropic_sse_body,
+    _anthropic_wire_json,
+    _parse_anthropic_request,
+    _restore_anthropic_reasoning_history,
+    _strip_anthropic_reasoning_history,
+)
+from miles.rollout.session.anthropic_adapter import (
+    _validate_anthropic_content_block as _validate_anthropic_content_block,
+)
+from miles.rollout.session.anthropic_adapter import _validate_anthropic_features, anthropic_adapter_available
+from miles.rollout.session.config import SessionServerConfig
+from miles.rollout.session.core import JSON_MEDIA_TYPE, SessionCore, _render_json
+from miles.rollout.session.errors import SessionError
+from miles.rollout.session.linear_trajectory import SessionRegistry
+from miles.rollout.session.types import CreateSessionRequest
 from miles.utils.chat_template_utils import get_tito_tokenizer
+from miles.utils.chat_template_utils.message_matcher_hub import (
+    SessionMessageMatcherError,
+    resolve_session_message_matcher,
+)
 from miles.utils.processing_utils import load_tokenizer
 
 logger = logging.getLogger(__name__)
 
 
-def setup_session_routes(app, backend, args):
-    hf_checkpoint = getattr(args, "hf_checkpoint", None)
-    if not hf_checkpoint:
+def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addition_r3: bool = False):
+    if not config.hf_checkpoint:
         logger.info("[session] Skipping session routes (hf_checkpoint not set).")
         return
 
-    session_server_instance_id = getattr(args, "session_server_instance_id", None)
+    message_matcher_selector = config.session_message_matcher
+    message_matcher = resolve_session_message_matcher(message_matcher_selector)
+    logger.info("[session] Using message matcher selector=%r callable=%r", message_matcher_selector, message_matcher)
 
     tokenizer = load_tokenizer(
-        hf_checkpoint, chat_template_path=getattr(args, "chat_template_path", None), trust_remote_code=True
+        config.hf_checkpoint, chat_template_path=config.chat_template_path, trust_remote_code=True
     )
 
     tito_tokenizer = get_tito_tokenizer(
         tokenizer,
-        tokenizer_type=getattr(args, "tito_model", "default"),
-        chat_template_kwargs=getattr(args, "apply_chat_template_kwargs", None),
-        allowed_append_roles=getattr(args, "tito_allowed_append_roles", None),
+        tokenizer_type=config.tito_model,
+        chat_template_kwargs=config.apply_chat_template_kwargs,
     )
+    merge_inline_system = not detect_inline_system_support(getattr(tokenizer, "chat_template", None))
 
-    registry = SessionRegistry(args, tokenizer, tito_tokenizer=tito_tokenizer)
+    use_v2 = config.use_session_server == "v2"
+    if use_v2:
+        from miles.rollout.session.v2.core import SessionCoreV2
+        from miles.rollout.session.v2.session_state import SessionRegistryV2
 
-    @app.get("/health")
-    async def health():
-        body = {"status": "ok"}
-        if session_server_instance_id is not None:
-            body["session_server_instance_id"] = session_server_instance_id
-        return body
-
-    # --- DEBUG: track in-flight chat_completions ---
-    _inflight_chat = {"count": 0}
-
-    @app.middleware("http")
-    async def debug_request_logger(request: Request, call_next):
-        client = request.client
-        client_info = f"{client.host}:{client.port}" if client else "unknown"
-        logger.info(
-            f"[session-server] REQUEST ARRIVED: {request.method} {request.url.path} from={client_info} inflight_chat={_inflight_chat['count']}"
-        )
-        t0 = time.time()
-        response = await call_next(request)
-        elapsed = time.time() - t0
-        logger.info(
-            f"[session-server] REQUEST DONE: {request.method} {request.url.path} status={response.status_code} elapsed={elapsed:.3f}s from={client_info}"
-        )
-        return response
+        registry = SessionRegistryV2(tokenizer, tito_tokenizer=tito_tokenizer, message_matcher=message_matcher)
+        core = SessionCoreV2(backend, registry, config, config.instance_id, use_addition_r3=use_addition_r3)
+    else:
+        registry = SessionRegistry(tokenizer, tito_tokenizer=tito_tokenizer, message_matcher=message_matcher)
+        core = SessionCore(backend, registry, config, config.instance_id, use_addition_r3=use_addition_r3)
 
     @app.exception_handler(SessionError)
     async def session_error_handler(request: Request, exc: SessionError):
         return JSONResponse(status_code=exc.status_code, content={"error": str(exc)})
 
+    @app.exception_handler(SessionMessageMatcherError)
+    async def session_message_matcher_error_handler(request: Request, exc: SessionMessageMatcherError):
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+    @app.get("/health")
+    async def health():
+        response = await core.health()
+        body = json.loads(response.body)
+        body["anthropic_intermediate_system_supported"] = not merge_inline_system
+        return Response(content=_render_json(body), status_code=response.status_code, media_type=JSON_MEDIA_TYPE)
+
     @app.post("/sessions")
-    async def create_session():
-        session_id = registry.create_session()
-        return {"session_id": session_id}
+    async def create_session(request: Request):
+        try:
+            params = CreateSessionRequest.model_validate_json(await request.body() or b"{}")
+        except ValidationError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        return await core.create_session(
+            evaluation=params.evaluation,
+            sampling_defaults=params.model_dump(exclude={"evaluation"}, exclude_none=True),
+        )
 
     @app.get("/sessions/{session_id}")
     async def get_session(session_id: str):
-        session = registry.get_session(session_id)
-        metadata = {}
-        try:
-            mismatch = registry.compute_session_mismatch(session)
-        except TokenizationError:
-            logger.exception("Failed to compute tito_session_mismatch for session %s", session_id)
-            mismatch = None
-        if mismatch is not None:
-            metadata["tito_session_mismatch"] = mismatch
-        metadata["accumulated_token_ids"] = session.token_ids
-        metadata["max_trim_tokens"] = registry.tito_tokenizer.max_trim_tokens
-        return GetSessionResponse(
-            session_id=session_id,
-            records=session.records,
-            metadata=metadata,
-        )
+        return await core.get_session(session_id)
 
     @app.delete("/sessions/{session_id}")
     async def delete_session(session_id: str):
-        session = registry.get_session(session_id)
-        if session.closing:
-            raise SessionNotFoundError(f"session not found: session_id={session_id}")
-        session.closing = True
-        logger.debug(
-            f"[session-server] DELETE waiting for lock: session={session_id} lock_locked={session.lock.locked()}"
-        )
-        await session.lock.acquire()
-        logger.debug(f"[session-server] DELETE acquired lock: session={session_id}")
-        try:
-            registry.remove_session(session_id)
-        finally:
-            session.lock.release()
-        return Response(status_code=204)
+        return await core.delete_session(session_id)
 
     @app.post("/sessions/{session_id}/v1/chat/completions")
     async def chat_completions(request: Request, session_id: str):
-        """Proxy a chat completion through SGLang with TITO token tracking.
+        body = await request.body()
+        return await core.chat_completions(
+            session_id,
+            method=request.method,
+            query=request.url.query,
+            headers=dict(request.headers),
+            body=body,
+        )
 
-        Flow: prepare pretokenized input_ids (lock held briefly) → inject
-        SGLang flags → proxy to backend (NO lock) → validate response →
-        update trajectory checkpoint (lock held briefly) → append session record.
-
-        The lock is NOT held during the slow proxy call to avoid blocking
-        DELETE/other operations when the agent disconnects mid-request.
-        """
-        _inflight_chat["count"] += 1
+    # Keep before session_proxy: Starlette's first match must not bypass session/TITO.
+    @app.post("/sessions/{session_id}/v1/messages")
+    async def anthropic_messages(request: Request, session_id: str):
+        """Serve Anthropic Messages through the OpenAI session path."""
+        if (
+            anthropic_utils is None
+            or convert_response is None
+            or convert_to_chat_completion_request is None
+            or not anthropic_adapter_available()
+        ):
+            # _anthropic_error_response depends on the very helpers that are
+            # missing, so write the wire envelope out literally: this route
+            # always speaks Anthropic error shapes, 501 included.
+            return JSONResponse(
+                status_code=501,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "The installed SGLang does not support the Anthropic Messages adapter",
+                    },
+                },
+            )
+        body = await request.body()
         try:
-            session = registry.get_session(session_id)
-            if session.closing:
-                raise SessionNotFoundError(f"session not found: session_id={session_id}")
-
-            # --- Phase 1: prepare request (lock held briefly) ---
-            async with session.lock:
-                # Double-check: session may have been marked closing while waiting for lock.
-                if session.closing:
-                    raise SessionNotFoundError(f"session not found: session_id={session_id}")
-
-                body = await request.body()
-                request_body = json.loads(body) if body else {}
-
-                # TITO token tracking requires Miles-owned input_ids plus SGLang
-                # output-token metadata:
-                #   logprobs=True     → populates meta_info.output_token_logprobs
-                #   return_meta_info  → wraps the above in choice.meta_info
-                # Both flags are hardcoded (not set default) to prevent agent-side
-                # overrides from breaking the token accumulation invariants.
-                request_body["logprobs"] = True
-                request_body["return_meta_info"] = True
-                if getattr(args, "use_rollout_routing_replay", False):
-                    request_body["return_routed_experts"] = True
-                # Must be False so stop-token text is trimmed from assistant
-                # message content; token IDs are still taken from logprobs below.
-                request_body["no_stop_trim"] = False
-
-                request_messages = request_body.get("messages", [])
-                prompt_token_ids = session.prepare_pretokenized(
-                    request_messages,
-                    tools=request_body.get("tools"),
-                    tito_tokenizer=registry.tito_tokenizer,
+            anthropic_request = _parse_anthropic_request(body)
+            _validate_anthropic_features(anthropic_request)
+            try:
+                conversion_request, reasoning_history = _strip_anthropic_reasoning_history(anthropic_request)
+                openai_request = convert_to_chat_completion_request(
+                    conversion_request, merge_inline_system=merge_inline_system
                 )
-                request_body["input_ids"] = prompt_token_ids
-                logger.debug(
-                    "Using TITO input_ids: %d tokens",
-                    len(prompt_token_ids),
+            except Exception as exc:
+                logger.exception("Error converting Anthropic request: %s", exc)
+                raise ValueError(str(exc)) from exc
+            # Core is non-streaming; build fake SSE from its complete response below.
+            openai_request.stream = False
+            openai_request.stream_options = None
+            # Omit defaults so equivalent Anthropic and OpenAI inputs produce the same canonical record.
+            openai_body_dict = openai_request.model_dump(
+                mode="json", exclude_none=True, exclude_unset=True, by_alias=True
+            )
+            _restore_anthropic_reasoning_history(openai_body_dict, reasoning_history)
+            openai_body = _render_json(openai_body_dict)
+        except ValueError as exc:
+            # Parsing and JSON encoding failures are invalid Anthropic requests.
+            return _anthropic_error_response(400, _render_json({"error": str(exc)}))
+
+        anthropic_stream = bool(anthropic_request.stream)
+
+        try:
+            core_response = await core.chat_completions(
+                session_id,
+                method=request.method,
+                query=request.url.query,
+                headers=dict(request.headers),
+                body=openai_body,
+            )
+        except SessionError as exc:
+            return _anthropic_error_response(exc.status_code, _render_json({"error": str(exc)}))
+        except Exception:
+            # Preserve Anthropic error framing; cancellation still propagates.
+            logger.exception("Anthropic chat processing failed for session %s", session_id)
+            return _anthropic_error_response(500, b"")
+
+        if core_response.status_code != 200:
+            return _anthropic_error_response(
+                core_response.status_code, core_response.body, dict(core_response.headers)
+            )
+
+        try:
+            openai_response = ChatCompletionResponse.model_validate_json(core_response.body)
+            if anthropic_stream:
+                events = anthropic_utils.to_anthropic_fake_sse_events(
+                    openai_response,
+                    model=anthropic_request.model,
+                    id_factory=lambda: openai_response.id,
                 )
-
-                body = json.dumps(request_body).encode()
-                expected_num_assistant = session.num_assistant
-            # --- lock released here ---
-
-            # --- Phase 2: proxy to SGLang (NO lock held) ---
-            result = await backend.do_proxy(request, "v1/chat/completions", body=body)
-
-            # If SGLang returned a non-200 error (e.g. 400 for context too long),
-            # pass it through to the agent without recording — the agent can retry
-            # or handle the error.
-            if result["status_code"] != 200:
-                return backend.build_proxy_response(result)
-
-            response = json.loads(result["response_body"])
-
-            choice = response.get("choices", [{}])[0]
-
-            meta_info = choice.get("meta_info")
-            if not isinstance(meta_info, dict) or "output_token_logprobs" not in meta_info:
-                raise UpstreamResponseError(
-                    "meta_info and output_token_logprobs must be in choice (requires logprobs=True)"
+                return Response(
+                    content=_anthropic_sse_body(events),
+                    status_code=200,
+                    headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
+                    media_type="text/event-stream",
                 )
-            assistant_message = choice.get("message", {})
-            if assistant_message.get("content") is None:
-                raise UpstreamResponseError(
-                    "assistant message content is None, when tool call parser failed SGLang should still return "
-                    "an empty content rather than None. Please check your modified SGLang version."
-                )
+            envelope = convert_response(openai_response).model_copy(update={"id": openai_response.id})
+            return Response(content=_anthropic_wire_json(envelope), status_code=200, media_type=JSON_MEDIA_TYPE)
+        except Exception:
+            # Post-commit failures keep the record and return JSON 500, never partial SSE.
+            logger.exception("Anthropic response conversion failed for session %s", session_id)
+            return _anthropic_error_response(500, b"")
 
-            output_token_logprobs = meta_info["output_token_logprobs"]
-            completion_tokens = meta_info["completion_tokens"]
-
-            actual_output_logprobs_len = len(output_token_logprobs)
-            if actual_output_logprobs_len != completion_tokens:
-                raise UpstreamResponseError(
-                    "invalid chat completion response: "
-                    f"len(output_token_logprobs)={actual_output_logprobs_len} "
-                    f"!= completion_tokens={completion_tokens}. "
-                    f"Please check whether you use the correct SGLang branch which has fix the tokenizer batch decode issue."
-                )
-
-            completion_token_ids = [t[1] for t in output_token_logprobs]
-
-            # --- Phase 3: update state (lock held briefly) ---
-            async with session.lock:
-                if session.closing:
-                    logger.warning(f"Session {session_id} closed during proxy, skipping state update")
-                    return backend.build_proxy_response(result)
-
-                if session.num_assistant != expected_num_assistant:
-                    logger.warning(
-                        f"Session {session_id} state changed during proxy "
-                        f"(expected num_assistant={expected_num_assistant}, "
-                        f"got {session.num_assistant}), skipping state update"
-                    )
-                    return backend.build_proxy_response(result)
-
-                session.update_pretokenized_state(
-                    request_messages,
-                    assistant_message,
-                    prompt_token_ids=prompt_token_ids,
-                    completion_token_ids=completion_token_ids,
-                    max_trim_tokens=registry.tito_tokenizer.max_trim_tokens,
-                )
-
-                record = SessionRecord(
-                    timestamp=time.time(),
-                    method=request.method,
-                    path="/v1/chat/completions",
-                    status_code=result["status_code"],
-                    request=request_body,
-                    response=response,
-                )
-                session.append_record(record)
-            # --- lock released here ---
-
-            return backend.build_proxy_response(result)
-        finally:
-            _inflight_chat["count"] -= 1
+    @app.post("/sessions/{session_id}/samples")
+    async def collect_samples(request: Request, session_id: str):
+        # Starlette matches routes in registration order; keep this before session_proxy.
+        # Parse here so malformed input is not reported as an assembly error (422).
+        body = await request.body()
+        params = json.loads(body) if body else {}
+        if use_v2:
+            return await core.collect_samples(
+                session_id, max_seq_len=params.get("max_seq_len"), agent_metadata=params.get("metadata")
+            )
+        return await core.collect_samples(session_id, max_seq_len=params.get("max_seq_len"))
 
     @app.api_route("/sessions/{session_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
     async def session_proxy(request: Request, session_id: str, path: str):
-        result = await backend.do_proxy(request, path)
-        return backend.build_proxy_response(result)
+        body = await request.body()
+        return await core.proxy(
+            session_id,
+            path,
+            method=request.method,
+            query=request.url.query,
+            headers=dict(request.headers),
+            body=body,
+        )

@@ -19,7 +19,7 @@ if str(_MILES_ROOT) not in sys.path:
     sys.path.insert(0, str(_MILES_ROOT))
 
 import typer
-from tests.ci.ci_register import register_cuda_ci
+from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 from tests.e2e.conftest_dumper import (
     MEGATRON_PATCHER_YAMLS,
     SGLANG_SOURCE_PATCHER_CONFIG_YAML,
@@ -29,9 +29,10 @@ from tests.e2e.conftest_dumper import (
     run_and_verify_comparator,
 )
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
-register_cuda_ci(est_time=2000, suite="stage-c-8-gpu-h100", labels=["short"])
+register_cuda_ci(est_time=1200, suite="stage-c-8-gpu-h200", labels=["short"], hardware=["hopper", "blackwell"])
+register_rocm_ci(est_time=1800, suite="nightly-stage-c-8-gpu-mi350", labels=["short"])
 
 
 app: typer.Typer = typer.Typer()
@@ -87,11 +88,12 @@ def _resolve_mode(mode: str) -> tuple[str, str]:
 
 
 def prepare(dump_dir: str, mode: str) -> None:
-    U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
+    U = command_utils.default_config().create_backend()
+    U.exec_command_cpu("mkdir -p /root/models /root/datasets")
+    U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/gsm8k")
     U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=NUM_GPUS)
-    U.exec_command(f"rm -rf {dump_dir}")
+    U.exec_command_cpu(f"rm -rf {dump_dir}")
 
     megatron_yaml: str = MEGATRON_PATCHER_YAMLS["bshd" if mode.endswith("_bshd") else "thd"]
     Path(MEGATRON_SOURCE_PATCHER_CONFIG_PATH).write_text(megatron_yaml)
@@ -99,6 +101,7 @@ def prepare(dump_dir: str, mode: str) -> None:
 
 
 def _execute(perf_args: str, dump_subdir: str, dump_dir: str) -> None:
+    U = command_utils.default_config().create_backend()
     full_dump_dir: str = f"{dump_dir}/{dump_subdir}"
 
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} " f"--ref-load /root/{MODEL_NAME}_torch_dist "
@@ -160,7 +163,7 @@ def _execute(perf_args: str, dump_subdir: str, dump_dir: str) -> None:
             sglang_args,
             dumper_args,
             misc_args,
-            U.get_default_wandb_args(__file__),
+            command_utils.get_default_wandb_args(__file__),
         ]
     )
 

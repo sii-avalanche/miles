@@ -1,28 +1,34 @@
 import os
 
-from tests.ci.ci_register import register_cuda_ci
+from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
 register_cuda_ci(
     est_time=900,
-    suite="stage-c-8-gpu-h100",
+    suite="stage-c-2-gpu-h200",
     labels=["fsdp"],
-    disabled="FSDP backend has known issues, not actively maintained",
+    hardware=["hopper", "blackwell"],
+)
+register_rocm_ci(
+    est_time=800,
+    suite="nightly-stage-c-2-gpu-mi350",
+    labels=["fsdp"],
 )
 
 
 MODEL_NAME = "Qwen3-0.6B"
 MODEL_TYPE = "qwen3-0.6B"
-NUM_GPUS = 8
+NUM_GPUS = 2
 CP_SIZE = 1
 MEGATRON_TP_SIZE = 1
 MEGATRON_PP_SIZE = 1
 
 
 def prepare():
-    U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
+    U = command_utils.default_config().create_backend()
+    U.exec_command_cpu("mkdir -p /root/models /root/datasets")
+    U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/dapo-math-17k")
 
     U.convert_checkpoint(
@@ -34,6 +40,7 @@ def prepare():
 
 
 def execute():
+    U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/"
 
     rollout_args = (
@@ -84,13 +91,13 @@ def execute():
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{ppo_args} "
-        f"{U.get_default_wandb_args(__file__)} "
+        f"{command_utils.get_default_wandb_args(__file__)} "
         f"{sglang_args} "
         f"{ci_args} "
         f"{misc_args} "
     )
 
-    debug_data_path = "test_rollout_data_megatron_fsdp_align.pt"
+    debug_data_path = "test_rollout_data_megatron_fsdp_align_{rollout_id}.pt"
     grad_norm_path = "grad_norm_fsdp.pt"
 
     fsdp_args = (
@@ -107,7 +114,6 @@ def execute():
             train_args=train_args + (f"{fsdp_args}" f"--save-debug-rollout-data {debug_data_path} "),
             num_gpus_per_node=NUM_GPUS,
             megatron_model_type=None,
-            extra_env_vars={"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1"},
         )
 
         U.execute_train(
@@ -120,7 +126,6 @@ def execute():
             ),
             num_gpus_per_node=NUM_GPUS,
             megatron_model_type=None,
-            extra_env_vars={"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1"},
         )
 
         U.execute_train(
@@ -139,6 +144,7 @@ def execute():
                 "--train-memory-margin-bytes 3221225472 "
                 f"--load-debug-rollout-data {debug_data_path} "
                 f"--ci-load-grad-norm {grad_norm_path} "
+                "--skip-actor-forward-only "
                 "--attention-dropout 0.0 "
                 "--hidden-dropout 0.0 "
                 "--accumulate-allreduce-grads-in-fp32 "
@@ -147,15 +153,15 @@ def execute():
                 "--debug-train-only "
             ),
             num_gpus_per_node=NUM_GPUS,
-            extra_env_vars={"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1"},
             megatron_model_type=MODEL_TYPE,
         )
 
     finally:
         if os.path.exists(grad_norm_path):
             os.remove(grad_norm_path)
-        if os.path.exists(debug_data_path):
-            os.remove(debug_data_path)
+        debug_data_file = debug_data_path.format(rollout_id=0)
+        if os.path.exists(debug_data_file):
+            os.remove(debug_data_file)
 
 
 if __name__ == "__main__":

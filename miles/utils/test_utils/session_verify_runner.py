@@ -11,6 +11,8 @@ pipeline (sglang + miles-router with session support) is launched, ``train`` is
 skipped, and the rollout drives ``session_verify_agent.run_agent`` against the
 session server.
 
+Args flow through miles' canonical ``parse_args`` Namespace.
+
 # Backend choice
 
 ``execute_train`` asserts ``("--train-backend fsdp" in train_args) == (megatron_model_type is None)``,
@@ -20,16 +22,26 @@ in ``--debug-rollout-only`` mode.  We use that.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
+import shutil
 import tempfile
+from typing import Any, Literal
+
+from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser
+from miles.utils.external_utils import command_utils
+from miles.utils.external_utils.command_utils.base_backend import BaseCommandBackend
+from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 
 logger = logging.getLogger(__name__)
 
+SessionWireFormat = Literal["openai", "anthropic"]
+
 # Soft cap on how many samples may report any assistant_text mismatch.  Hard
 # mismatch types (special_token_count / special_token_type / non_assistant_text)
-# are asserted per-sample inside the agent wrapper — those must be 0.
+# are journaled per sample and rejected by the run-level gate — those must be 0.
 ASSISTANT_TEXT_MISMATCH_RATIO_THRESHOLD = 0.2
 
 PROMPT_DATA_PATH = "/root/datasets/session_multi_role_verify.jsonl"
@@ -46,6 +58,52 @@ _PLACEHOLDER_PROMPT_RECORD = {
     ],
 }
 
+SESSION_VERIFY_INVARIANT_ARGS: dict[str, Any] = {
+    "prompt_data": PROMPT_DATA_PATH,
+    "input_key": "messages",
+    "num_rollout": 1,
+    "rollout_batch_size": 16,
+    "rollout_max_response_len": 8192,
+    "rollout_temperature": 0.7,
+    "global_batch_size": 64,
+    "rm_type": "random",
+    "custom_generate_function_path": "miles.utils.test_utils.session_verify_agent.generate",
+    "custom_agent_function_path": "miles.utils.test_utils.session_verify_agent.run_agent",
+    "use_session_server": "v2",
+    "session_message_matcher": "strict",
+    "debug_rollout_only": True,
+    "ci_test": True,
+    "colocate": True,
+    "train_backend": "fsdp",
+    "sglang_ep_size": 1,
+    "enable_spec": False,
+}
+
+
+def session_verify_extras(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """``add_custom_arguments`` hook for ``miles.utils.arguments.parse_args``.
+
+    Adds the wrapper-only ``--assistant-text-threshold`` knob (a post-process
+    gate on the per-sample metrics JSONL, NOT in ``train_args``) and applies
+    session-verify invariants as parser defaults — user CLI still overrides
+    these via the canonical miles flags.
+    """
+    parser.add_argument(
+        "--assistant-text-threshold",
+        type=float,
+        default=ASSISTANT_TEXT_MISMATCH_RATIO_THRESHOLD,
+        help=(
+            "Soft threshold for assistant_text mismatch ratio.  Default 0.1.  "
+            "Raise to 1.0 for families whose upstream sglang reasoning parser "
+            "is known to roundtrip imperfectly (e.g. nemotron_3 keeps a "
+            "trailing newline in reasoning_content) — hard mismatches still "
+            "gate.  Post-process gate on per-sample JSONL metrics; not "
+            "forwarded to ``train_args``."
+        ),
+    )
+    parser.set_defaults(**SESSION_VERIFY_INVARIANT_ARGS)
+    return parser
+
 
 def _ensure_prompt_data() -> str:
     os.makedirs(os.path.dirname(PROMPT_DATA_PATH), exist_ok=True)
@@ -54,22 +112,20 @@ def _ensure_prompt_data() -> str:
     return PROMPT_DATA_PATH
 
 
-def _ensure_model_downloaded(hf_checkpoint: str) -> str:
+def _ensure_model_downloaded(hf_checkpoint: str, *, backend: BaseCommandBackend) -> str:
     """Return a local model path, downloading HF repos when needed.
 
     Lets callers pass either a HuggingFace repo id (downloaded under
     ``/root/models/<short-name>``) or an existing local checkpoint path
     (returned as-is, no download).
     """
-    import miles.utils.external_utils.command_utils as U
-
     if os.path.exists(hf_checkpoint):
         return hf_checkpoint
 
     short = hf_checkpoint.split("/")[-1]
     local_dir = os.path.join(LOCAL_MODELS_ROOT, short)
     os.makedirs(LOCAL_MODELS_ROOT, exist_ok=True)
-    U.exec_command(f"hf download {hf_checkpoint} --local-dir {local_dir}")
+    backend.exec_command_cpu(f"hf download {hf_checkpoint} --local-dir {local_dir}")
     return local_dir
 
 
@@ -78,168 +134,162 @@ def _clear_proxy_env() -> None:
         os.environ.pop(proxy_var, None)
 
 
-def build_train_args(
-    *,
-    local_model_dir: str,
-    tito_model: str,
-    allowed_append_roles,
-    tp_size: int,
-    num_gpus: int = 8,
-    reasoning_parser: str,
-    tool_call_parser: str | None,
-    n_samples_per_prompt: int = 4,
-    cycles: int = 3,
-    tool_call_failure_mode: str = "rollback",
-    rollout_max_response_len: int = 8192,
-) -> str:
-    """Compose the ``train_args`` string for ``execute_train``.
+def namespace_to_train_args(ns: argparse.Namespace) -> str:
+    """Serialize a fully-shaped Namespace into the ``train_args`` string.
 
-    Caller-supplied ``allowed_append_roles`` is forwarded verbatim to
-    ``--tito-allowed-append-roles``; the agent's ``run_agent`` will read it back
-    from ``args.tito_allowed_append_roles`` to pick a schedule.
-
-    Rollout batching: ``--rollout-batch-size 16`` × ``--n-samples-per-prompt`` ×
-    ``--num-rollout 1`` = ``--global-batch-size``.  The single placeholder
-    prompt is cycled inside the batch — that's the path miles' rollout layer
-    actually parallelizes on, so leave it at 16 even though the prompt-data
-    file is single-record.  Setting batch-size=1 with a multi-sample n triggers
-    unexpected agent re-invocation in the rollout loop.
+    Reads miles-canonical field names off ``ns``; emits the exact flag set
+    ``execute_train`` re-parses downstream.  ``actor_num_nodes`` is written
+    explicitly from ``ns.actor_num_nodes`` (NOT defaulted at the serializer
+    level) so the runner stays pinned to whatever the caller's Namespace
+    declared, regardless of any drift in miles' upstream default.
     """
-    allowed_roles_arg = " ".join(allowed_append_roles)
-    rollout_batch_size = 16
-    global_batch_size = rollout_batch_size * n_samples_per_prompt
+    parts: list[str] = [
+        f"--hf-checkpoint {ns.hf_checkpoint}",
+        f"--prompt-data {ns.prompt_data}",
+        f"--input-key {ns.input_key}",
+        f"--num-rollout {ns.num_rollout}",
+        f"--rollout-batch-size {ns.rollout_batch_size}",
+        f"--n-samples-per-prompt {ns.n_samples_per_prompt}",
+        f"--rollout-max-response-len {ns.rollout_max_response_len}",
+        f"--rollout-temperature {ns.rollout_temperature}",
+        f"--global-batch-size {ns.global_batch_size}",
+        f"--custom-generate-function-path {ns.custom_generate_function_path}",
+        f"--custom-agent-function-path {ns.custom_agent_function_path}",
+        f"--session-verify-cycles {ns.session_verify_cycles}",
+        f"--tool-call-failure-mode {ns.tool_call_failure_mode}",
+        f"--tito-model {ns.tito_model}",
+        f"--session-message-matcher {ns.session_message_matcher}",
+        f"--rollout-num-gpus-per-engine {ns.rollout_num_gpus_per_engine}",
+        f"--sglang-reasoning-parser {ns.sglang_reasoning_parser}",
+        f"--rm-type {ns.rm_type}",
+        f"--actor-num-nodes {ns.actor_num_nodes}",
+        f"--actor-num-gpus-per-node {ns.actor_num_gpus_per_node}",
+        f"--train-backend {ns.train_backend}",
+    ]
+    if getattr(ns, "rollout_num_gpus", None) is not None:
+        parts.append(f"--rollout-num-gpus {ns.rollout_num_gpus}")
+    if ns.sglang_tool_call_parser:
+        parts.append(f"--sglang-tool-call-parser {ns.sglang_tool_call_parser}")
+    if ns.sglang_context_length is not None:
+        parts.append(f"--sglang-context-length {ns.sglang_context_length}")
+    if ns.sglang_kv_cache_dtype is not None:
+        parts.append(f"--sglang-kv-cache-dtype {ns.sglang_kv_cache_dtype}")
+    if ns.sglang_mamba_full_memory_ratio is not None:
+        parts.append(f"--sglang-mamba-full-memory-ratio {ns.sglang_mamba_full_memory_ratio}")
+    if getattr(ns, "sglang_cuda_graph_max_bs_decode", None) is not None:
+        parts.append(f"--sglang-cuda-graph-max-bs-decode {ns.sglang_cuda_graph_max_bs_decode}")
+    if ns.sglang_cuda_graph_backend_prefill is not None:
+        parts.append(f"--sglang-cuda-graph-backend-prefill {ns.sglang_cuda_graph_backend_prefill}")
+    # DeepSeek V3.2 (and other NSA/MoE archs) requires expert-parallel > 1 in
+    # sglang; the default is 1, which is fatal at engine init.  Only emit the
+    # flag when the caller asks for ep>1 so single-expert models stay untouched.
+    if ns.sglang_ep_size > 1:
+        parts.append(f"--sglang-expert-parallel-size {ns.sglang_ep_size}")
+    if ns.enable_spec:
+        parts.extend(
+            [
+                "--sglang-speculative-algorithm EAGLE",
+                "--sglang-speculative-num-steps 2",
+                "--sglang-speculative-eagle-topk 1",
+                "--sglang-speculative-num-draft-tokens 3",
+            ]
+        )
+    if getattr(ns, "anthropic_intermediate_system_expectation", None) is not None:
+        parts.append("--anthropic-intermediate-system-expectation " f"{ns.anthropic_intermediate_system_expectation}")
+    if ns.use_session_server:
+        # Preserve an explicit version string ("v2"); a bare True stays the bare flag.
+        if isinstance(ns.use_session_server, str):
+            parts.append(f"--use-session-server {ns.use_session_server}")
+        else:
+            parts.append("--use-session-server")
+    if ns.debug_rollout_only:
+        parts.append("--debug-rollout-only")
+    if ns.ci_test:
+        parts.append("--ci-test")
+    if getattr(ns, "ci_tito_special_token_count_threshold", 0.0):
+        parts.append(f"--ci-tito-special-token-count-threshold {ns.ci_tito_special_token_count_threshold}")
+    if ns.colocate:
+        parts.append("--colocate")
+    return " ".join(parts) + " "
 
-    ckpt_args = f"--hf-checkpoint {local_model_dir} "
 
-    rollout_args = (
-        f"--prompt-data {PROMPT_DATA_PATH} "
-        "--input-key messages "
-        "--num-rollout 1 "
-        f"--rollout-batch-size {rollout_batch_size} "
-        f"--n-samples-per-prompt {n_samples_per_prompt} "
-        f"--rollout-max-response-len {rollout_max_response_len} "
-        "--rollout-temperature 0.7 "
-        f"--global-batch-size {global_batch_size} "
-    )
-
-    generate_args = (
-        "--custom-generate-function-path "
-        "miles.utils.test_utils.session_verify_agent.generate "
-        "--custom-agent-function-path "
-        "miles.utils.test_utils.session_verify_agent.run_agent "
-        f"--session-verify-cycles {cycles} "
-        f"--tool-call-failure-mode {tool_call_failure_mode} "
-    )
-
-    router_args = (
-        "--use-miles-router "
-        "--use-session-server "
-        f"--tito-model {tito_model} "
-        f"--tito-allowed-append-roles {allowed_roles_arg} "
-    )
-
-    sglang_args = f"--rollout-num-gpus-per-engine {tp_size} " f"--sglang-reasoning-parser {reasoning_parser} "
-    if tool_call_parser:
-        sglang_args += f"--sglang-tool-call-parser {tool_call_parser} "
-    sglang_args += "--rm-type random "
-
-    infra_args = (
-        "--debug-rollout-only "
-        "--ci-test "
-        "--actor-num-nodes 1 "
-        # ``num_gpus`` controls the actor's full-node allocation (default 8 =
-        # whole node).  The sglang engine's tensor-parallel slice is the
-        # separate ``tp_size`` parameter — a small model can run TP=1/2/4
-        # while the test still occupies the whole node, keeping the CI lane
-        # allocation stable regardless of the engine TP.
-        f"--actor-num-gpus-per-node {num_gpus} "
-        "--colocate "
-        "--train-backend fsdp "
-    )
-
-    return ckpt_args + rollout_args + generate_args + router_args + sglang_args + infra_args
+def _session_verify_env(
+    args: argparse.Namespace, metrics_path: str, *, wire_format: SessionWireFormat
+) -> dict[str, str]:
+    env = {
+        "MILES_TITO_MODEL": args.tito_model,
+        "MILES_SESSION_VERIFY_METRICS_PATH": metrics_path,
+    }
+    if wire_format == "anthropic":
+        # This run still uses the local metrics file, but must not overwrite
+        # another endpoint's CI-history series under the same v2 metric key.
+        env[RECORD_DIR_ENV] = ""
+    return env
 
 
-def run_session_verify(
-    *,
-    hf_checkpoint: str,
-    tito_model: str,
-    allowed_append_roles,
-    reasoning_parser: str | None = None,
-    tool_call_parser: str | None = None,
-    tp_size: int = 1,
-    num_gpus: int = 8,
-    n_samples_per_prompt: int = 4,
-    cycles: int = 3,
-    assistant_text_threshold: float = ASSISTANT_TEXT_MISMATCH_RATIO_THRESHOLD,
-    tool_call_failure_mode: str = "rollback",
-    rollout_max_response_len: int = 8192,
-) -> None:
-    """Boot ``miles`` rollout pipeline and run the multi-role driver.
+def run_session_verify(args: argparse.Namespace, *, wire_format: SessionWireFormat = "openai") -> None:
+    """Boot ``miles`` rollout pipeline and run the session-verification driver.
 
     Returns nothing on success; raises ``AssertionError`` on TITO mismatch
-    (HTTP 500 from server-side prefix check) or coverage shortfall (raised by
-    ``session_verify_agent.generate``).
+    (HTTP 500 from server-side prefix check) or coverage shortfall raised by the selected generate wrapper.
 
-    Both parsers are resolved against the TITO subclass's bound values via
-    ``resolve_reasoning_and_tool_call_parser`` — caller-passed values that
-    disagree with the bound values raise ``ValueError`` here, before any GPU
-    work starts.  Pass ``None`` for either to auto-resolve from the TITO
-    subclass.
+    ``args`` MUST be a fully-shaped Namespace carrying miles-canonical field
+    names plus the session-verify-specific fields (``session_verify_cycles``,
+    ``tool_call_failure_mode``, ``assistant_text_threshold``).  Build it via
+    ``parse_args(add_custom_arguments=session_verify_extras)`` for the CLI
+    path or by spreading ``SESSION_VERIFY_INVARIANT_ARGS`` into
+    ``argparse.Namespace(...)`` for tests.
+
+    Mutates ``args`` in two places before composing train_args:
+    - ``args.sglang_reasoning_parser`` / ``args.sglang_tool_call_parser`` are
+      resolved against the TITO subclass's bound values via
+      ``resolve_reasoning_and_tool_call_parser`` — caller-passed values that
+      disagree with the bound values raise ``ValueError`` here, before any
+      GPU work starts.
+    - ``args.hf_checkpoint`` is replaced with the local download path so the
+      composed train_args points at the downloaded model, not the HF id.
     """
-    import miles.utils.external_utils.command_utils as U
-    from miles.utils.chat_template_utils import resolve_reasoning_and_tool_call_parser
+    if wire_format not in ("openai", "anthropic"):
+        raise ValueError(f"unsupported session verification wire format: {wire_format}")
 
-    reasoning_parser, tool_call_parser = resolve_reasoning_and_tool_call_parser(
-        tito_model, reasoning_parser, tool_call_parser
+    backend = command_utils.default_config().create_backend()
+    args.sglang_reasoning_parser, args.sglang_tool_call_parser = resolve_reasoning_and_tool_call_parser(
+        args.tito_model, args.sglang_reasoning_parser, args.sglang_tool_call_parser
     )
-
     _ensure_prompt_data()
     _clear_proxy_env()
-    local_model_dir = _ensure_model_downloaded(hf_checkpoint)
+    args.hf_checkpoint = _ensure_model_downloaded(args.hf_checkpoint, backend=backend)
 
-    train_args = build_train_args(
-        local_model_dir=local_model_dir,
-        tito_model=tito_model,
-        allowed_append_roles=allowed_append_roles,
-        tp_size=tp_size,
-        num_gpus=num_gpus,
-        reasoning_parser=reasoning_parser,
-        tool_call_parser=tool_call_parser,
-        n_samples_per_prompt=n_samples_per_prompt,
-        cycles=cycles,
-        tool_call_failure_mode=tool_call_failure_mode,
-        rollout_max_response_len=rollout_max_response_len,
-    )
+    train_args = namespace_to_train_args(args)
 
     # Per-sample token-seq metrics file: rollout workers append one JSONL line
-    # per sample inside session_verify_agent.generate; we aggregate after
+    # per sample inside the selected generate wrapper; we aggregate after
     # execute_train returns to apply the assistant_text soft threshold.
     metrics_fd, metrics_path = tempfile.mkstemp(prefix="session_verify_metrics_", suffix=".jsonl")
     os.close(metrics_fd)
 
-    preserved_metrics_path = None
     try:
-        U.execute_train(
+        backend.execute_train(
             train_args=train_args,
-            num_gpus_per_node=num_gpus,
+            num_gpus_per_node=args.actor_num_gpus_per_node,
             megatron_model_type=None,
-            extra_env_vars={
-                "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
-                "SGLANG_E2E_MODEL_PATH": local_model_dir,
-                "MILES_TITO_MODEL": tito_model,
-                "MILES_SESSION_VERIFY_METRICS_PATH": metrics_path,
-            },
+            extra_env_vars=_session_verify_env(args, metrics_path, wire_format=wire_format),
         )
+        assert_session_verify_metrics(
+            metrics_path,
+            assistant_text_threshold=args.assistant_text_threshold,
+            special_token_count_threshold=getattr(args, "ci_tito_special_token_count_threshold", 0.0),
+            require_append_tool=wire_format == "openai",
+        )
+    except Exception:
+        preserved_metrics_path = metrics_path + ".failed"
         try:
-            _assert_session_verify_metrics(metrics_path, assistant_text_threshold=assistant_text_threshold)
-        except AssertionError:
-            import shutil
-
-            preserved_metrics_path = metrics_path + ".failed"
             shutil.copy(metrics_path, preserved_metrics_path)
+        except Exception:
+            logger.exception("Failed to preserve per-sample mismatch payloads at %s", preserved_metrics_path)
+        else:
             logger.error("Preserved per-sample mismatch payloads at %s for post-mortem", preserved_metrics_path)
-            raise
+        raise
     finally:
         try:
             os.unlink(metrics_path)
@@ -247,30 +297,85 @@ def run_session_verify(
             pass
 
 
-def _assert_session_verify_metrics(metrics_path: str, *, assistant_text_threshold: float) -> None:
+def assert_session_verify_metrics(
+    metrics_path: str,
+    *,
+    assistant_text_threshold: float,
+    special_token_count_threshold: float = 0.0,
+    require_append_tool: bool = True,
+) -> None:
     """Read per-sample JSONL metrics and assert cross-sample verifier gates.
 
-    Forbidden mismatch types (special_*, non_assistant_text) are caught
-    per-sample in the agent wrapper and would have already raised by now.
-    Here we only cross-check the soft assistant_text rate against the
-    caller-provided threshold (per-model: some upstream sglang reasoning
-    parsers — notably ``nemotron_3`` — leave a trailing ``\\n`` in
-    ``reasoning_content`` that breaks the canonical roundtrip until the
-    parser is patched, so those families ride at threshold=1.0).
+    Forbidden mismatch types (special_*, non_assistant_text) are recorded by
+    the agent wrapper and hard-failed here so the rollout loop cannot discard
+    their assertion as a retryable sample failure.  Samples whose only hard
+    type is special_token_count are tolerated up to the caller-provided
+    ``special_token_count_threshold`` ratio.  The assistant_text tier remains
+    soft and is checked only against the caller-provided ratio threshold.
     """
     samples_with_mismatch = 0
     total_samples = 0
     has_append_tool = False
+    samples_with_special_token_count_only = 0
+    samples_with_hard_mismatch = 0
+    hard_mismatch_count = 0
+    hard_mismatch_types = set()
+    hard_mismatch_example = None
+    verification_error_count = 0
+    verification_error_stages = set()
+    verification_error_example = None
     with open(metrics_path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             entry = json.loads(line)
+            if "verification_error" in entry:
+                verification_error_count += 1
+                error = entry["verification_error"]
+                if isinstance(error, dict):
+                    stage = error.get("stage")
+                    if stage:
+                        verification_error_stages.add(stage)
+                    if verification_error_example is None:
+                        verification_error_example = {
+                            "stage": stage,
+                            "type": error.get("type"),
+                            "message": str(error.get("message") or "")[:1000],
+                        }
+                elif verification_error_example is None:
+                    verification_error_example = str(error)[:1000]
+                continue
             total_samples += 1
             has_append_tool = has_append_tool or "append_tool" in entry.get("driver_events", [])
             if entry.get("had_assistant_mismatch"):
                 samples_with_mismatch += 1
+            entry_hard_types = entry.get("hard_mismatch_types", [])
+            entry_hard_count = entry.get("hard_mismatch_count", len(entry_hard_types))
+            if entry_hard_count or entry_hard_types:
+                if set(entry_hard_types) == {"special_token_count"}:
+                    samples_with_special_token_count_only += 1
+                samples_with_hard_mismatch += 1
+                hard_mismatch_count += entry_hard_count
+                hard_mismatch_types.update(entry_hard_types)
+                if hard_mismatch_example is None:
+                    entry_example = entry.get("hard_mismatch_example")
+                    if isinstance(entry_example, dict):
+                        hard_mismatch_example = {
+                            "type": entry_example.get("type"),
+                            "segment_index": entry_example.get("segment_index"),
+                            "detail": str(entry_example.get("detail") or "")[:500],
+                        }
+                    elif entry_example is not None:
+                        hard_mismatch_example = str(entry_example)[:500]
+
+    if verification_error_count:
+        raise AssertionError(
+            "Session multi-role e2e: verifier assertions failed in "
+            f"{verification_error_count} attempted trajectories "
+            f"(completed_samples={total_samples}, stages={sorted(verification_error_stages)}, "
+            f"first={verification_error_example})."
+        )
 
     if total_samples == 0:
         raise AssertionError(
@@ -279,21 +384,36 @@ def _assert_session_verify_metrics(metrics_path: str, *, assistant_text_threshol
             "run before any sample completed.  Check rollout logs."
         )
 
-    if not has_append_tool:
+    ratio = samples_with_mismatch / total_samples
+    logger.info(
+        "Token-seq metric summary: samples=%d, with_hard_mismatch=%d, "
+        "with_assistant_text_mismatch=%d, ratio=%.3f, threshold=%.3f",
+        total_samples,
+        samples_with_hard_mismatch,
+        samples_with_mismatch,
+        ratio,
+        assistant_text_threshold,
+    )
+    special_token_count_ratio = samples_with_special_token_count_only / total_samples
+    if samples_with_hard_mismatch > samples_with_special_token_count_only or (
+        special_token_count_ratio > special_token_count_threshold
+    ):
+        raise AssertionError(
+            f"Session multi-role e2e: hard TITO mismatches found in "
+            f"{samples_with_hard_mismatch}/{total_samples} attempted samples "
+            f"({hard_mismatch_count} mismatches, types={sorted(hard_mismatch_types)}, "
+            f"first={hard_mismatch_example}).  These types must be 0 for any "
+            f"TITO-correct setup (special_token_count-only samples tolerated up to "
+            f"{special_token_count_threshold})."
+        )
+
+    if require_append_tool and not has_append_tool:
         raise AssertionError(
             "Session multi-role e2e: no sample produced an append_tool action — "
             "the model may not be tool-calling.  Check sampling temperature, "
             "the tool spec, or parser configuration."
         )
 
-    ratio = samples_with_mismatch / total_samples
-    logger.info(
-        "Token-seq metric summary: samples=%d, with_assistant_text_mismatch=%d, ratio=%.3f, threshold=%.3f",
-        total_samples,
-        samples_with_mismatch,
-        ratio,
-        assistant_text_threshold,
-    )
     if ratio > assistant_text_threshold:
         raise AssertionError(
             f"Session multi-role e2e: assistant_text mismatch ratio "

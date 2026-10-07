@@ -5,8 +5,7 @@ GLM-5 744B-A40B Training Script
 
 Tested on H200, B200, GB300
 
-For H200, B200, please use `radixark/miles:glm5` docker
-For GB300, please use `radixark/miles:glm5-gb300` docker
+Please use the `radixark/miles:dev` docker image.
 
 =====================
 
@@ -46,11 +45,8 @@ II. Usage for multi node (20 layers, 6 nodes as an example):
      Run on **head node**; megatron conversion uses Ray to coordinate multi-node work.
        `python scripts/run_glm5_744b_a40b.py prepare --model-name GLM-5_20layer --num-nodes 6`
 
-  4. (Optional) Copy model from shared NFS to local disk on each node.
-     Run independently on every node.
-       python scripts/run_glm5_744b_a40b.py prepare-cp --model-name GLM-5_20layer --num-nodes 6
-
-  5. Run training. Execute on head node; uses Ray internally for distributed training.
+  4. Run training; it first copies the model from shared NFS to each node's local disk.
+     Execute on head node; uses Ray internally for distributed training.
        python scripts/run_glm5_744b_a40b.py train --model-name GLM-5_20layer --num-nodes 6
 """
 
@@ -62,19 +58,19 @@ from typing import Literal
 
 import typer
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
 app = typer.Typer()
 
 
 @dataclass
-class ScriptArgs(U.ExecuteTrainConfig):
+class ScriptArgs(command_utils.ExecuteTrainConfig):
     mode: Literal["normal", "debug_minimal"] = "normal"
-    run_id: str = U.create_run_id()
+    run_id: str = command_utils.create_run_id()
     model_org: str = "zai-org"
     model_name: str = "GLM-5"
     megatron_model_type: str = "glm5-744B-A40B"
-    num_gpus_per_node: int = 8
+    num_gpus_per_node: int | None = None
     fp8_rollout: bool = False
     use_deepep: bool = True
     megatron_use_deepep: bool = True
@@ -88,9 +84,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
     model_dir: str = "/root/models"
     model_local_dir: str = "/root/models"
     megatron_path: str = "/root/Megatron-LM"
-    hardware: Literal["H200", "B200", "GB300"] = "H200"
+    hardware: Literal["auto", "H200", "B200", "GB300"] = "auto"
 
     def __post_init__(self):
+        self.hardware = command_utils.resolve_hardware(self)
+        self.num_gpus_per_node = self.num_gpus_per_node or command_utils.NUM_GPUS_OF_HARDWARE[self.hardware]
         if self.hardware == "GB300":
             assert not self.megatron_use_deepep, (
                 "Known issue: Megatron's DeepEP fail on GB300. " "Please specify --no-megatron-use-deepep."
@@ -148,9 +146,10 @@ def _validate_glm_checkpoint(args: ScriptArgs):
 
 def _convert_to_fp8(args: ScriptArgs):
     """Convert HF checkpoint to FP8 (block quantization). Megatron still uses bf16."""
+    U = args.create_backend()
     src = f"{args.model_dir}/{args.model_name}"
     dst = f"{args.model_dir}/{args.model_name}_fp8"
-    U.exec_command(
+    U.exec_command_gpu(
         f"python tools/convert_hf_to_fp8.py "
         f"--model-dir {src} --save-dir {dst} "
         f"--strategy block --block-size 128 128"
@@ -158,12 +157,16 @@ def _convert_to_fp8(args: ScriptArgs):
 
 
 def _prepare_download(args: ScriptArgs):
-    U.exec_command(f"mkdir -p {args.model_dir} {args.data_dir}")
-    U.exec_command(f"hf download {args.model_org}/{args.model_name} --local-dir {args.model_dir}/{args.model_name}")
+    U = args.create_backend()
+    U.exec_command_cpu(f"mkdir -p {args.model_dir} {args.data_dir}")
+    U.exec_command_cpu(
+        f"hf download {args.model_org}/{args.model_name} --local-dir {args.model_dir}/{args.model_name}"
+    )
     U.hf_download_dataset("zhuzilin/dapo-math-17k", data_dir=args.data_dir)
 
 
 def _prepare_megatron_ckpt(args: ScriptArgs):
+    U = args.create_backend()
     extra_args = "--tensor-model-parallel-size 1 " "--expert-tensor-parallel-size 1 "
     num_gpus_per_node = args.num_gpus_per_node
     multinode = True
@@ -197,23 +200,20 @@ def _prepare_megatron_ckpt(args: ScriptArgs):
     )
 
 
-def _prepare_cp(args: ScriptArgs, skip_existing: bool = False):
-    torch_dist_dst = f"{args.model_local_dir}/{args.model_name}_torch_dist"
-    if not (skip_existing and Path(torch_dist_dst).exists()):
-        U.rsync_simple(
-            path_src=f"{args.model_dir}/{args.model_name}_torch_dist",
-            path_dst=torch_dist_dst,
-        )
+def _prepare_cmd(args: ScriptArgs) -> dict[str, str]:
     hf_name = f"{args.model_name}_fp8" if args.fp8_rollout else args.model_name
-    hf_dst = f"{args.model_local_dir}/{hf_name}"
-    if not (skip_existing and Path(hf_dst).exists()):
-        U.rsync_simple(
-            path_src=f"{args.model_dir}/{hf_name}",
-            path_dst=hf_dst,
-        )
+    copies = [
+        command_utils.rsync_cmd(
+            f"{args.model_dir}/{args.model_name}_torch_dist",
+            f"{args.model_local_dir}/{args.model_name}_torch_dist",
+        ),
+        command_utils.rsync_cmd(f"{args.model_dir}/{hf_name}", f"{args.model_local_dir}/{hf_name}"),
+    ]
+    return {"trainer": " && ".join(copies)}
 
 
 def _execute_train(args: ScriptArgs):
+    U = args.create_backend()
     load_save_path = f"{args.output_dir}/{args.run_id}/checkpoints"
     hf_name = f"{args.model_name}_fp8" if args.fp8_rollout else args.model_name
     ckpt_args = (
@@ -343,16 +343,23 @@ def _execute_train(args: ScriptArgs):
         sglang_args += "--prefill-num-servers 1 "
     sglang_args += (
         # use flashmla backend for better precision
-        "--sglang-nsa-decode-backend flashmla_sparse "
-        "--sglang-nsa-prefill-backend flashmla_sparse "
+        "--sglang-dsa-decode-backend flashmla_sparse "
+        "--sglang-dsa-prefill-backend flashmla_sparse "
+        "--sglang-kv-cache-dtype bf16 "
         "--sglang-attention-backend nsa "
         "--sglang-page-size 64 "
-        f"--sglang-cuda-graph-max-bs {sglang_decode_max_bs} "
+        f"--sglang-cuda-graph-max-bs-decode {sglang_decode_max_bs} "
         # concurrency
         f"--sglang-max-running-requests 512 "
         f"--sglang-chunked-prefill-size {2048 * sglang_world_size} "
         "--sglang-watchdog-timeout 3600 "
     )
+    if args.hardware in ("B200", "GB300") and not (args.fp8_rollout and args.use_deepep):
+        # TODO: fix bf16 trtllm weight update
+        if args.fp8_rollout:
+            sglang_args += "--sglang-moe-runner-backend flashinfer_trtllm_routed "
+        else:
+            sglang_args += "--sglang-moe-runner-backend triton "
     sglang_extra_env_vars = {
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": f"{32 if args.enable_pd else 256}",
         "SGLANG_NSA_FORCE_MLA": "1",
@@ -374,6 +381,7 @@ def _execute_train(args: ScriptArgs):
         f"--actor-num-gpus-per-node {args.num_gpus_per_node} "
         f"--num-gpus-per-node {args.num_gpus_per_node} "
         "--colocate "
+        "--rematerialize-param-from-master-weight "
     )
 
     if args.megatron_use_deepep:
@@ -386,7 +394,7 @@ def _execute_train(args: ScriptArgs):
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
-        f"{U.get_default_wandb_args(__file__, run_id=args.run_id)} "
+        f"{command_utils.get_default_wandb_args(__file__, run_id=args.run_id)} "
         f"{perf_args} "
         f"{eval_args} "
         f"{sglang_args} "
@@ -396,7 +404,6 @@ def _execute_train(args: ScriptArgs):
 
     U.execute_train(
         train_args=train_args,
-        config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type=args.megatron_model_type,
         extra_env_vars={
@@ -405,11 +412,12 @@ def _execute_train(args: ScriptArgs):
             "NVSHMEM_DISABLE_NCCL": "1",
         },
         megatron_path=args.megatron_path,
+        prepare_cmd=_prepare_cmd(args),
     )
 
 
 @app.command()
-@U.dataclass_cli
+@command_utils.dataclass_cli
 def full_train(args: ScriptArgs):
     """Full pipeline: download, convert, copy, train."""
     _prepare_download(args)
@@ -417,12 +425,11 @@ def full_train(args: ScriptArgs):
     if args.fp8_rollout:
         _convert_to_fp8(args)
     _prepare_megatron_ckpt(args)
-    _prepare_cp(args, skip_existing=True)
     _execute_train(args)
 
 
 @app.command()
-@U.dataclass_cli
+@command_utils.dataclass_cli
 def prepare(args: ScriptArgs):
     """Download model/data and convert to megatron checkpoint (run on head node)."""
     _prepare_download(args)
@@ -433,14 +440,7 @@ def prepare(args: ScriptArgs):
 
 
 @app.command()
-@U.dataclass_cli
-def prepare_cp(args: ScriptArgs):
-    """Copy model to local storage (run on all nodes via run_spmd)."""
-    _prepare_cp(args)
-
-
-@app.command()
-@U.dataclass_cli
+@command_utils.dataclass_cli
 def train(args: ScriptArgs):
     """Run training only (assumes data is prepared)."""
     _execute_train(args)

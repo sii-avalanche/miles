@@ -1,7 +1,8 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
 MODEL_NAME = "Qwen3-30B-A3B"
 MODEL_TYPE = "qwen3-30B-A3B"
@@ -14,29 +15,61 @@ class CaseConfig:
     num_gpus_per_node: int
     cp_size: int
     pp_size: int
-    tp_size: int = None
-    ep_size: int = None
+    tp_size: int
+    ep_size: int
+    rollout_num_gpus_per_engine: int
+    etp_size: int = 1
+    sglang_ep_size: int = None
+    sglang_dp_size: int = None
+    sglang_enable_dp_attention: bool = False
+    sglang_max_running_requests: int = 512
     use_deepep: bool = False
     use_fp8_rollout: bool = False
     use_int4_rollout: bool = False
     use_bridge: bool = False
     use_r3: bool = False
+    use_mooncake: bool = False
     max_tokens_per_gpu: int = 8192
+    colocate: bool = True
+    rollout_num_gpus: int = None
+    update_weight_transfer_mode: str = None
+    num_rollout: int = 2
+    fully_async: bool = False
+    optimizer: Literal["adam", "dist_muon"] = "adam"
+    extra_args: str = ""
+    extra_env_vars: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
-        if self.tp_size is None:
-            self.tp_size = self.num_gpus_per_node // self.cp_size // self.pp_size
-        if self.ep_size is None:
-            self.ep_size = self.num_gpus_per_node // self.pp_size
+        if self.optimizer not in ("adam", "dist_muon"):
+            raise ValueError(f"unsupported optimizer: {self.optimizer}")
+        # Validation only — topology values are passed explicitly, not inferred.
+        if self.fully_async and self.colocate:
+            raise ValueError("fully_async requires colocate=False: train_async.py rejects colocation")
+        if self.num_gpus_per_node % (self.cp_size * self.pp_size) != 0:
+            raise ValueError(
+                "num_gpus_per_node must be divisible by cp_size * pp_size: "
+                f"{self.num_gpus_per_node=} {self.cp_size=} {self.pp_size=}"
+            )
+        if not self.colocate and self.rollout_num_gpus is None:
+            raise ValueError("rollout_num_gpus must be set when colocate is False")
+        rollout_pool = self.num_gpus_per_node if self.colocate else self.rollout_num_gpus
+        if rollout_pool % self.rollout_num_gpus_per_engine != 0:
+            raise ValueError(
+                "rollout pool must be divisible by rollout_num_gpus_per_engine: "
+                f"{rollout_pool=} {self.rollout_num_gpus_per_engine=}"
+            )
+        if self.update_weight_transfer_mode is not None:
+            assert self.update_weight_transfer_mode in ("broadcast", "broadcast_packed")
 
 
 def prepare(case: CaseConfig, *, need_fp8: bool, need_int4: bool, all_bridge: bool) -> None:
-    U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command("hf download Qwen/Qwen3-30B-A3B --local-dir /root/models/Qwen3-30B-A3B")
+    U = command_utils.default_config().create_backend()
+    U.exec_command_cpu("mkdir -p /root/models /root/datasets")
+    U.exec_command_cpu("hf download Qwen/Qwen3-30B-A3B --local-dir /root/models/Qwen3-30B-A3B")
     if need_fp8:
-        U.exec_command("hf download Qwen/Qwen3-30B-A3B-FP8 --local-dir /root/models/Qwen3-30B-A3B-FP8")
+        U.exec_command_cpu("hf download Qwen/Qwen3-30B-A3B-FP8 --local-dir /root/models/Qwen3-30B-A3B-FP8")
     if need_int4:
-        U.exec_command(
+        U.exec_command_gpu(
             f"python tools/convert_hf_to_int4_direct.py "
             f"--model-dir /root/models/{MODEL_NAME} "
             f"--save-dir /root/models/{MODEL_NAME}-INT4"
@@ -69,6 +102,10 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
     ref_load = f"/root/models/{MODEL_NAME}" if case.use_bridge else f"/root/{MODEL_NAME}_torch_dist"
     if case.use_int4_rollout:
         ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}-INT4/ " f"--ref-load {ref_load} "
+        # Fake QAT swaps in straight-through weight tensors, while TE's fused wgrad
+        # accumulation writes main_grad onto the original ones, so the two together
+        # would drop the quantized weights' gradients.
+        ckpt_args += "--no-gradient-accumulation-fusion "
     elif case.use_fp8_rollout:
         ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}-FP8 " f"--ref-load {ref_load} "
     else:
@@ -81,7 +118,7 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
-        "--num-rollout 2 "
+        f"--num-rollout {case.num_rollout} "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 8192 "
@@ -104,7 +141,7 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
         f"--pipeline-model-parallel-size {case.pp_size} "
         f"--context-parallel-size {case.cp_size} "
         f"--expert-model-parallel-size {case.ep_size} "
-        "--expert-tensor-parallel-size 1 "
+        f"--expert-tensor-parallel-size {case.etp_size} "
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
@@ -112,7 +149,7 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
         f"--max-tokens-per-gpu {case.max_tokens_per_gpu} "
     )
 
-    if TIGHT_HOST_MEMORY:
+    if TIGHT_HOST_MEMORY and case.optimizer == "adam":
         perf_args += "--exp-avg-dtype fp16 "
         perf_args += "--exp-avg-sq-dtype fp16 "
         perf_args += "--main-params-dtype fp16 "
@@ -132,33 +169,48 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
     )
 
     optimizer_args = (
-        "--optimizer adam "
+        f"--optimizer {case.optimizer} "
         "--lr 1e-6 "
         "--lr-decay-style constant "
         "--weight-decay 0.1 "
         "--adam-beta1 0.9 "
         "--adam-beta2 0.98 "
-        "--optimizer-cpu-offload "
-        "--overlap-cpu-optimizer-d2h-h2d "
-        "--use-precision-aware-optimizer "
     )
-
-    if case.use_int4_rollout:
-        sglang_args = (
-            "--rollout-num-gpus-per-engine 1 " "--sglang-mem-fraction-static 0.8 " "--sglang-cuda-graph-max-bs 512 "
+    if case.optimizer == "dist_muon":
+        # Muon offloads through LayerWise; HybridDeviceOptimizer is Adam-only.
+        optimizer_args += (
+            "--chunked-optimizer-state-offload "
+            "--optimizer-state-offload-fraction 1.0 "
+            "--optimizer-state-offload-chunk-size-mb 1024 "
         )
     else:
-        sglang_args = (
-            "--rollout-num-gpus-per-engine 4 "
-            "--sglang-mem-fraction-static 0.7 "
-            "--sglang-max-running-requests 512 "
-            "--sglang-enable-metrics "
+        optimizer_args += (
+            "--optimizer-cpu-offload " "--overlap-cpu-optimizer-d2h-h2d " "--use-precision-aware-optimizer "
         )
+
+    sglang_args = (
+        f"--rollout-num-gpus-per-engine {case.rollout_num_gpus_per_engine} "
+        "--sglang-mem-fraction-static 0.7 "
+        f"--sglang-max-running-requests {case.sglang_max_running_requests} "
+        "--sglang-enable-metrics "
+    )
 
     if case.use_deepep:
         sglang_args += "--sglang-moe-a2a-backend deepep --sglang-deepep-mode auto "
+        if not (case.use_fp8_rollout or case.use_int4_rollout):
+            # SGLang has DeepEP MoE kernels for BF16 experts only on the DeepGEMM runner
+            # (FP8 already resolves auto to DeepGEMM).
+            sglang_args += "--sglang-moe-runner-backend deep_gemm "
+    if case.sglang_ep_size is not None:
+        sglang_args += f"--sglang-expert-parallel-size {case.sglang_ep_size} "
+    if case.sglang_dp_size is not None:
+        sglang_args += f"--sglang-data-parallel-size {case.sglang_dp_size} "
+    if case.sglang_enable_dp_attention:
+        sglang_args += "--sglang-enable-dp-attention "
 
     ci_args = "--ci-test "
+    if case.use_fp8_rollout or case.use_int4_rollout:
+        ci_args += "--check-weight-update-allow-quant-error "
 
     misc_args = (
         "--attention-dropout 0.0 "
@@ -168,11 +220,25 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
         "--attention-backend flash "
         "--actor-num-nodes 1 "
         f"--actor-num-gpus-per-node {case.num_gpus_per_node} "
-        "--colocate "
     )
+    if case.colocate:
+        misc_args += "--colocate "
+        if case.optimizer == "adam":
+            misc_args += "--rematerialize-param-from-master-weight "
+    else:
+        misc_args += f"--rollout-num-gpus {case.rollout_num_gpus} "
+
+    if case.update_weight_transfer_mode is not None:
+        misc_args += f"--update-weight-transfer-mode {case.update_weight_transfer_mode} "
 
     if case.use_bridge:
         misc_args += "--megatron-to-hf-mode bridge "
+
+    if case.fully_async:
+        misc_args += "--fully-async "
+
+    if case.use_mooncake:
+        misc_args += command_utils.get_mooncake_object_store_args()
 
     if case.use_deepep:
         misc_args += "--moe-token-dispatcher-type flex --moe-enable-deepep "
@@ -184,29 +250,33 @@ def build_train_args(case: CaseConfig, *, wandb_file: str) -> str:
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
-        f"{U.get_default_wandb_args(wandb_file)} "
+        f"{command_utils.get_default_wandb_args(wandb_file)} "
         f"{perf_args} "
         f"{eval_args} "
         f"{sglang_args} "
         f"{ci_args} "
         f"{misc_args} "
+        f"{case.extra_args} "
     )
     return train_args
 
 
 def execute(case: CaseConfig, *, wandb_file: str) -> None:
+    U = command_utils.default_config().create_backend()
     train_args = build_train_args(case, wandb_file=wandb_file)
 
-    extra_env_vars = {"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1"}
+    extra_env_vars = {}
     if case.use_int4_rollout:
         extra_env_vars |= {
             "OPEN_TRAINING_INT4_FAKE_QAT_FLAG": "1",
             "OPEN_TRAINING_INT4_GROUP_SIZE": "128",
         }
+    extra_env_vars |= case.extra_env_vars
 
     U.execute_train(
         train_args=train_args,
-        num_gpus_per_node=case.num_gpus_per_node,
+        num_gpus_per_node=case.num_gpus_per_node + (0 if case.colocate else case.rollout_num_gpus),
         megatron_model_type=MODEL_TYPE,
+        train_script="train_async.py" if case.fully_async else "train.py",
         extra_env_vars=extra_env_vars,
     )

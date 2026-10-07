@@ -6,18 +6,20 @@ python tools/convert_hf_to_nvfp4.py [-h] [--model-dir MODEL_DIR] [--save-dir SAV
                                    [--extra-high-precision-layers-hf ...]
 
 Convert a BF16/FP16/FP32 HF safetensors checkpoint to NVFP4 (E2M1) for MoE
-expert GEMMs only. Dense linear layers are left unmodified.
+routed-expert GEMMs in the main language decoder only. MTP, vision/audio
+components, shared experts, and dense linear layers are left unmodified.
 Use --extra-high-precision-layers-hf to keep additional HF weight-name
 substrings unquantized.
 
-This follows the NVFP4 reference quantization in Transformer Engine and uses
-1D block scaling (NVTE_NVFP4_1D_SCALING, group size = 16).
+This follows Transformer Engine NVFP4 quantization and uses 1D block scaling
+(NVTE_NVFP4_1D_SCALING, group size = 16).
 """
 
 import argparse
 import gc
 import json
 import os
+import re
 import shutil
 
 import safetensors
@@ -25,9 +27,8 @@ import safetensors.torch
 import torch
 from tqdm import tqdm
 
-FP4_E2M1_MAX = 6.0
-FP8_E4M3_MAX = 448.0
-NVFP4_GROUP_SIZE = 16
+from miles.utils.nvfp4 import NVFP4_GROUP_SIZE, nvfp4_quantize_1d, nvfp4_quantize_1d_pair
+
 DEFAULT_KV_CACHE_SCHEME = {"dynamic": False, "num_bits": 8, "type": "float"}
 DEFAULT_KV_CACHE_QUANT_ALGO = "FP8"
 
@@ -41,11 +42,25 @@ EXPERT_WEIGHT_SUFFIXES = (
     ".gate_up_proj.weight",
 )
 
-EXPERT_NAME_MARKERS = (
+ROUTED_EXPERT_NAME_MARKERS = (
     ".experts.",
-    ".shared_experts.",
     "block_sparse_moe.experts.",
     ".moe.experts.",
+)
+
+SHARED_EXPERT_NAME_MARKERS = (
+    ".shared_expert.",
+    ".shared_experts.",
+)
+
+LANGUAGE_MODEL_LAYER_PREFIXES = (
+    "model.layers",
+    "language_model.model.layers",
+    "model.language_model.layers",
+    "language_model.layers",
+)
+LANGUAGE_MODEL_LAYER_PATTERN = re.compile(
+    r"^(?:" + "|".join(re.escape(prefix) for prefix in LANGUAGE_MODEL_LAYER_PREFIXES) + r")\.(\d+)\."
 )
 
 FUSED_QKV_SUFFIXES = (".q_proj", ".k_proj", ".v_proj")
@@ -57,10 +72,12 @@ GATED_PAIR_SUFFIXES = {
 }
 
 
-def _is_moe_expert_weight_name(name: str) -> bool:
+def _is_routed_expert_weight_name(name: str) -> bool:
     if not name.endswith(".weight"):
         return False
-    if not any(marker in name for marker in EXPERT_NAME_MARKERS):
+    if any(marker in name for marker in SHARED_EXPERT_NAME_MARKERS):
+        return False
+    if not any(marker in name for marker in ROUTED_EXPERT_NAME_MARKERS):
         return False
     return any(name.endswith(suffix) for suffix in EXPERT_WEIGHT_SUFFIXES)
 
@@ -68,26 +85,37 @@ def _is_moe_expert_weight_name(name: str) -> bool:
 def _get_num_hidden_layers(model_dir: str) -> int:
     config_path = os.path.join(model_dir, "config.json")
     if not os.path.exists(config_path):
-        raise ValueError(
-            "config.json is required to use --num-layers-at-start-in-bf16 or --num-layers-at-end-in-bf16."
-        )
+        raise ValueError("config.json is required to identify the main language decoder layers.")
     cfg = json.load(open(config_path))
-    num_layers = cfg.get("num_hidden_layers")
-    if num_layers is None and isinstance(cfg.get("text_config"), dict):
-        num_layers = cfg["text_config"].get("num_hidden_layers")
+    text_config = cfg.get("text_config")
+    num_layers = text_config.get("num_hidden_layers") if isinstance(text_config, dict) else None
+    if num_layers is None:
+        num_layers = cfg.get("num_hidden_layers")
     if num_layers is None:
         raise ValueError("num_hidden_layers not found in config.json.")
     return int(num_layers)
+
+
+def _get_bf16_layer_prefixes(num_hidden_layers: int, num_at_start: int, num_at_end: int) -> tuple[str, ...]:
+    layer_indices = set(range(num_at_start)) | set(range(num_hidden_layers - num_at_end, num_hidden_layers))
+    return tuple(sorted(f"{prefix}.{i}." for prefix in LANGUAGE_MODEL_LAYER_PREFIXES for i in layer_indices))
 
 
 def should_quantize(
     name: str,
     weight: torch.Tensor,
     skip_weight_substrings: tuple[str, ...] = (),
+    *,
+    num_hidden_layers: int | None = None,
 ) -> bool:
+    # An allowlist keeps modality towers and separately named MTP stacks out.
+    # DeepSeek/GLM checkpoints append MTP to model.layers, so also bound its index.
+    match = LANGUAGE_MODEL_LAYER_PATTERN.match(name)
+    if match is None or (num_hidden_layers is not None and int(match.group(1)) >= num_hidden_layers):
+        return False
     if any(substr in name for substr in skip_weight_substrings):
         return False
-    if not _is_moe_expert_weight_name(name):
+    if not _is_routed_expert_weight_name(name):
         return False
     if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False
@@ -100,37 +128,11 @@ def should_quantize(
     return True
 
 
-def _nvfp4_global_decode_scale_te(global_amax: torch.Tensor) -> torch.Tensor:
-    fp4_max = torch.tensor(FP4_E2M1_MAX, device=global_amax.device, dtype=torch.float32)
-    fp8_max = torch.tensor(FP8_E4M3_MAX, device=global_amax.device, dtype=torch.float32)
-    global_encode_scale = torch.div(fp8_max * fp4_max, global_amax.to(torch.float32))
-    global_encode_scale = torch.min(
-        global_encode_scale,
-        torch.tensor(
-            torch.finfo(torch.float32).max,
-            device=global_encode_scale.device,
-            dtype=torch.float32,
-        ),
-    )
-    if global_encode_scale.numel() == 1:
-        if global_encode_scale == torch.tensor(0.0, device=global_amax.device, dtype=torch.float32):
-            global_encode_scale = torch.tensor(1.0, device=global_amax.device, dtype=torch.float32)
-    else:
-        global_encode_scale = torch.where(
-            global_encode_scale == 0.0,
-            torch.ones_like(global_encode_scale),
-            global_encode_scale,
-        )
-    return torch.div(1.0, global_encode_scale)
-
-
 def _quantize_nvfp4_1d(
     weight: torch.Tensor,
-    global_amax: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    NVFP4 1D quantization (tile shape = 1x16), adapted from
-    TransformerEngine NVFP4QuantizerRef._quantize_blockwise_reference.
+    NVFP4 1D quantization (tile shape = 1x16).
 
     Returns:
       qweight: uint8 packed fp4, shape (M, K // 2)
@@ -138,37 +140,19 @@ def _quantize_nvfp4_1d(
       global_scale: float32 scalar tensor
     """
     weight = weight.contiguous()
-    m, n = weight.shape
+    _, n = weight.shape
     if n % NVFP4_GROUP_SIZE != 0:
         raise ValueError(f"NVFP4 requires K divisible by {NVFP4_GROUP_SIZE}, got {n}.")
 
-    if global_amax is None:
-        global_amax = torch.max(torch.abs(weight.to(torch.float32)))
-    else:
-        global_amax = global_amax.to(device=weight.device, dtype=torch.float32)
-
-    from transformer_engine.pytorch.custom_recipes.quantization_nvfp4 import NVFP4QuantizerRef
-
-    qweight, block_scale = NVFP4QuantizerRef._quantize_blockwise_reference(
-        weight,
-        global_amax,
-        NVFP4_GROUP_SIZE,
-        1,
-        pow_2_scales=False,
-        eps=0.0,
-    )
-    return qweight, block_scale, _nvfp4_global_decode_scale_te(global_amax)
+    return nvfp4_quantize_1d(weight)
 
 
 def quantize_nvfp4(
     weight: torch.Tensor,
-    global_amax: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if weight.dim() == 2:
-        return _quantize_nvfp4_1d(weight, global_amax=global_amax)
+        return _quantize_nvfp4_1d(weight)
     if weight.dim() == 3:
-        if global_amax is not None:
-            raise ValueError("global_amax override is only supported for 2D weights.")
         qweights = []
         block_scales = []
         global_scales = []
@@ -225,6 +209,11 @@ def _update_quantization_config(cfg: dict, ignore_list: list[str]) -> None:
                 section["group_size"] = NVFP4_GROUP_SIZE
 
     cfg["quantization_config"] = quant_cfg
+    # Composite model configs can expose the text config's quantization policy
+    # as their top-level policy when loaded. Do not leave that policy stale.
+    text_config = cfg.get("text_config")
+    if isinstance(text_config, dict) and "quantization_config" in text_config:
+        _update_quantization_config(text_config, ignore_list)
 
 
 def _write_hf_quant_config(output_path: str, ignore_list: list[str], input_path: str) -> None:
@@ -258,6 +247,9 @@ def _augment_ignore_list(ignore_list: list[str]) -> list[str]:
                 if name.endswith(suffix):
                     extra.add(name[: -len(suffix)] + ".qkv_proj")
                     break
+        match = re.fullmatch(r"(.*\.experts)(?:\.\d+)?\.(gate_proj|up_proj|down_proj|gate_up_proj|w1|w2|w3)", name)
+        if match:
+            extra.add(match.group(1))
     ignore_set.update(extra)
     return sorted(ignore_set)
 
@@ -269,39 +261,53 @@ def _split_gated_pair_name(name: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _collect_shared_global_amax(
+def _collect_gated_pair_locations(
     *,
     input_path: str,
     safetensors_files: list[str],
     device: str,
     skip_weight_substrings: tuple[str, ...],
-) -> dict[str, torch.Tensor]:
-    """Collect shared gate/up amax across all shards to keep w1/w3 scales equal."""
-    gate_amax: dict[str, torch.Tensor] = {}
-    up_amax: dict[str, torch.Tensor] = {}
+    num_hidden_layers: int,
+) -> dict[str, dict[str, tuple[str, str]]]:
+    gated_pairs: dict[str, dict[str, tuple[str, str]]] = {}
     for filename in safetensors_files:
         with safetensors.safe_open(os.path.join(input_path, filename), framework="pt", device=device) as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
-                if not should_quantize(key, tensor, skip_weight_substrings=skip_weight_substrings):
+                if not should_quantize(
+                    key, tensor, skip_weight_substrings=skip_weight_substrings, num_hidden_layers=num_hidden_layers
+                ):
                     continue
                 base, role = _split_gated_pair_name(key)
                 if base is None or role is None:
                     continue
-                amax = tensor.abs().max().to(torch.float32)
-                if role == "gate":
-                    prev = gate_amax.get(base)
-                    gate_amax[base] = amax if prev is None else torch.max(prev, amax)
-                elif role == "up":
-                    prev = up_amax.get(base)
-                    up_amax[base] = amax if prev is None else torch.max(prev, amax)
-                else:
-                    continue
+                roles = gated_pairs.setdefault(base, {})
+                if role in roles:
+                    raise ValueError(
+                        f"NVFP4 requires a single complete gate/up pair per converted checkpoint; "
+                        f"found duplicate {role} tensor for {base}."
+                    )
+                roles[role] = (filename, key)
+    return {base: roles for base, roles in gated_pairs.items() if set(roles) == {"gate", "up"}}
 
-    shared_global_amax: dict[str, torch.Tensor] = {}
-    for base in gate_amax.keys() & up_amax.keys():
-        shared_global_amax[base] = torch.max(gate_amax[base], up_amax[base])
-    return shared_global_amax
+
+def _nvfp4_quantized_entries(
+    key: str,
+    qweight: torch.Tensor,
+    block_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    return {
+        key: qweight,
+        key.replace(".weight", ".weight_scale"): block_scale,
+        key.replace(".weight", ".weight_scale_2"): weight_scale_2,
+        key.replace(".weight", ".input_scale"): torch.ones_like(weight_scale_2, dtype=torch.float32),
+    }
+
+
+def _load_safetensors_tensor(input_path: str, filename: str, key: str, device: str) -> torch.Tensor:
+    with safetensors.safe_open(os.path.join(input_path, filename), framework="pt", device=device) as f:
+        return f.get_tensor(key)
 
 
 def process_file(
@@ -314,21 +320,18 @@ def process_file(
     num_layers_at_start_in_bf16: int,
     num_layers_at_end_in_bf16: int,
     extra_high_precision_layers_hf: tuple[str, ...],
-    shared_global_amax: dict[str, torch.Tensor],
+    gated_pair_locations: dict[str, dict[str, tuple[str, str]]],
+    processed_gated_pairs: set[str],
+    deferred_quantized_entries: dict[str, dict[str, dict[str, torch.Tensor]]],
 ) -> None:
     if not filename.endswith(".safetensors"):
         return
 
     modules_to_not_convert: list[str] = []
     q_weights: dict[str, torch.Tensor] = {}
-    head_end_idx = num_layers_at_start_in_bf16
-    tail_start_idx = num_hidden_layers - num_layers_at_end_in_bf16
-    dynamic_skip_layer_prefixes: set[str] = set()
-    dynamic_skip_layer_prefixes.update({f"model.layers.{i}." for i in range(0, head_end_idx)})
-    dynamic_skip_layer_prefixes.update({f"model.layers.{i}." for i in range(tail_start_idx, num_hidden_layers)})
-
-    if num_layers_at_end_in_bf16 > 0 or num_layers_at_start_in_bf16 > 0:
-        modules_to_not_convert.extend(sorted(dynamic_skip_layer_prefixes))
+    dynamic_skip_layer_prefixes = _get_bf16_layer_prefixes(
+        num_hidden_layers, num_layers_at_start_in_bf16, num_layers_at_end_in_bf16
+    )
 
     dynamic_skip_substrings = (
         *extra_high_precision_layers_hf,
@@ -337,20 +340,63 @@ def process_file(
 
     with safetensors.safe_open(os.path.join(input_path, filename), framework="pt", device=device) as f:
         for key in f.keys():
+            if key in q_weights:
+                continue
+            deferred_entries = deferred_quantized_entries.get(filename, {}).pop(key, None)
+            if deferred_entries is not None:
+                q_weights.update(deferred_entries)
+                continue
+
             tensor = f.get_tensor(key)
-            if should_quantize(key, tensor, skip_weight_substrings=dynamic_skip_substrings):
+            if should_quantize(
+                key, tensor, skip_weight_substrings=dynamic_skip_substrings, num_hidden_layers=num_hidden_layers
+            ):
                 base, _role = _split_gated_pair_name(key)
-                global_amax = shared_global_amax.get(base) if base else None
-                qweight, block_scale, weight_scale_2 = quantize_nvfp4(tensor, global_amax=global_amax)
-                q_weights[key] = qweight
-                q_weights[key.replace(".weight", ".weight_scale")] = block_scale
-                q_weights[key.replace(".weight", ".weight_scale_2")] = weight_scale_2
-                q_weights[key.replace(".weight", ".input_scale")] = torch.ones_like(
-                    weight_scale_2, dtype=torch.float32
-                )
+                if base in gated_pair_locations:
+                    if base in processed_gated_pairs:
+                        raise ValueError(f"Missing deferred NVFP4 output for already processed gated pair {base}.")
+
+                    pair = gated_pair_locations[base]
+                    gate_filename, gate_key = pair["gate"]
+                    up_filename, up_key = pair["up"]
+                    gate_weight = (
+                        tensor
+                        if key == gate_key
+                        else _load_safetensors_tensor(input_path, gate_filename, gate_key, device)
+                    )
+                    up_weight = (
+                        tensor if key == up_key else _load_safetensors_tensor(input_path, up_filename, up_key, device)
+                    )
+                    gate_output, up_output = nvfp4_quantize_1d_pair(gate_weight, up_weight)
+                    for target_filename, target_key, output in (
+                        (gate_filename, gate_key, gate_output),
+                        (up_filename, up_key, up_output),
+                    ):
+                        entries = _nvfp4_quantized_entries(target_key, *output)
+                        if target_filename == filename:
+                            q_weights.update(entries)
+                        else:
+                            deferred_quantized_entries.setdefault(target_filename, {})[target_key] = entries
+                    processed_gated_pairs.add(base)
+                    continue
+
+                qweight, block_scale, weight_scale_2 = quantize_nvfp4(tensor)
+                q_weights.update(_nvfp4_quantized_entries(key, qweight, block_scale, weight_scale_2))
             else:
                 if key.endswith(".weight"):
-                    modules_to_not_convert.append(key.replace(".weight", ""))
+                    module_name = key[: -len(".weight")]
+                    matched_layer_prefixes = [
+                        prefix for prefix in dynamic_skip_layer_prefixes if key.startswith(prefix)
+                    ]
+                    modules_to_not_convert.extend(matched_layer_prefixes)
+                    if ".experts." not in key:
+                        modules_to_not_convert.append(module_name)
+                    elif matched_layer_prefixes:
+                        # ModelOpt needs the exact FusedMoE container in addition to the layer prefix.
+                        expert_prefix = module_name.split(".experts.", 1)[0] + ".experts"
+                        modules_to_not_convert.append(expert_prefix)
+                    else:
+                        modules_to_not_convert.append(module_name)
                 q_weights[key] = tensor
 
     safetensors.torch.save_file(q_weights, os.path.join(output_path, filename), metadata={"format": "pt"})
@@ -376,22 +422,23 @@ def convert_nvfp4(
     safetensors_files = [f for f in os.listdir(input_path) if f.endswith(".safetensors")]
 
     num_hidden_layers = _get_num_hidden_layers(input_path)
-    head_end_idx = num_layers_at_start_in_bf16
-    tail_start_idx = num_hidden_layers - num_layers_at_end_in_bf16
-    dynamic_skip_layer_prefixes: set[str] = set()
-    dynamic_skip_layer_prefixes.update({f"model.layers.{i}." for i in range(0, head_end_idx)})
-    dynamic_skip_layer_prefixes.update({f"model.layers.{i}." for i in range(tail_start_idx, num_hidden_layers)})
+    dynamic_skip_layer_prefixes = _get_bf16_layer_prefixes(
+        num_hidden_layers, num_layers_at_start_in_bf16, num_layers_at_end_in_bf16
+    )
     dynamic_skip_substrings = (
         *extra_high_precision_layers_hf,
         *sorted(dynamic_skip_layer_prefixes),
     )
 
-    shared_global_amax = _collect_shared_global_amax(
+    gated_pair_locations = _collect_gated_pair_locations(
         input_path=input_path,
         safetensors_files=safetensors_files,
         device=device,
         skip_weight_substrings=dynamic_skip_substrings,
+        num_hidden_layers=num_hidden_layers,
     )
+    processed_gated_pairs: set[str] = set()
+    deferred_quantized_entries: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
     result_collector = ConversionResult()
     for filename in tqdm(safetensors_files, desc="Processing files"):
         process_file(
@@ -404,11 +451,19 @@ def convert_nvfp4(
             num_layers_at_start_in_bf16,
             num_layers_at_end_in_bf16,
             extra_high_precision_layers_hf,
-            shared_global_amax,
+            gated_pair_locations,
+            processed_gated_pairs,
+            deferred_quantized_entries,
         )
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    remaining_deferred_entries = {
+        filename: sorted(entries) for filename, entries in deferred_quantized_entries.items() if entries
+    }
+    if remaining_deferred_entries:
+        raise RuntimeError(f"Unwritten deferred NVFP4 gated-pair entries: {remaining_deferred_entries}")
 
     ignore_list = _augment_ignore_list(result_collector.modules_to_not_convert)
 

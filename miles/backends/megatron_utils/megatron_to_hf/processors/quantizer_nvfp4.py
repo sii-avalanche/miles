@@ -1,10 +1,9 @@
 import re
+from functools import lru_cache
 
 import torch
 
-FP4_E2M1_MAX = 6.0
-FP8_E4M3_MAX = 448.0
-NVFP4_GROUP_SIZE = 16
+from miles.utils.nvfp4 import NVFP4_GROUP_SIZE, nvfp4_quantize_1d, nvfp4_quantize_1d_pair
 
 GATED_PAIR_SUFFIXES = {
     ".gate_proj.weight": "gate",
@@ -24,7 +23,23 @@ def _get_ignore_rules(quantization_config) -> list[str]:
     return list(ignore_rules) + [rule for rule in exclude_rules if rule not in ignore_rules]
 
 
-def _is_ignored(name: str, ignore_rules: list[str]) -> bool:
+@lru_cache(maxsize=16)
+def _literal_ignore_rules(ignore_rules: tuple[str, ...]) -> frozenset[str] | None:
+    # Preserve the original ordered matching (including short-circuit behavior)
+    # for regex policies. Snapshot keys also invalidate after config mutations.
+    if any(rule.startswith("re:") for rule in ignore_rules):
+        return None
+    return frozenset(ignore_rules)
+
+
+def _is_ignored(name: str, ignore_rules: list[str], literal_rules: frozenset[str] | None = None) -> bool:
+    if literal_rules is not None:
+        while True:
+            if name in literal_rules:
+                return True
+            name, separator, _ = name.rpartition(".")
+            if not separator:
+                return False
     for rule in ignore_rules:
         if rule.startswith("re:"):
             if re.match(rule[3:], name):
@@ -38,6 +53,8 @@ def _is_ignored(name: str, ignore_rules: list[str]) -> bool:
 def quantize_params_nvfp4(args, megatron_name, converted_named_params, quantization_config):
     assert quantization_config is not None
     assert quantization_config.get("quant_algo") == "NVFP4" or quantization_config.get("quant_method") == "nvfp4"
+    if args is not None and bool(getattr(args, "fp4_param", False) or getattr(args, "fp4_param_gather", False)):
+        raise NotImplementedError("fp4-param-gather is unsupported for Miles NVFP4 checkpoint export.")
 
     if getattr(args, "extra_high_precision_layers_megatron", False):
         for layer_name in getattr(args, "extra_high_precision_layers_megatron", ()):
@@ -46,19 +63,12 @@ def quantize_params_nvfp4(args, megatron_name, converted_named_params, quantizat
 
     ignore_rules = _get_ignore_rules(quantization_config)
 
-    decoder_layers_pattern = r"decoder\.layers\.(\d+)\.(.+)"
-    match = re.search(decoder_layers_pattern, megatron_name)
-
+    # Only the main language decoder is eligible; MTP and modality towers stay in high precision.
+    decoder_layers_pattern = r"(?:module\.)*(?:language_model\.)?decoder\.layers\.(\d+)\.(.+)"
+    match = re.match(decoder_layers_pattern, megatron_name)
     if not match:
-        # check mtp layers
-        mtp_layer_pattern = r"mtp\.layers\.(\d+)\.(.+)"
-        match = re.search(mtp_layer_pattern, megatron_name)
-        if not match:
-            return converted_named_params
-        layer_idx, rest = match.groups()
-        rest = rest.replace("transformer_layer.", "")
-    else:
-        layer_idx, rest = match.groups()
+        return converted_named_params
+    layer_idx, rest = match.groups()
 
     # Skip quantization for BF16 tail of main decoder layers.
     if getattr(args, "first_last_layers_bf16", False):
@@ -70,7 +80,7 @@ def quantize_params_nvfp4(args, megatron_name, converted_named_params, quantizat
         if int(layer_idx) < head_end_idx or int(layer_idx) >= tail_start_idx:
             return converted_named_params
 
-    # experts
+    # routed experts
     expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
     match = re.match(expert_pattern, rest)
     if match:
@@ -81,37 +91,28 @@ def quantize_params_nvfp4(args, megatron_name, converted_named_params, quantizat
         ]:
             return _quantize_moe_params(converted_named_params, ignore_rules)
 
-    # shared expert
-    shared_expert_pattern = r"mlp.shared_experts\.(.+)"
-    match = re.match(shared_expert_pattern, rest)
-    if match:
-        rest = match.groups()[0]
-        if rest in [
-            "linear_fc1.weight",
-            "linear_fc2.weight",
-        ]:
-            return _quantize_moe_params(converted_named_params, ignore_rules)
-
     # for other parameters, we just return the original converted_named_params
     return converted_named_params
 
 
 def _quantize_moe_params(converted_named_params, ignore_rules):
-    shared_global_amax = {}
+    # Build/hash the policy once per conversion batch, not once per weight check.
+    literal_rules = _literal_ignore_rules(tuple(ignore_rules))
     gated_candidates = {}
     for converted_name, param in converted_named_params:
         base, role = _split_gated_pair_name(converted_name)
         if base is None or role is None:
             continue
-        if _should_quantize_param(converted_name, param, ignore_rules):
+        if _should_quantize_param(converted_name, param, ignore_rules, literal_rules):
             roles = gated_candidates.setdefault(base, {})
             if role in roles:
                 raise ValueError(
                     f"NVFP4 requires a single complete gate/up pair per conversion batch; "
                     f"found duplicate {role} tensor for {base}."
                 )
-            roles[role] = param
+            roles[role] = (converted_name, param)
 
+    paired_outputs = {}
     for base, roles in gated_candidates.items():
         if set(roles) != {"gate", "up"}:
             present = ", ".join(sorted(roles))
@@ -119,30 +120,30 @@ def _quantize_moe_params(converted_named_params, ignore_rules):
                 f"NVFP4 requires gate/up tensors to be quantized together so they can share "
                 f"one global amax; found only {{{present}}} for {base}."
             )
-        gate_amax = roles["gate"].abs().max().to(torch.float32)
-        up_amax = roles["up"].abs().max().to(torch.float32)
-        shared_global_amax[base] = torch.max(gate_amax, up_amax)
+        gate_name, gate_weight = roles["gate"]
+        up_name, up_weight = roles["up"]
+        gate_output, up_output = nvfp4_quantize_1d_pair(gate_weight, up_weight)
+        paired_outputs[gate_name] = gate_output
+        paired_outputs[up_name] = up_output
 
     quantize_named_params = []
     for converted_name, param in converted_named_params:
-        if not _should_quantize_param(converted_name, param, ignore_rules):
+        if not _should_quantize_param(converted_name, param, ignore_rules, literal_rules):
             quantize_named_params.append((converted_name, param))
             continue
-        base, _role = _split_gated_pair_name(converted_name)
-        global_amax = shared_global_amax.get(base) if base else None
-        qweight, block_scale, weight_scale_2 = quantize_nvfp4(param, global_amax=global_amax)
+        if converted_name in paired_outputs:
+            qweight, block_scale, weight_scale_2 = paired_outputs[converted_name]
+        else:
+            qweight, block_scale, weight_scale_2 = quantize_nvfp4(param)
         quantize_named_params.append((converted_name, qweight))
         quantize_named_params.append((converted_name.replace(".weight", ".weight_scale"), block_scale))
         quantize_named_params.append((converted_name.replace(".weight", ".weight_scale_2"), weight_scale_2))
-        quantize_named_params.append(
-            (converted_name.replace(".weight", ".input_scale"), torch.ones_like(weight_scale_2, dtype=torch.float32))
-        )
 
     return quantize_named_params
 
 
-def _should_quantize_param(name, weight, ignore_rules):
-    if ignore_rules and _is_ignored(name, ignore_rules):
+def _should_quantize_param(name, weight, ignore_rules, literal_rules=None):
+    if ignore_rules and _is_ignored(name, ignore_rules, literal_rules):
         return False
     if not name.endswith(".weight"):
         return False
@@ -162,37 +163,11 @@ def _split_gated_pair_name(name: str):
     return None, None
 
 
-def _nvfp4_global_decode_scale_te(global_amax: torch.Tensor) -> torch.Tensor:
-    fp4_max = torch.tensor(FP4_E2M1_MAX, device=global_amax.device, dtype=torch.float32)
-    fp8_max = torch.tensor(FP8_E4M3_MAX, device=global_amax.device, dtype=torch.float32)
-    global_encode_scale = torch.div(fp8_max * fp4_max, global_amax.to(torch.float32))
-    global_encode_scale = torch.min(
-        global_encode_scale,
-        torch.tensor(
-            torch.finfo(torch.float32).max,
-            device=global_encode_scale.device,
-            dtype=torch.float32,
-        ),
-    )
-    if global_encode_scale.numel() == 1:
-        if global_encode_scale == torch.tensor(0.0, device=global_amax.device, dtype=torch.float32):
-            global_encode_scale = torch.tensor(1.0, device=global_amax.device, dtype=torch.float32)
-    else:
-        global_encode_scale = torch.where(
-            global_encode_scale == 0.0,
-            torch.ones_like(global_encode_scale),
-            global_encode_scale,
-        )
-    return torch.div(1.0, global_encode_scale)
-
-
 def _quantize_nvfp4_1d(
     weight: torch.Tensor,
-    global_amax: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    NVFP4 1D quantization (tile shape = 1x16), adapted from
-    TransformerEngine NVFP4QuantizerRef._quantize_blockwise_reference.
+    NVFP4 1D quantization (tile shape = 1x16).
 
     Returns:
       qweight: uint8 packed fp4, shape (M, K // 2)
@@ -200,37 +175,19 @@ def _quantize_nvfp4_1d(
       global_scale: float32 scalar tensor
     """
     weight = weight.contiguous()
-    m, n = weight.shape
+    _, n = weight.shape
     if n % NVFP4_GROUP_SIZE != 0:
         raise ValueError(f"NVFP4 requires K divisible by {NVFP4_GROUP_SIZE}, got {n}.")
 
-    if global_amax is None:
-        global_amax = torch.max(torch.abs(weight.to(torch.float32)))
-    else:
-        global_amax = global_amax.to(device=weight.device, dtype=torch.float32)
-
-    from transformer_engine.pytorch.custom_recipes.quantization_nvfp4 import NVFP4QuantizerRef
-
-    qweight, block_scale = NVFP4QuantizerRef._quantize_blockwise_reference(
-        weight,
-        global_amax,
-        NVFP4_GROUP_SIZE,
-        1,
-        pow_2_scales=False,
-        eps=0.0,
-    )
-    return qweight, block_scale, _nvfp4_global_decode_scale_te(global_amax)
+    return nvfp4_quantize_1d(weight)
 
 
 def quantize_nvfp4(
     weight: torch.Tensor,
-    global_amax: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if weight.dim() == 2:
-        return _quantize_nvfp4_1d(weight, global_amax=global_amax)
+        return _quantize_nvfp4_1d(weight)
     if weight.dim() == 3:
-        if global_amax is not None:
-            raise ValueError("global_amax override is only supported for 2D weights.")
         qweights = []
         block_scales = []
         global_scales = []

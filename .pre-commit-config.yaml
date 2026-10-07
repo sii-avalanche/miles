@@ -1,6 +1,10 @@
 default_language_version:
   python: python3
 
+# The vendored upstream module stays byte-diffable against its source; keep
+# formatters and linters away so upstream-tracking diffs remain minimal.
+exclude: '^miles/utils/chat_template_utils/templates/encoding_dsv32\.py$'
+
 ci:
   autofix_prs: true
   autoupdate_commit_msg: '[pre-commit.ci] pre-commit suggestions'
@@ -11,6 +15,8 @@ repos:
     rev: v4.5.0
     hooks:
       - id: check-yaml
+        args: ['--allow-multiple-documents']
+        exclude: '^charts/.*/templates/'
       - id: check-case-conflict
       - id: detect-private-key
       - id: check-added-large-files
@@ -47,6 +53,26 @@ repos:
 
   - repo: local
     hooks:
+      - id: sync-example-docs
+        name: Mirror examples/ READMEs into the docs site
+        language: system
+        entry: python3 scripts/tools/sync_example_docs.py
+        files: '^(examples/.*README\.md|docs/examples/.*|docs/docs\.json|scripts/tools/sync_example_docs\.py)$'
+        pass_filenames: false
+
+      - id: ban-docs-nav-group-root
+        name: Ban group `root` in docs navigation (put the landing page first in `pages` with `sidebarTitle Overview` instead; see docs/README.md)
+        language: pygrep
+        entry: '"root":'
+        files: ^docs/docs\.json$
+
+      - id: helm-lint
+        name: helm lint every chart
+        language: system
+        entry: python3 tools/kubernetes/lint_charts.py
+        pass_filenames: false
+        files: '^charts/'
+
       - id: ban-mpu-get
         name: Ban direct mpu.get_* calls (use ParallelState)
         language: pygrep
@@ -59,4 +85,10 @@ repos:
         language: pygrep
         entry: '(AutoConfig|AutoTokenizer)\.from_pretrained'
         types: [python]
-        exclude: '(miles/utils/hf_config\.py|miles/utils/processing_utils\.py|tests/|test_utils/|miles_plugins/|examples/)'
+        exclude: '(miles/utils/hf_utils/config\.py|miles/utils/processing_utils\.py|tests/|test_utils/|miles_plugins/|examples/)'
+
+      - id: ban-huggingface-cli
+        name: Ban deprecated huggingface-cli (use hf)
+        language: pygrep
+        entry: 'huggingface-cli'
+        types: [python]

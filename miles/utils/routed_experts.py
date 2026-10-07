@@ -20,14 +20,16 @@ def decode_routed_experts(
     num_layers: int,
     moe_router_topk: int,
 ) -> np.ndarray:
-    return np.frombuffer(
-        pybase64.b64decode(routed_experts.encode("ascii")),
-        dtype=np.int32,
-    ).reshape(
-        num_tokens,
-        num_layers,
-        moe_router_topk,
+    x = np.frombuffer(pybase64.b64decode(routed_experts.encode("ascii")), dtype=np.int32)
+    row = num_layers * moe_router_topk
+    if x.size == (num_tokens + 1) * row:
+        # sglang also forwarded the final token, whose routing feeds no training position
+        x = x[: num_tokens * row]
+    assert x.size == 0 or x.any(), (
+        "routed_experts payload is all zeros: the sglang engine did not capture routed experts "
+        "(topk-bypassing --moe-runner-backend such as flashinfer_trtllm?)."
     )
+    return x.reshape(num_tokens, num_layers, moe_router_topk)
 
 
 def resolve_routed_experts(

@@ -7,7 +7,8 @@ from tests.e2e.megatron.test_qwen3_30B_A3B._common import CaseConfig, execute, p
 register_cuda_ci(
     est_time=1800,
     suite="stage-c-4-gpu-h200",
-    labels=["megatron"],
+    labels=["megatron", "replay"],
+    hardware=["hopper", "blackwell"],
     disabled="Failed due to mismatch between fp8 rollout and bf16 training.",
 )
 
@@ -20,6 +21,10 @@ CASE = CaseConfig(
     num_gpus_per_node=4,
     cp_size=2,
     pp_size=1,
+    tp_size=2,
+    ep_size=4,
+    rollout_num_gpus_per_engine=4,
+    sglang_ep_size=4,
 )
 
 

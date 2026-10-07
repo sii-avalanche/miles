@@ -1,3 +1,4 @@
+# FIXME
 """End-to-end test for MTP-only gradient verification.
 
 This test verifies that when MTP training is enabled and all outputs are truncated
@@ -10,11 +11,12 @@ to only the MTP layers when the main model loss is zero (due to truncation).
 
 import os
 
-from tests.ci.ci_register import register_cuda_ci
+from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
-register_cuda_ci(est_time=420, suite="stage-c-4-gpu-h200", labels=["megatron"])
+register_cuda_ci(est_time=400, suite="stage-c-4-gpu-h200", labels=["megatron"], hardware=["hopper", "blackwell"])
+register_rocm_ci(est_time=600, suite="nightly-stage-c-4-gpu-mi350", labels=["megatron"])
 
 MODEL_NAME = "MiMo-7B-RL"
 MODEL_TYPE = "mimo-7B-rl"
@@ -23,8 +25,9 @@ NUM_GPUS = 4
 
 def prepare():
     """Download model and convert checkpoint with MTP layers."""
-    U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command(f"hf download XiaomiMiMo/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
+    U = command_utils.default_config().create_backend()
+    U.exec_command_cpu("mkdir -p /root/models /root/datasets")
+    U.exec_command_cpu(f"hf download XiaomiMiMo/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/dapo-math-17k")
 
     # Convert checkpoint with MTP layers enabled
@@ -39,6 +42,7 @@ def prepare():
 
 def execute():
     """Run training with MTP enabled and very short output length to cause truncation."""
+    U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
 
     # Use very short rollout-max-response-len to ensure all outputs are truncated
@@ -118,6 +122,7 @@ def execute():
         "--actor-num-nodes 1 "
         f"--actor-num-gpus-per-node {NUM_GPUS} "
         "--colocate "
+        "--rematerialize-param-from-master-weight "
     )
 
     train_args = (
@@ -125,7 +130,7 @@ def execute():
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
-        f"{U.get_default_wandb_args(__file__)} "
+        f"{command_utils.get_default_wandb_args(__file__)} "
         f"{perf_args} "
         f"{sglang_args} "
         f"{mtp_args} "
@@ -137,7 +142,6 @@ def execute():
         train_args=train_args,
         num_gpus_per_node=NUM_GPUS,
         megatron_model_type=MODEL_TYPE,
-        extra_env_vars={"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1"},
     )
 
 

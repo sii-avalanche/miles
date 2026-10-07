@@ -1,18 +1,23 @@
 import logging
 import os
 import re
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch.distributed as dist
+from megatron.core.utils import unwrap_model
 
 # TODO: may need to copy those 2 functions and do refactoring.
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.global_vars import get_args
 
+from miles.backends.training_utils.weight_update.snapshot_publisher import SnapshotPublisher
 from miles.utils import megatron_bridge_utils
+from miles_plugins.models.deepseek_v4.arguments import assert_checkpoint_is_current, is_dsv4_model
 
-from .lora_utils import is_lora_enabled, is_lora_model, load_lora_adapter, save_lora_checkpoint
+from .lora.utils import is_lora_enabled, is_lora_model, load_lora_adapter, save_lora_checkpoint
+from .model_provider import LinearForLastLayer
 
 try:
     # Here we patch out the `validate_non_overlapping_shards_metadata` in both functions
@@ -100,13 +105,20 @@ __all__ = ["save_checkpoint", "save_checkpoint_with_lora", "load_checkpoint"]
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
     # ref: how megatron `load_checkpoint` gets directory
     args = get_args()
+
     load_path = args.load
 
-    assert Path(load_path).exists() and _is_dir_nonempty(
-        load_path
-    ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
+    has_local_checkpoint_manager = "local_checkpoint_manager" in (checkpointing_context or {})
+    if has_local_checkpoint_manager:
+        logger.info("Skipping disk path validation: using in-memory checkpoint via local_checkpoint_manager")
+    else:
+        assert Path(load_path).exists() and _is_dir_nonempty(
+            load_path
+        ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
-    if _is_megatron_checkpoint(load_path):
+    if has_local_checkpoint_manager or _is_megatron_checkpoint(load_path):
+        if not has_local_checkpoint_manager and is_dsv4_model(args):
+            assert_checkpoint_is_current(load_path)
         result = _load_checkpoint_megatron(
             ddp_model=ddp_model,
             optimizer=optimizer,
@@ -123,14 +135,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         )
 
     # Load LoRA adapter weights if available
+    native_optimizer_restored = False
     if is_lora_enabled(args):
         adapter_path = getattr(args, "lora_adapter_path", None)
         if adapter_path is not None:
-            loaded, iteration = load_lora_adapter(
+            loaded, iteration, native_optimizer_restored = load_lora_adapter(
                 ddp_model,
                 adapter_path,
                 optimizer=optimizer,
                 opt_param_scheduler=opt_param_scheduler,
+                load_optimizer=not args.no_load_optim,
             )
             if loaded:
                 logger.info(f"Successfully loaded LoRA adapter from {adapter_path}")
@@ -143,20 +157,26 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
                     f"Training will start with freshly initialized adapter weights."
                 )
 
-    return result
+    return (*result, native_optimizer_restored)
 
 
-def save_checkpoint_with_lora(iteration, model, optimizer, opt_param_scheduler):
+def save_checkpoint_with_lora(
+    iteration, model, optimizer, opt_param_scheduler, *, publisher: SnapshotPublisher | None = None
+):
     """Extended save that handles LoRA adapters separately."""
     args = get_args()
 
     if is_lora_model(model):
+        assert (
+            publisher is not None or args.megatron_to_hf_mode == "raw"
+        ), "Bridge LoRA checkpoint requires a snapshot publisher"
         save_dir = Path(args.save) / f"iter_{iteration:07d}" / "adapter"
         logger.info(f"Saving LoRA checkpoint to {save_dir}")
         save_lora_checkpoint(
             model,
             args,
             str(save_dir),
+            publisher=publisher,
             optimizer=optimizer,
             opt_param_scheduler=opt_param_scheduler,
             iteration=iteration,
@@ -171,13 +191,30 @@ def _is_megatron_checkpoint(path: str | Path) -> bool:
     )
 
 
+@contextmanager
+def _hide_critic_value_head_from_hf_load(ddp_model):
+    value_heads = [
+        (chunk, name, head)
+        for chunk in unwrap_model(ddp_model)
+        for name, head in chunk.named_children()
+        if isinstance(head, LinearForLastLayer)
+    ]
+    for chunk, name, _ in value_heads:
+        delattr(chunk, name)
+    try:
+        yield
+    finally:
+        for chunk, name, head in value_heads:
+            setattr(chunk, name, head)
+
+
 def _load_checkpoint_hf(ddp_model, optimizer, args, load_path: str):
     assert args.megatron_to_hf_mode == "bridge", "Only bridge mode is supported for loading HF checkpoint"
     from megatron.bridge import AutoBridge
 
     logger.info(f"Load checkpoint from HuggingFace model into Megatron (path={load_path})")
 
-    with megatron_bridge_utils.patch_megatron_model(ddp_model):
+    with megatron_bridge_utils.patch_megatron_model(ddp_model), _hide_critic_value_head_from_hf_load(ddp_model):
         bridge = AutoBridge.from_hf_pretrained(load_path, trust_remote_code=True)
         bridge.load_hf_weights(ddp_model)
 

@@ -5,8 +5,17 @@ Utils to integrate SGLang's `/generate` endpoint with RL things like Sample.
 from copy import deepcopy
 from typing import Any
 
-from miles.utils.processing_utils import encode_image_for_rollout_engine
-from miles.utils.routed_experts import decode_routed_experts, is_boxed_ray_ref
+import numpy as np
+import pybase64
+
+from miles.rollout.generate_utils.rollout_topk_logprobs import (
+    append_rollout_topk_logprobs,
+    configure_rollout_topk_logprobs_request,
+)
+from miles.rollout.generate_utils.sampling_mask import append_sampling_metadata, should_return_sampling_mask
+from miles.utils.lora.utils import LORA_ADAPTER_NAME, lora_rollout_enabled
+from miles.utils.processing_utils import encode_image_for_rollout_engine, extract_multimodal_train_inputs
+from miles.utils.routed_experts import is_boxed_ray_ref
 from miles.utils.types import Sample
 
 
@@ -19,9 +28,7 @@ def compute_prompt_ids_from_sample(state, sample, tools=None):
         prompt_ids = processor_output["input_ids"][0]
 
         # TODO shall we move it to other places? then can make this function immutable
-        sample.multimodal_train_inputs = {
-            k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
-        } or None
+        sample.multimodal_train_inputs = extract_multimodal_train_inputs(processor_output)
 
         return prompt_ids
     else:
@@ -33,11 +40,28 @@ def compute_prompt_ids_from_sample(state, sample, tools=None):
         return state.tokenizer.encode(prompt, add_special_tokens=False)
 
 
+def policy_uses_routing_key(args) -> bool:
+    return args.sglang_router_policy in ("consistent_hashing", "manual")
+
+
+def compute_routing_headers(args, sample: Sample) -> dict[str, str] | None:
+    if policy_uses_routing_key(args) and not sample.routing_key:
+        raise ValueError(
+            f"router policy {args.sglang_router_policy} routes by X-SMG-Routing-Key, "
+            f"but sample (index={sample.index}) has no routing_key set"
+        )
+    if sample.routing_key:
+        return {"X-SMG-Routing-Key": sample.routing_key}
+    return None
+
+
 def compute_request_payload(
     args,
     input_ids: list[int],
     sampling_params: dict,
     multimodal_inputs: dict | None = None,
+    *,
+    evaluation: bool = False,
 ) -> tuple[dict[str, Any] | None, Sample.Status | None]:
     sampling_params = deepcopy(sampling_params)
     max_new_tokens = sampling_params.pop("max_new_tokens", args.rollout_max_response_len)
@@ -46,15 +70,24 @@ def compute_request_payload(
     if max_new_tokens <= 0:
         return None, Sample.Status.TRUNCATED
 
+    return_sampling_mask = should_return_sampling_mask(args, sampling_params, evaluation=evaluation)
+
     payload = {
         "input_ids": input_ids,
         "sampling_params": {**sampling_params, "max_new_tokens": max_new_tokens},
         "return_logprob": True,
         "return_routed_experts": args.use_rollout_routing_replay,
+        "return_indexer_topk": args.use_rollout_indexer_replay,
     }
+    if return_sampling_mask:
+        payload["return_sampling_mask"] = True
+    if lora_rollout_enabled(args):
+        payload["lora_path"] = LORA_ADAPTER_NAME
     if image_data := (multimodal_inputs or {}).get("images"):
         payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
 
+    if not evaluation:
+        configure_rollout_topk_logprobs_request(args, payload)
     return payload, None
 
 
@@ -65,47 +98,84 @@ async def update_sample_from_response(
     if (len(sample.response) == 0) and not sample.tokens:
         sample.tokens = payload["input_ids"]
 
-    if args.use_miles_router and "RadixTreeMiddleware" in args.miles_router_middleware_paths:
-        from miles.router.middleware_hub.radix_tree_middleware import postprocess_sample_with_radix_tree
-
-        # TODO may rename to match
-        await postprocess_sample_with_radix_tree(args, sample, output)
-
-        assert not update_loss_mask, "This code branch has not implemented update_loss_mask"
+    if x := output["meta_info"].get("output_token_logprobs"):
+        new_response_tokens = [item[1] for item in x]
+        new_response_log_probs = [item[0] for item in x]
     else:
-        if x := output["meta_info"].get("output_token_logprobs"):
-            new_response_tokens = [item[1] for item in x]
-            new_response_log_probs = [item[0] for item in x]
-        else:
-            new_response_tokens, new_response_log_probs = [], []
+        new_response_tokens, new_response_log_probs = [], []
 
-        # Update sample with tokens directly - avoiding re-tokenization
-        sample.tokens = sample.tokens + new_response_tokens
-        sample.response_length += len(new_response_tokens)
-        sample.response += output["text"]
+    if payload.get("return_sampling_mask", False):
+        new_response_log_probs = append_sampling_metadata(
+            sample,
+            new_response_tokens,
+            output["meta_info"],
+            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
+        )
 
-        if sample.rollout_log_probs is None:
-            sample.rollout_log_probs = []
-        sample.rollout_log_probs += new_response_log_probs
+    # Update sample with tokens directly - avoiding re-tokenization
+    sample.tokens = sample.tokens + new_response_tokens
+    sample.response_length += len(new_response_tokens)
+    sample.response += output["text"]
 
-        if update_loss_mask:
-            if sample.loss_mask is None:
-                sample.loss_mask = []
-            sample.loss_mask += [1] * len(new_response_tokens)
+    if sample.rollout_log_probs is None:
+        sample.rollout_log_probs = []
+    sample.rollout_log_probs += new_response_log_probs
+    if payload.get("top_logprobs_num") or payload.get("sampling_logprobs_mode") == "support":
+        append_rollout_topk_logprobs(
+            sample,
+            output["meta_info"],
+            args.rollout_top_logprobs_num,
+            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
+        )
+
+    if update_loss_mask:
+        if sample.loss_mask is None:
+            sample.loss_mask = []
+        sample.loss_mask += [1] * len(new_response_tokens)
 
     # TODO handle multi-turn cases (may need concat instead of assignment)
-    sample.rollout_routed_experts = get_rollout_topk_from_response(args, output, sample, "routed_experts")
+    sample.rollout_routed_experts = get_routed_experts_from_response(args, output, len(sample.tokens) - 1)
+    sample.rollout_indexer_topk = get_indexer_topk_from_response(args, output, sample)
 
     # TODO may unify (currently there are both methods inside Sample and separate functions)
     sample.update_from_meta_info(args, output["meta_info"])
 
 
-def get_rollout_topk_from_response(args, output, sample, key):
-    info = output["meta_info"].get(key)
+def _decode_topk_buffer(info: str, num_tokens: int, num_layers: int, topk: int) -> np.ndarray:
+    x = np.frombuffer(pybase64.b64decode(info.encode("ascii")), dtype=np.int32)
+    if num_tokens <= 0:
+        return np.empty((0, num_layers, max(0, topk)), dtype=np.int32)
+    if topk == -1:  # indexer: topk dim recovered from buffer length
+        topk = len(x) // (num_tokens * num_layers)
+    return x.reshape(num_tokens, num_layers, topk)
+
+
+def get_routed_experts_from_response(args, output, num_tokens: int):
+    info = output["meta_info"].get("routed_experts")
     if info is None:
         return None
     if is_boxed_ray_ref(info):
         return info
-    if isinstance(info, str):
-        return decode_routed_experts(info, len(sample.tokens) - 1, args.num_layers, args.moe_router_topk)
-    raise TypeError(f"Unsupported {key} payload type: {type(info).__name__}")
+    routed_experts = _decode_topk_buffer(info, num_tokens, args.num_layers, -1)
+    assert routed_experts.size == 0 or routed_experts.any(), (
+        "routed_experts payload is all zeros: the sglang engine did not capture routed experts "
+        "(topk-bypassing --moe-runner-backend such as flashinfer_trtllm?)."
+    )
+    return routed_experts
+
+
+def get_indexer_topk_from_response(args, output, sample):
+    info = output["meta_info"].get("indexer_topk")
+    if info is None:
+        return None
+    num_layers = output["meta_info"].get("indexer_topk_num_layers")
+    assert num_layers is not None, (
+        "Server returned indexer_topk without indexer_topk_num_layers; "
+        "sglang-miles must include the layer count in meta_info."
+    )
+    expected_num_streams = getattr(args, "rollout_indexer_topk_num_streams", None)
+    assert expected_num_streams is None or num_layers == expected_num_streams, (
+        f"Server returned indexer_topk with {num_layers} streams but the model has "
+        f"{expected_num_streams} indexer layers; replaying it would map streams to the wrong layers."
+    )
+    return _decode_topk_buffer(info, len(sample.tokens) - 1, num_layers, -1)

@@ -1,11 +1,8 @@
 ---
 title: Customization
-description: The 22 plug-points where you can drop in your own Python without forking Miles.
+description: The plug-points where you can drop in your own Python without forking Miles.
 ---
-
-# Customization
-
-Most of Miles's behaviour can be replaced with user-supplied Python by passing a
+Most of Miles's behavior can be replaced with user-supplied Python by passing a
 `--*-path` flag. This page lists every such hook, the function signature it expects,
 and the default it replaces.
 
@@ -14,9 +11,11 @@ and the default it replaces.
 | Stage | Flag | Replaces |
 |---|---|---|
 | **Rollout** | `--rollout-function-path` | The whole rollout loop |
+| | `--custom-agent-function-path` | The agent-environment loop inside a TITO session |
 | | `--custom-generate-function-path` | A single sample's generation |
 | | `--data-source-path` | How prompts are loaded |
 | | `--eval-function-path` | The eval rollout |
+| **Session** | `--session-message-matcher` | Prefix-replay equivalence |
 | **Reward** | `--custom-rm-path` | Reward computation |
 | | `--custom-reward-post-process-path` | Reward normalization |
 | **Filtering** | `--dynamic-sampling-filter-path` | Per-group filter (DAPO) |
@@ -31,9 +30,9 @@ and the default it replaces.
 | **Megatron hooks** | `--custom-megatron-init-path` | After Megatron init |
 | | `--custom-megatron-before-log-prob-hook-path` | Before logprob compute |
 | | `--custom-megatron-before-train-step-hook-path` | Before each train step |
+| | `--custom-megatron-post-save-hook-path` | After each checkpoint save |
 | **Logging** | `--custom-rollout-log-function-path` | Train-rollout logging |
 | | `--custom-eval-rollout-log-function-path` | Eval-rollout logging |
-| **Routing** | `--miles-router-middleware-paths` | Router middleware |
 | **Model** | `--custom-model-provider-path` | Megatron model factory |
 
 ---
@@ -51,11 +50,12 @@ def generate_rollout(args, rollout_id, data_source, evaluation=False) \
     ...
 ```
 
-**Default:** `miles.rollout.sglang_rollout.generate_rollout`, or
-`miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn` when
-`enable_experimental_rollout_refactor()` is on.
+**Default:** `miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn`; use `miles.rollout.sglang_rollout.generate_rollout` under `MILES_USE_LEGACY_ROLLOUT_V1=1`.
 
-**Reference:** [`examples/multi_agent/rollout_with_multi_agents.py`](https://github.com/radixark/miles/blob/main/examples/multi_agent/rollout_with_multi_agents.py).
+Plain functions with the signature above are wrapped in a legacy adapter. A class-based rollout
+function needs to subclass `miles.rollout.base_types.BaseRolloutFn`.
+
+**Reference:** [`examples/experimental/multi_agent/rollout_with_multi_agents.py`](https://github.com/radixark/miles/blob/main/examples/experimental/multi_agent/rollout_with_multi_agents.py).
 
 ### `--custom-generate-function-path`
 
@@ -67,7 +67,34 @@ async def custom_generate(args, sample: Sample, sampling_params: dict) -> Sample
     ...
 ```
 
-**Reference:** [`examples/search-r1/generate_with_search.py`](https://github.com/radixark/miles/blob/main/examples/search-r1/generate_with_search.py).
+The hook also accepts the `GenerateFnInput -> GenerateFnOutput` form; both
+signatures load through the same adapter. See
+[Generate Endpoint](/user-guide/generate-endpoint) for the full contract.
+
+**Reference:** [`examples/experimental/search-r1/generate_with_search.py`](https://github.com/radixark/miles/blob/main/examples/experimental/search-r1/generate_with_search.py).
+
+
+### `--custom-agent-function-path`
+
+Enabled when you set `--custom-generate-function-path miles.rollout.generate_hub.agentic_tool_call.generate`.
+Use `--custom-agent-function-path` to specify the async agent or environment loop
+that sends OpenAI-compatible chat requests through Miles' TITO session server.
+
+
+```python
+async def run_agent(
+    base_url: str,
+    prompt,
+    request_kwargs: dict,
+    metadata: dict,
+    **kwargs,
+) -> dict | None:
+    ...
+```
+
+See [Agentic Rollout (TITO)](/user-guide/agentic-rollout) for the full wiring and
+message/token ownership contract.
+
 
 ### `--data-source-path`
 
@@ -88,12 +115,26 @@ configured.
 
 ---
 
+## Session
+
+### `--session-message-matcher`
+
+Some harnesses do not replay history verbatim — they reserialize tool-call arguments or drop `reasoning_content` — and the default `strict` matcher counts that as divergence (v1 rollback, v2 branching). This flag loosens what "the same message" means during replay: choose a looser built-in selector (see [Agentic Rollout (TITO)](/user-guide/agentic-rollout#choose-replay-matching)) or supply your own matcher via a trusted dotted import path:
+
+```python
+def matcher(stored_message: dict[str, Any], replayed_message: dict[str, Any]) -> bool:
+    ...
+```
+
+`stored_message` is the authoritative stored message; return `True` to accept the replayed message as the same history at that position. Keep the matcher a fast, synchronous, side-effect-free equivalence check — exceptions or non-`bool` results return HTTP 500, and startup fails if the path does not resolve.
+
+---
+
 ## Reward
 
 ### `--custom-rm-path`
 
 ```python
-# Single-sample mode
 async def custom_rm(args, sample: Sample) -> float:
     ...
 
@@ -102,8 +143,10 @@ async def batched_custom_rm(args, samples: list[Sample]) -> list[float]:
     ...
 ```
 
-**Built-in `--rm-type` options:** `math`, `dapo`, `deepscaler`, `f1`, `gpqa`,
-`ifbench`, `remote_rm` (with `--rm-url`), `random`.
+**Built-in `--rm-type` options:** `math`, `dapo`, `deepscaler`, `gemma_math`, `f1`,
+`gpqa`, `ifbench`, `remote_rm` (with `--rm-url`), `random`, `deterministic_random`.
+Prefixing any of them with `boxed_` (for example `boxed_math`) extracts `\boxed{}`
+from the response before grading.
 
 ### `--custom-reward-post-process-path`
 
@@ -118,8 +161,8 @@ Hook to normalize rewards differently from the default GRPO normalization.
 Per-group filter; runs after scoring, before queueing for training.
 
 ```python
-def filter_function(args, samples: list[Sample], **kwargs) -> DynamicFilterOutput:
-    return DynamicFilterOutput(keep=True, reason=None)
+def filter_function(args, samples: list[Sample], **kwargs) -> FilterOutput:
+    return FilterOutput(keep=True, reason=None)
 ```
 
 **Stock implementation:** `miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std`.
@@ -180,7 +223,7 @@ objectives or multi-objective work.
 Importance sampling correction for off-policy training when train and inference
 diverge.
 
-**Reference:** [`examples/train_infer_mismatch_helper/mis.py`](https://github.com/radixark/miles/blob/main/examples/train_infer_mismatch_helper/mis.py).
+**Reference:** [`examples/infra_features/train_infer_mismatch_helper/mis.py`](https://github.com/radixark/miles/blob/main/examples/infra_features/train_infer_mismatch_helper/mis.py).
 
 ### `--custom-pg-loss-reducer-function-path`
 
@@ -195,7 +238,7 @@ def get_pg_loss_reducer(
 ```
 
 Use case: Dr.GRPO divides by a constant instead of effective token count.
-**Reference:** [`examples/DrGRPO/custom_reducer.py`](https://github.com/radixark/miles/blob/main/examples/DrGRPO/custom_reducer.py).
+**Reference:** [`examples/experimental/DrGRPO/custom_reducer.py`](https://github.com/radixark/miles/blob/main/examples/experimental/DrGRPO/custom_reducer.py).
 
 ### `--custom-convert-samples-to-train-data-path`
 
@@ -228,9 +271,12 @@ def convert_samples_to_train_data(args, samples) -> dict:
 | `--custom-megatron-init-path` | `def custom_init(args) -> None` |
 | `--custom-megatron-before-log-prob-hook-path` | `def custom_hook(args, model, store_prefix) -> None` |
 | `--custom-megatron-before-train-step-hook-path` | `def custom_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler) -> None` |
+| `--custom-megatron-post-save-hook-path` | `def hook(args, rollout_id: int, checkpoint_dir: str, hf_checkpoint_dir: str | None) -> None` |
 
-These give per-step access to the live Megatron model and optimizer, useful for
-custom probes, weight clipping, or surgical interventions.
+The Megatron init, log-prob, and train-step hooks give access to the live model
+and optimizer, useful for custom probes, weight clipping, or surgical interventions.
+The post-save hook runs on rank 0 after checkpoint save completion and receives
+the saved checkpoint paths instead of live model objects.
 
 ---
 
@@ -247,15 +293,6 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics) -> bool:
 ```
 
 Return `True` to suppress Miles's default logging, `False` to layer on top.
-
----
-
-## Router
-
-### `--miles-router-middleware-paths`
-
-Inject middleware into the router for request and response transformation,
-caching, or custom routing.
 
 ---
 
@@ -291,4 +328,4 @@ ROLLOUT_ARGS+=(
 
 That is the entire delta from the stock GRPO recipe, with no source changes to Miles.
 
-→ Next: [Server arguments reference](cli-reference.md)
+→ Next: [Server arguments reference](/user-guide/cli-reference)

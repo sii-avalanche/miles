@@ -5,14 +5,21 @@ import multiprocessing
 import os
 import random
 import socket
+import subprocess
 import time
 
 import httpx
 import msgspec
 
+from miles.utils.logging_utils import configure_logger_raw
+
 logger = logging.getLogger(__name__)
 
 MILES_HOST_IP_ENV = "MILES_HOST_IP"
+MILES_PREFER_IPV6_ENV = "MILES_PREFER_IPV6"
+
+_CONNECT_ATTEMPT_TIMEOUT_SECONDS = 1.0
+_CONNECT_RETRY_INTERVAL_SECONDS = 0.5
 
 
 def find_available_port(base_port: int):
@@ -43,7 +50,7 @@ def is_port_available(port):
 def wait_for_server_ready(
     host: str,
     port: int,
-    process: "multiprocessing.Process | None" = None,
+    process: "multiprocessing.Process | subprocess.Popen | None" = None,
     timeout: float = 30,
 ) -> None:
     """Poll until a TCP port is accepting connections.
@@ -52,7 +59,7 @@ def wait_for_server_ready(
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if process is not None and not process.is_alive():
+        if process is not None and not _is_process_running(process):
             raise RuntimeError(f"Server process died before port {port} became ready")
         try:
             with socket.create_connection((host, port), timeout=1):
@@ -62,73 +69,54 @@ def wait_for_server_ready(
     raise RuntimeError(f"Server at {host}:{port} not ready after {timeout}s")
 
 
-def get_host_info():
-    hostname = socket.gethostname()
-
-    if env_overwrite_local_ip := os.getenv(MILES_HOST_IP_ENV, None):
-        return hostname, env_overwrite_local_ip
-
-    def _is_loopback(ip):
-        return ip.startswith("127.") or ip == "::1"
-
-    def _resolve_ip(family, test_target_ip):
-        """
-        Attempt to get the local LAN IP for the specific family (IPv4/IPv6).
-        Strategy: UDP Probe (Preferred) -> Hostname Resolution (Fallback) -> None
-        """
-
-        # Strategy 1: UDP Connect Probe (Most accurate, relies on routing table)
-        # Useful when the machine has a default gateway or internet access.
+async def wait_tcp_ready_async(host: str, port: int, *, timeout: float = 30) -> None:
+    """Poll until a TCP port accepts connections."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
         try:
-            with socket.socket(family, socket.SOCK_DGRAM) as s:
-                # The IP doesn't need to be reachable, but the routing table must exist.
-                s.connect((test_target_ip, 80))
-                ip = s.getsockname()[0]
-                if not _is_loopback(ip):
-                    return ip
-        except Exception:
-            pass  # Route unreachable or network error, move to next strategy.
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host.strip("[]"), port), timeout=_CONNECT_ATTEMPT_TIMEOUT_SECONDS
+            )
+            writer.close()
+            await writer.wait_closed()
+            return
+        except (OSError, asyncio.TimeoutError):
+            await asyncio.sleep(_CONNECT_RETRY_INTERVAL_SECONDS)
+    raise RuntimeError(f"Server at {host}:{port} not ready after {timeout}s")
 
-        # Strategy 2: Hostname Resolution (Fallback for offline clusters)
-        # Useful for offline environments where UDP connect fails but /etc/hosts is configured.
-        try:
-            # getaddrinfo allows specifying the family (AF_INET or AF_INET6)
-            # Result format: [(family, type, proto, canonname, sockaddr), ...]
-            infos = socket.getaddrinfo(hostname, None, family=family, type=socket.SOCK_STREAM)
 
-            for info in infos:
-                ip = info[4][0]  # The first element of sockaddr is the IP
-                # Must filter out loopback addresses to avoid "127.0.0.1" issues
-                if not _is_loopback(ip):
-                    return ip
-        except Exception:
-            pass
+def _is_process_running(process: "multiprocessing.Process | subprocess.Popen") -> bool:
+    if isinstance(process, subprocess.Popen):
+        return process.poll() is None
+    return process.is_alive()
 
-        return None
 
-    prefer_ipv6 = os.getenv("MILES_PREFER_IPV6", "0").lower() in ("1", "true", "yes", "on")
-    local_ip = None
-    final_fallback = "127.0.0.1"
-
-    if prefer_ipv6:
-        # [Strict Mode] IPv6 Only
-        # 1. Try UDP V6 Probe
-        # 2. Try Hostname Resolution (V6)
-        # If failed, fallback to V6 loopback. Never mix with V4.
-        local_ip = _resolve_ip(socket.AF_INET6, "2001:4860:4860::8888")
-        final_fallback = "::1"
+def resolve_ip(host: str) -> str:
+    bare = host.strip("[]")
+    try:
+        ipaddress.ip_address(bare)
+    except ValueError:
+        pass
     else:
-        # [Strict Mode] IPv4 Only (Default)
-        # 1. Try UDP V4 Probe
-        # 2. Try Hostname Resolution (V4)
-        # If failed, fallback to V4 loopback. Never mix with V6.
-        local_ip = _resolve_ip(socket.AF_INET, "8.8.8.8")
-        final_fallback = "127.0.0.1"
+        return wrap_ipv6(bare)
 
-    return hostname, local_ip or final_fallback
+    # "Prefer" is indeed strict to match old semantics
+    prefer_ipv6 = os.getenv(MILES_PREFER_IPV6_ENV, "0").lower() in ("1", "true", "yes", "on")
+    family = socket.AF_INET6 if prefer_ipv6 else socket.AF_INET
+    # getaddrinfo allows specifying the family (AF_INET or AF_INET6)
+    # Result format: [(family, type, proto, canonname, sockaddr), ...]
+    infos = socket.getaddrinfo(bare, None, family=family, type=socket.SOCK_STREAM)
+    for info in infos:
+        ip = info[4][0]  # The first element of sockaddr is the IP
+        # Must filter out loopback addresses to avoid "127.0.0.1" issues
+        if not ipaddress.ip_address(ip).is_loopback:
+            return wrap_ipv6(ip)
+
+    raise RuntimeError(f"{host!r} resolves to no non-loopback {family.name} address, so nothing can bind on it")
 
 
-def _wrap_ipv6(host):
+def wrap_ipv6(host):
     """Wrap IPv6 address in [] if needed."""
     try:
         ipaddress.IPv6Address(host.strip("[]"))
@@ -137,7 +125,21 @@ def _wrap_ipv6(host):
         return host
 
 
+def router_worker_base_urls(urls: list[str]) -> list[str]:
+    """Strip the `@<rank>` suffix dp-aware routing adds; ranks of one engine dedupe to one address."""
+    bases = []
+    for url in urls:
+        base, sep, rank = url.rpartition("@")
+        if sep and rank.isdigit():
+            url = base
+        if url not in bases:
+            bases.append(url)
+    return bases
+
+
 def run_router(args):
+    # Spawned as a fresh interpreter, so it inherits no logging config.
+    configure_logger_raw("router")
     try:
         from sglang_router.launch_router import launch_router
 
@@ -167,6 +169,31 @@ def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) ->
         process.join()
 
 
+class GeneralHttpClientProvider:
+    _CONNECT_TIMEOUT = 10.0
+    _WRITE_TIMEOUT = 60.0
+    _POOL_TIMEOUT = 60.0
+    _TIMEOUT = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=None, write=_WRITE_TIMEOUT, pool=_POOL_TIMEOUT)
+    _LIMITS = httpx.Limits(max_connections=None, max_keepalive_connections=None)
+
+    # TODO: entries are never evicted and the clients are never aclose()d, so a caller that keeps
+    # creating event loops (repeated asyncio.run) leaks one client and its keep-alive sockets per
+    # loop. Today's call sites use a bounded number of loops; add eviction before that stops holding.
+    _clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
+
+    @classmethod
+    def client(cls) -> httpx.AsyncClient:
+        loop = asyncio.get_running_loop()
+        client = cls._clients.get(loop)
+        if client is None:
+            client = httpx.AsyncClient(timeout=cls._TIMEOUT, limits=cls._LIMITS)
+            cls._clients[loop] = client
+        return client
+
+
+# TODO: the client below is not general — it carries a rollout-specific connection limit and an
+# optional ray-distributed POST path. Rename it (or fold it into GeneralHttpClientProvider with the
+# limit as an argument) once the rollout request path is reworked.
 _http_client: httpx.AsyncClient | None = None
 _client_concurrency: int = 0
 
@@ -242,13 +269,52 @@ async def _post(
     return output
 
 
+async def wait_http_ok(url: str, *, json_payload=None, timeout: float = 180.0, request_timeout: float = 60.0) -> None:
+    """Poll ``url`` until it answers HTTP 200 (POST when ``json_payload`` is given,
+    else GET); raise ``TimeoutError`` past the deadline."""
+    deadline = time.time() + timeout
+    last_error = "no attempt made"
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                if json_payload is not None:
+                    response = await client.post(url, json=json_payload, timeout=request_timeout)
+                else:
+                    response = await client.get(url, timeout=request_timeout)
+                if response.status_code == 200:
+                    return
+                last_error = f"HTTP {response.status_code}"
+            except httpx.HTTPError as e:
+                last_error = repr(e)
+            if time.time() > deadline:
+                raise TimeoutError(f"{url} not ready after {timeout}s: {last_error}")
+            await asyncio.sleep(5)
+
+
+async def post_bytes_no_retry(url: str, payload: dict, *, timeout: float) -> bytes:
+    """Perform one raw-bytes POST with a total timeout."""
+    assert _http_client is not None, "init_http_client() must run before post_bytes_no_retry()"
+
+    async def _do() -> bytes:
+        response = await _http_client.post(url, json=payload)
+        if not (200 <= response.status_code < 300):
+            raise RuntimeError(f"POST {url} failed with {response.status_code}: {response.text}")
+        return response.content
+
+    return await asyncio.wait_for(_do(), timeout=timeout)
+
+
 def init_http_client(args):
     """Initialize HTTP client and optionally enable distributed POST via Ray."""
     global _http_client, _client_concurrency, _distributed_post_enabled
-    if not args.rollout_num_gpus:
+    rollout_num_gpus = args.rollout_num_gpus or 0
+    if rollout_num_gpus == 0 and not args.eval_uses_snapshots:
         return
 
-    _client_concurrency = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+    _client_concurrency = args.sglang_server_concurrency * rollout_num_gpus // args.rollout_num_gpus_per_engine
+    if args.eval_num_gpus > 0:
+        _client_concurrency += args.sglang_server_concurrency * args.eval_num_gpus // args.eval_num_gpus_per_engine
+    _client_concurrency = max(_client_concurrency, args.sglang_server_concurrency)
     if _http_client is None:
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=_client_concurrency),
@@ -282,7 +348,7 @@ def _init_ray_distributed_post(args):
     # Define the async actor
     @ray.remote
     class _HttpPosterActor:
-        def __init__(self, concurrency: int):
+        def __init__(self, *, concurrency: int):
             # Lazy creation to this actor's event loop
             self._client = httpx.AsyncClient(
                 limits=httpx.Limits(max_connections=max(1, concurrency)),
@@ -317,7 +383,7 @@ def _init_ray_distributed_post(args):
                 max_concurrency=per_actor_conc,
                 # Use tiny CPU to schedule
                 num_cpus=0.001,
-            ).remote(per_actor_conc)
+            ).remote(concurrency=per_actor_conc)
             created.append(actor)
 
     _post_actors = created

@@ -17,10 +17,90 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
-from miles.utils.misc import load_function
+from miles.utils.audit_utils.witness.module import install_witness
+from miles.utils.function_registry import load_function
 from miles.utils.replay_base import routing_replay_manager
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
+    """Copy the runtime config from args onto a bridge-built provider.
+
+    Bridge mode builds the model from the HF checkpoint and skips
+    core_transformer_config_from_args, so command-line args never reach the
+    provider. We copy only some fields, not all of args: the provider already
+    holds the right values from the HF checkpoint, while args only has default
+    values for model shape, dtype, and fields the provider set on purpose.
+    Copying those would quietly break the model -- the bridge only logs a
+    warning and keeps going, it does not fail. So we copy just the training,
+    parallelism, memory, and numerics settings that really come from args. Put
+    new training flags here, not spread across the code.
+    """
+    # parallelism / sharding
+    provider.tensor_model_parallel_size = args.tensor_model_parallel_size
+    provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
+    provider.expert_model_parallel_size = args.expert_model_parallel_size
+    provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
+    provider.sequence_parallel = args.sequence_parallel
+    provider.context_parallel_size = args.context_parallel_size
+
+    # loss / sequence handling
+    provider.calculate_per_token_loss = args.calculate_per_token_loss  # CP>1 VL models assert this
+    provider.variable_seq_lengths = args.variable_seq_lengths
+
+    # Match the non-bridge path: MTP must only train its own draft parameters.
+    if getattr(args, "enable_mtp_training", False):
+        provider.mtp_detach_heads = True
+
+    # numerics (training infra, not model-defining)
+    provider.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
+    provider.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+    provider.fp32_residual_connection = args.fp32_residual_connection
+    provider.deterministic_mode = args.deterministic_mode
+
+    # activation recompute (silently dropped before -> no checkpointing -> OOM at long context)
+    provider.recompute_granularity = args.recompute_granularity
+    provider.recompute_method = args.recompute_method
+    provider.recompute_num_layers = args.recompute_num_layers
+    provider.recompute_modules = args.recompute_modules
+
+    # activation / memory offload
+    provider.cpu_offloading_num_layers = args.cpu_offloading_num_layers
+    provider.distribute_saved_activations = args.distribute_saved_activations
+    # cpu_offloading is derived, set only when cpu_offloading_num_layers>0; guard its presence.
+    if hasattr(args, "cpu_offloading"):
+        provider.cpu_offloading = args.cpu_offloading
+
+    # communication overlap
+    provider.tp_comm_overlap = args.tp_comm_overlap
+
+    # fp8
+    provider.fp8 = args.fp8
+    provider.fp8_recipe = args.fp8_recipe
+
+    # attention kernel selection
+    provider.attention_backend = args.attention_backend
+
+    # MoE token dispatcher (same-name, always present)
+    provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
+
+    # arg name != provider field; arg default None, so propagate only when the user set it
+    if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
+        provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
+    if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
+        provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+
+    # MoE training knobs: override only when explicitly set, else keep the provider's value
+    if getattr(args, "moe_router_bias_update_rate", None) is not None:
+        provider.moe_router_bias_update_rate = args.moe_router_bias_update_rate
+    if getattr(args, "moe_aux_loss_coeff", None) is not None:
+        provider.moe_aux_loss_coeff = args.moe_aux_loss_coeff
+
+    # Imported here: test_bridge_mtp_detachment.py exec()s this function's AST in a bare namespace (no module names).
+    from miles.utils.megatron_bridge_utils import apply_dsa_backend_args
+
+    apply_dsa_backend_args(provider, args)
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -82,6 +162,7 @@ def get_model_provider_func(
                 model.output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=1, config=model.config
                 )
+            _maybe_install_witness(args, model)
             return model
 
         return wrapped_model_provider
@@ -91,25 +172,9 @@ def get_model_provider_func(
 
         bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
         provider = bridge.to_megatron_provider(load_weights=False)
-        # TODO: we should not manually set this...
-        provider.tensor_model_parallel_size = args.tensor_model_parallel_size
-        provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
-        provider.expert_model_parallel_size = args.expert_model_parallel_size
-        provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
-        provider.sequence_parallel = args.sequence_parallel
-        provider.context_parallel_size = args.context_parallel_size
-        provider.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
-        provider.variable_seq_lengths = args.variable_seq_lengths
-        if hasattr(args, "moe_token_dispatcher_type"):
-            provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
-        if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
-            provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
-        if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
-            provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
-        if getattr(args, "moe_router_bias_update_rate", None) is not None:
-            provider.moe_router_bias_update_rate = args.moe_router_bias_update_rate
-        if getattr(args, "moe_aux_loss_coeff", None) is not None:
-            provider.moe_aux_loss_coeff = args.moe_aux_loss_coeff
+        _apply_bridge_runtime_config(provider, args)
+        if role == "critic":
+            provider.share_embeddings_and_output_weights = False
         provider.finalize()
 
         def wrapped_bridge_provider(
@@ -125,7 +190,21 @@ def get_model_provider_func(
             # caller's pg_collection here, those code paths hit AttributeError.
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
-            return provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+            model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+            if post_process and role == "critic":
+                model.output_layer = LinearForLastLayer(
+                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                )
+            assert not getattr(args, "enable_witness", False), "Witness is not supported yet in this mode"
+            # Gemma-4 forward returns (logits, loss_mask); keep logits only.
+            _bridge_forward = model.forward
+
+            def _logits_only_forward(*args, **kwargs):
+                out = _bridge_forward(*args, **kwargs)
+                return out[0] if isinstance(out, tuple) else out
+
+            model.forward = _logits_only_forward
+            return model
 
         return wrapped_bridge_provider
 
@@ -154,6 +233,13 @@ def get_model_provider_func(
         assert config is None, "miles builds the config from args, so it expects config to be None"
         config = core_transformer_config_from_args(args)
 
+        # `enable_mtp_training` comes from miles' arg parser; megatron-only arg contexts
+        # (e.g. the run_megatron debug worker) won't have it, so default to False.
+        if getattr(args, "enable_mtp_training", False):
+            # Detach the MTP heads so RL MTP gradients do not flow into the shared
+            # output layer / embedding.
+            config.mtp_detach_heads = True
+
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
             # Allow the spec to be a function so that user can use customized Megatron easier.
@@ -176,7 +262,6 @@ def get_model_provider_func(
                         moe_grouped_gemm=args.moe_grouped_gemm,
                         qk_layernorm=args.qk_layernorm,
                         multi_latent_attention=args.multi_latent_attention,
-                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
@@ -184,10 +269,8 @@ def get_model_provider_func(
                         moe_grouped_gemm=args.moe_grouped_gemm,
                         qk_layernorm=args.qk_layernorm,
                         multi_latent_attention=args.multi_latent_attention,
-                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
                         normalization=args.normalization,
                         use_kitchen=config.use_kitchen,
-                        use_true_on_policy_backend=config.true_on_policy_contract is not None,
                         use_kitchen_attention=config.use_kitchen_attention,
                         kitchen_attention_backend=config.kitchen_attention_backend,
                     )
@@ -218,7 +301,7 @@ def get_model_provider_func(
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
             "parallel_output": True,
-            "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
+            "share_embeddings_and_output_weights": role != "critic" and not args.untie_embeddings_and_output_weights,
             "position_embedding_type": args.position_embedding_type,
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
@@ -240,6 +323,7 @@ def get_model_provider_func(
             # hard code here to skip r3 registration for mtp layers
             # getattr is required to avoid ckpt conversion errors
             if getattr(args, "use_rollout_routing_replay", False):
+                prev_routing_replay_enabled = routing_replay_manager.enabled
                 routing_replay_manager.enabled = False
                 logger.warning(
                     "Rollout routing replay is not applicable for MTP modules, so skipped replay registration"
@@ -247,14 +331,40 @@ def get_model_provider_func(
             mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, **mtp_kwargs)
             kwargs["mtp_block_spec"] = mtp_block_spec
             if getattr(args, "use_rollout_routing_replay", False):
-                routing_replay_manager.enabled = True
+                # restore instead of forcing True: the critic role keeps the manager disabled
+                routing_replay_manager.enabled = prev_routing_replay_enabled
 
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        _maybe_freeze_native_dsa_indexer(args, model)
+
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+
+        _maybe_install_witness(args, model)
 
         return model
 
     return model_provider
+
+
+def _maybe_freeze_native_dsa_indexer(args: argparse.Namespace, model: GPTModel) -> None:
+    if args.dsa_impl == "megatron" and model.config.dsa_indexer_loss_coeff == 0:
+        # Native DSA runs its indexer under no_grad without the auxiliary objective.
+        # Exclude these unused parameters from DDP and optimizer weight decay.
+        for name, parameter in model.named_parameters():
+            if ".self_attention.core_attention.indexer." in name:
+                parameter.requires_grad_(False)
+
+
+def _maybe_install_witness(
+    args: argparse.Namespace,
+    model: GPTModel,
+) -> None:
+    if getattr(args, "enable_witness", False):
+        install_witness(
+            model,
+            buffer_size=args.witness_buffer_size,
+            sequence_parallel=getattr(model.config, "sequence_parallel", False),
+        )

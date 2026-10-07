@@ -1,110 +1,119 @@
 import argparse
+import os
 import subprocess
 import sys
-import warnings
-from collections.abc import Iterable
+import tempfile
 
+from tests.ci.ci_policy import (
+    CI_CADENCES,
+    NIGHTLY_CADENCE,
+    REGULAR_CADENCE,
+    RunPolicy,
+    registration_matches_selection,
+    resolve_policy,
+)
 from tests.ci.ci_register import CIRegistry, HWBackend, collect_tests, discover_ci_files
-from tests.ci.ci_utils import run_unittest_files
+from tests.ci.ci_utils import (
+    CI_GATE_RECORD_DIR_ENV,
+    build_store_from_env,
+    gate_provenance_from_env,
+    reaping_is_isolated,
+    run_unittest_files,
+)
+from tests.ci.hardware import CUDA_STAGES, dispatch_targets
+from tests.ci.labels import KNOWN_LABELS
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
+    "rocm": HWBackend.ROCM,
 }
 
-# PR-side label prefix the workflow attaches to every domain label and passes
-# verbatim to `--labels`. Stripping is done here (not in YAML) so the filter
-# is unit-testable and the workflow stays a thin pass-through.
-_RUN_CI_PREFIX = "run-ci-"
-
-# Per-commit test suites (run on every PR; per-domain selection is done at
-# runtime by `filter_tests` via the `--labels` arg, not via per-suite jobs).
+# CI suites by hardware backend. Cadence is an eligibility filter within a
+# suite, not a second suite inventory.
 #
-# CUDA suites: each is served by a matching workflow job in
-# .github/workflows/pr-test.yml. `stage-c-8-gpu-h100` runs on the full-node
-# 8-GPU H100 host; the H200 fleet is one 8-GPU node split into 2+2+4 workers
-# via per-runner CUDA_VISIBLE_DEVICES (see pr-test.yml stage-c-4-gpu-h200 /
-# stage-b-2-gpu-h200 / stage-c-2-gpu-h200 job comments).
-PER_COMMIT_SUITES = {
+# CUDA suites derive from `hardware.CUDA_STAGES`, which also carries each
+# stage's arch, GPU count and runner labels; each has a matching workflow job in
+# .github/workflows/pr-test.yml.
+CI_SUITES = {
     HWBackend.CPU: [
         "stage-a-cpu",
         "stage-b-cpu",
     ],
-    HWBackend.CUDA: [
-        "stage-b-2-gpu-h200",
-        "stage-c-8-gpu-h100",
-        "stage-c-4-gpu-h200",
-        "stage-c-2-gpu-h200",
+    HWBackend.CUDA: list(CUDA_STAGES),
+    HWBackend.ROCM: [
+        # Consumed by pr-test-rocm.yml.
+        "stage-c-4-gpu-mi350",
+        # Consumed by the external sgl-project/sglang MI350 nightly.
+        "nightly-stage-c-8-gpu-mi350",
+        "nightly-stage-c-4-gpu-mi350",
+        "nightly-stage-c-2-gpu-mi350",
     ],
 }
 
-# Nightly test suites (placeholder for future use)
-NIGHTLY_SUITES = {
-    HWBackend.CUDA: [],
-}
 
+def runs_in_stage(
+    registration: CIRegistry,
+    suite: str,
+    *,
+    dispatch_arches: frozenset[str] = frozenset(),
+    absorb: bool = False,
+) -> bool:
+    """Whether `registration` executes in `suite`, ignoring label selection.
 
-def strip_run_ci_prefix(raw_labels: Iterable[str]) -> set[str]:
-    """Strip the `run-ci-` prefix from each PR-side label.
-
-    Inputs come straight from the workflow (e.g. `["run-ci-megatron",
-    "run-ci-fsdp"]`). Empty input yields an empty set. Items missing the
-    `run-ci-` prefix are skipped after emitting a `warnings.warn(...)` --
-    the workflow contract requires every passed label to be a raw
-    `run-ci-<X>` string, and silently including a non-prefixed item would
-    risk matching the wrong domain label (e.g. bare `"megatron"` colliding
-    with a test's domain label by accident).
+    CPU and ROCm registrations have no arch, so their home suite is the only
+    answer. A CUDA registration's home stage is where AUTO sends it; an explicit
+    `run-on-*` can send it to another arch's stage instead. Shared with
+    `stage_selection` so runner allocation and test collection cannot disagree.
     """
-    stripped: set[str] = set()
-    for raw in raw_labels:
-        if not raw:
-            continue
-        if raw.startswith(_RUN_CI_PREFIX):
-            stripped.add(raw[len(_RUN_CI_PREFIX) :])
-        else:
-            warnings.warn(
-                f"--labels entry {raw!r} is missing the expected {_RUN_CI_PREFIX!r} "
-                f"prefix; ignoring. The workflow must pass raw `run-ci-<X>` labels.",
-                stacklevel=2,
-            )
-    return stripped
+    if registration.backend is not HWBackend.CUDA:
+        return registration.suite == suite
+    return suite in dispatch_targets(
+        registration.suite,
+        registration.hardware,
+        dispatch_arches=dispatch_arches,
+        absorb=absorb,
+    )
 
 
 def filter_tests(
     ci_tests: list[CIRegistry],
     hw: HWBackend,
     suite: str,
-    nightly: bool = False,
+    admit_nightly_tests: bool = False,
     labels: set[str] | None = None,
-    match_all_labels: bool = False,
+    dispatch_arches: frozenset[str] = frozenset(),
+    absorb: bool = False,
 ) -> tuple[list[CIRegistry], list[CIRegistry]]:
     """Filter registered tests down to the set that should run.
 
-    The base predicate (hw / suite / nightly / disabled) is applied first.
-    Label selection then narrows further, with two modes:
-
-    * `match_all_labels=True`: ignore labels entirely -- every enabled test
-      that matches hw/suite/nightly runs. Used for the `run-ci-image` /
-      `run-ci-all` meta-labels and for `workflow_dispatch`. Precedence: this
-      mode wins even when `labels` is also passed.
-    * `match_all_labels=False` (default): include only tests where
-      `not test.labels or (set(test.labels) & labels)`. `labels` here is
-      the already-stripped domain-label set produced by
-      `strip_run_ci_prefix`. A test registered with `labels=[]` (or
-      omitted) is treated as always-run: it survives an empty PR-label
-      set; a test with non-empty `labels` survives only when its labels
-      intersect the PR-supplied set.
+    The base predicate (hw / suite / cadence eligibility / disabled) is applied first.
+    Label selection then keeps a test iff it declares no labels (the CPU
+    always-on case) or any of its labels is in `labels` -- the effective
+    include set from `resolve_policy` (the requested domain labels for a plain
+    PR, near-total registry sets for broad scopes). GPU registrations require
+    at least one label. There is no separate exclusion pass: a label a scope
+    subtracted simply grants no inclusion, so a test whose only labels were
+    subtracted drops out (including from the skip report), while a test that
+    also carries an included label still runs.
     """
-    ci_tests = [t for t in ci_tests if t.backend == hw and t.suite == suite and t.nightly == nightly]
-
-    valid_suites = NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
-
+    valid_suites = CI_SUITES.get(hw, [])
     if suite not in valid_suites:
-        print(f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}")
+        raise ValueError(f"Unknown suite {suite} for backend {hw.name}")
 
-    if not match_all_labels:
-        label_set: set[str] = labels or set()
-        ci_tests = [t for t in ci_tests if not t.labels or (set(t.labels) & label_set)]
+    label_set: set[str] = labels or set()
+    ci_tests = [
+        t
+        for t in ci_tests
+        if t.backend == hw
+        and runs_in_stage(t, suite, dispatch_arches=dispatch_arches, absorb=absorb)
+        and registration_matches_selection(
+            t.labels,
+            t.nightly,
+            admit_nightly_tests=admit_nightly_tests,
+            include_labels=label_set,
+        )
+    ]
 
     enabled_tests = [t for t in ci_tests if t.disabled is None]
     skipped_tests = [t for t in ci_tests if t.disabled is not None]
@@ -139,10 +148,15 @@ def auto_partition(files: list[CIRegistry], rank, size):
     return []
 
 
-def pretty_print_tests(args, ci_tests: list[CIRegistry], skipped_tests: list[CIRegistry]):
+def pretty_print_tests(
+    args,
+    policy: RunPolicy,
+    continue_on_error: bool,
+    ci_tests: list[CIRegistry],
+    skipped_tests: list[CIRegistry],
+):
     hw = HW_MAPPING[args.hw]
     suite = args.suite
-    nightly = args.nightly
     if args.auto_partition_size:
         partition_info = (
             f"{args.auto_partition_id + 1}/{args.auto_partition_size} " f"(0-based id={args.auto_partition_id})"
@@ -151,7 +165,10 @@ def pretty_print_tests(args, ci_tests: list[CIRegistry], skipped_tests: list[CIR
         partition_info = "full"
 
     msg = f"\n{'='*60}\n"
-    msg += f"Hardware: {hw.name}  Suite: {suite}  Nightly: {nightly}  Partition: {partition_info}\n"
+    msg += (
+        f"Hardware: {hw.name}  Suite: {suite}  Cadence: {policy.cadence}  "
+        f"Continue on error: {continue_on_error}  Partition: {partition_info}\n"
+    )
     msg += f"{'='*60}\n"
 
     if skipped_tests:
@@ -162,7 +179,7 @@ def pretty_print_tests(args, ci_tests: list[CIRegistry], skipped_tests: list[CIR
         msg += "\n"
 
     if len(ci_tests) == 0:
-        msg += f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}\n"
+        msg += f"No tests found for hw={hw.name}, suite={suite}, cadence={policy.cadence}\n"
         msg += "This is expected during incremental migration. Skipping.\n"
     else:
         total_est_time = sum(t.est_time for t in ci_tests)
@@ -174,29 +191,59 @@ def pretty_print_tests(args, ci_tests: list[CIRegistry], skipped_tests: list[CIR
     print(msg, flush=True)
 
 
+def build_cpu_pytest_cmd(filenames: list[str], continue_on_error: bool) -> list[str]:
+    """Build the single pytest invocation for a CPU suite.
+
+    `-x` (stop at first failure) is the default regular-run behavior. With
+    continue_on_error -- e.g. a PR carrying the `bypass-fastfail` label -- drop
+    `-x` so every file runs; pytest still exits non-zero if any failed, so the
+    stage stays red.
+    """
+    # sorted so every directory is named in one run of arguments: pytest loads a directory's
+    # conftest once, and an argument list that returns to a directory after naming its parent
+    # leaves the tests of that second visit without the fixtures their own conftest defines
+    cmd = ["pytest", *sorted(filenames), "-v"]
+    if not continue_on_error:
+        cmd.append("-x")
+    return cmd
+
+
 def run_a_suite(args):
     hw = HW_MAPPING[args.hw]
     suite = args.suite
-    nightly = args.nightly
     auto_partition_id = args.auto_partition_id
     auto_partition_size = args.auto_partition_size
 
     files = discover_ci_files()
     all_tests = collect_tests(files, sanity_check=True)
-    stripped_labels = strip_run_ci_prefix(args.labels or [])
+    policy = resolve_policy(args.cadence, set(args.labels or []))
+    include_labels = set(policy.include_labels)
+    if args.match_all_labels:
+        include_labels |= set(KNOWN_LABELS)
+    continue_on_error = args.continue_on_error or policy.bypass_fastfail
+    print(
+        f"Policy: cadence={policy.cadence!r} bypass_fastfail={policy.bypass_fastfail} "
+        f"include_labels={sorted(include_labels)}",
+        flush=True,
+    )
     ci_tests, skipped_tests = filter_tests(
         all_tests,
         hw,
         suite,
-        nightly,
-        labels=stripped_labels,
-        match_all_labels=args.match_all_labels,
+        policy.admit_nightly_tests,
+        labels=include_labels,
+        dispatch_arches=policy.dispatch_arches,
+        absorb=policy.absorb,
     )
 
     if auto_partition_size:
         ci_tests = auto_partition(ci_tests, auto_partition_id, auto_partition_size)
 
-    pretty_print_tests(args, ci_tests, skipped_tests)
+    pretty_print_tests(args, policy, continue_on_error, ci_tests, skipped_tests)
+
+    if args.github_output:
+        with open(args.github_output, "a", encoding="utf-8") as output:
+            output.write(f"has_tests={str(bool(ci_tests)).lower()}\n")
 
     if len(ci_tests) == 0:
         print("No tests to run. Exiting with success.", flush=True)
@@ -207,7 +254,7 @@ def run_a_suite(args):
 
     # CPU tests (fast/) use pytest; CUDA tests use python3 per-file
     if hw == HWBackend.CPU:
-        cmd = ["pytest"] + [t.filename for t in ci_tests] + ["-x", "-v"]
+        cmd = build_cpu_pytest_cmd([t.filename for t in ci_tests], continue_on_error)
         print(f"Running: {' '.join(cmd)}", flush=True)
         return subprocess.call(cmd)
 
@@ -216,13 +263,31 @@ def run_a_suite(args):
     if args.enable_retry:
         timeout += args.retry_timeout_increase
 
+    # Regression-gate wiring: the store exists only when NEON_DATABASE_URL is
+    # set (CI), so the gate hook is a no-op locally. The resolved cadence is
+    # also supplies the baseline-writing signal. Provenance comes from the GitHub env.
+    gate_store = build_store_from_env()
+    gate_provenance = gate_provenance_from_env()
+
+    # The gate collects only when a record directory exists. CI does not set
+    # MILES_CI_GATE_RECORD_DIR, so allocate a job-local one whenever a store is
+    # configured (CUDA suites only -- the gate is CUDA-only). The training
+    # subprocesses' CiHistoryBackend and the merge/gate steps read it from env.
+    if gate_store is not None and hw == HWBackend.CUDA and not os.environ.get(CI_GATE_RECORD_DIR_ENV):
+        os.environ[CI_GATE_RECORD_DIR_ENV] = tempfile.mkdtemp(prefix="miles-ci-gate-")
+
     return run_unittest_files(
         ci_tests,
         timeout_per_file=timeout,
-        continue_on_error=args.continue_on_error,
+        continue_on_error=continue_on_error,
         enable_retry=args.enable_retry,
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
+        gate_store=gate_store,
+        gate_executing_suite=suite,
+        gate_write_baseline=policy.write_baseline,
+        gate_provenance=gate_provenance,
+        reap_leftovers=reaping_is_isolated(),
     )
 
 
@@ -236,10 +301,19 @@ def main():
         help="Hardware backend to run tests on.",
     )
     parser.add_argument("--suite", type=str, required=True, help="Test suite to run.")
-    parser.add_argument(
+    cadence_group = parser.add_mutually_exclusive_group()
+    cadence_group.add_argument(
+        "--cadence",
+        choices=sorted(CI_CADENCES),
+        default=REGULAR_CADENCE,
+        help="Explicit CI cadence resolved by the workflow (default: regular).",
+    )
+    cadence_group.add_argument(
         "--nightly",
-        action="store_true",
-        help="Run nightly tests instead of per-commit tests.",
+        dest="cadence",
+        action="store_const",
+        const=NIGHTLY_CADENCE,
+        help="Local alias for --cadence nightly; matches the nightly tag's selection and failure policy.",
     )
     parser.add_argument(
         "--timeout-per-file",
@@ -301,22 +375,29 @@ def main():
             "Raw PR-side labels (e.g. `run-ci-megatron run-ci-fsdp`). The "
             "`run-ci-` prefix is stripped on the Python side; the resulting "
             "domain-label set is intersected with each test's `labels` to "
-            "decide what runs. An empty list keeps only `always_on=True` "
-            "tests for the suite."
+            "decide what runs. An empty list keeps only CPU registrations "
+            "with no domain labels; it selects no GPU tests."
         ),
+    )
+    parser.add_argument(
+        "--github-output",
+        help="Append has_tests for the selected shard to a GitHub Actions output file; requires --list-only.",
     )
     parser.add_argument(
         "--match-all-labels",
         action="store_true",
         default=False,
         help=(
-            "Bypass the labels filter and run every enabled test in the "
-            "suite (subject to hw/suite/nightly/disabled). Set by the "
-            "workflow when the PR carries `run-ci-image` or `run-ci-all`, "
-            "and equivalently on `workflow_dispatch`."
+            "Include every registered label, running every enabled test in "
+            "the suite (subject to hw/suite/cadence/disabled). Manual "
+            "override for local runs; the workflow passes resolved cadence "
+            "and labels instead."
         ),
     )
     args = parser.parse_args()
+
+    if args.github_output and not args.list_only:
+        parser.error("--github-output requires --list-only.")
 
     # Validate auto-partition arguments
     if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):

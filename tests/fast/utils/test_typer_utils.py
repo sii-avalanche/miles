@@ -408,6 +408,20 @@ class TestFieldTypes:
         assert result.exit_code == 0
         assert "color=red" in result.stdout
 
+    def test_the_argument_table_prints_an_enum_value_without_its_python_class_name(self) -> None:
+        """The argument table prints an enum default using its wire value."""
+        app = typer.Typer()
+
+        @app.command()
+        @dataclass_cli(env_var_prefix="")
+        def cmd(args: _EnumArgs) -> None:
+            pass
+
+        result = runner.invoke(app, [])
+        assert result.exit_code == 0
+        assert "| color | red" in result.stdout
+        assert "_Color.RED" not in result.stdout
+
     def test_enum_field_override(self) -> None:
         app = typer.Typer()
 
@@ -729,6 +743,23 @@ class TestEnvVarNaming:
         result = runner.invoke(app, [], env={"MILES_SCRIPT_MY_LONG_NAME": "from_env"})
         assert result.exit_code == 0
         assert "val=from_env" in result.stdout
+
+    def test_a_field_with_a_default_factory_is_usable_from_the_command_line(self) -> None:
+        """Click type-casts the declared default, so dataclasses' factory sentinel must never reach it."""
+
+        @dataclasses.dataclass
+        class _FactoryArgs:
+            count: int = dataclasses.field(default_factory=lambda: 7)
+
+        app = typer.Typer()
+
+        @app.command()
+        @dataclass_cli
+        def cmd(args: _FactoryArgs) -> None:
+            print(f"count={args.count}")
+
+        assert "count=7" in runner.invoke(app, []).stdout
+        assert "count=9" in runner.invoke(app, ["--count", "9"]).stdout
 
 
 # ---------------------------------------------------------------------------

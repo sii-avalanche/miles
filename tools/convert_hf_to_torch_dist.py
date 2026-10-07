@@ -12,20 +12,37 @@ from megatron.training.training import get_model
 import miles_plugins.mbridge  # noqa: F401
 from mbridge import AutoBridge
 from miles.backends.megatron_utils.arguments import set_default_megatron_args
+from miles.backends.megatron_utils.fp32_param_utils import enforce_marked_param_dtypes
 from miles.backends.megatron_utils.initialize import init
 from miles.backends.megatron_utils.model_provider import get_model_provider_func
-from miles.utils.logging_utils import configure_logger
+from miles.utils.logging_utils import configure_logger_raw
 from miles.utils.memory_utils import print_memory
+from miles_plugins.models.deepseek_v4.arguments import add_dsv4_arguments
+from miles_plugins.models.glm5.arguments import add_dsa_arguments
 
 
-def add_convertion_args(parser):
-    """Add conversion arguments to the parser"""
+def add_conversion_args(parser):
+    """Add conversion arguments, plus the plugin arguments the model scripts pass through."""
+    add_dsv4_arguments(parser)
+    add_dsa_arguments(parser)
     parser.add_argument("--hf-checkpoint", type=str, required=True, help="HuggingFace model path")
     parser.add_argument(
         "--megatron-to-hf-mode",
         choices=["raw", "bridge"],
         default="raw",
         help="The method to convert megatron weights to hugging face weights for SGLang.",
+    )
+    parser.add_argument(
+        "--custom-model-provider-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to a custom model provider function (e.g. for models like Inkling whose mcore "
+            "module structure differs from a plain GPTModel -- model-level embed_norm, custom "
+            "router/shared-experts). When set, the offline mcore model is built by this provider "
+            "(via miles' get_model_provider_func), then the mbridge bridge populates its weights. "
+            "Signature: def provider(pre_process, post_process, vp_stage=None) -> GPTModel."
+        ),
     )
     try:
         parser.add_argument("--padded-vocab-size", type=int, default=None)
@@ -35,8 +52,11 @@ def add_convertion_args(parser):
 
 
 def get_args():
-    args = parse_args(add_convertion_args)
+    args = parse_args(add_conversion_args)
     args = set_default_megatron_args(args)
+
+    args.debug_deterministic_collective = False
+    args.enable_witness = False
 
     # set to pass megatron validate_args
     args.save_interval = 1
@@ -52,8 +72,19 @@ def get_args():
     def ceildiv(a, b):
         return -(a // -b)
 
-    if args.pipeline_model_parallel_size == 1 and world_size > 1:
-        pp_size = world_size
+    auto_pipeline_parallel = (
+        args.pipeline_model_parallel_size == 1
+        and args.tensor_model_parallel_size == 1
+        and args.context_parallel_size == 1
+        # ETP defaults to None (= TP) until validate_args resolves it.
+        and (args.expert_tensor_parallel_size or args.tensor_model_parallel_size) == 1
+        # Each pipeline stage must hold whole EP groups, so auto PP only fills the ranks EP leaves.
+        and world_size % args.expert_model_parallel_size == 0
+        and world_size > args.expert_model_parallel_size
+        and not os.environ.get("CONVERT_KEEP_PP1")
+    )
+    if auto_pipeline_parallel:
+        pp_size = world_size // args.expert_model_parallel_size
         while True:
             args.pipeline_model_parallel_size = pp_size
             args.decoder_last_pipeline_num_layers = args.num_layers - ceildiv(
@@ -78,15 +109,7 @@ def get_args():
 
 
 def main():
-    if torch.version.hip:
-        import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
-
-        from miles.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
-
-        filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
-        print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
-
-    configure_logger()
+    configure_logger_raw()
 
     # Initialize distributed environment
     world_size = int(os.getenv("WORLD_SIZE") or os.getenv("SLURM_NTASKS") or 1)
@@ -108,6 +131,7 @@ def main():
     args = get_args()
     init(args)
     model = get_model(get_model_provider_func(args), ModelType.encoder_or_decoder, wrap_with_ddp=False)
+    enforce_marked_param_dtypes(model)
 
     # Load model
     hf_model_path = args.hf_checkpoint

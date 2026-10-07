@@ -9,11 +9,15 @@ from pathlib import Path
 import torch
 
 from miles.utils.data import Dataset
-from miles.utils.misc import load_function
+from miles.utils.function_registry import load_function
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+
+def compute_global_dataset_state_path(directory: str, *, rollout_id: int | None) -> str:
+    return os.path.join(directory, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
 
 
 def apply_system_prompt(
@@ -60,6 +64,10 @@ class DataSource(abc.ABC):
         Load the state of the data source
         """
 
+    def get_buffer_length(self) -> int | None:
+        """Pending-sample backlog, or None for sources without a buffer."""
+        return None
+
 
 # TODO may further refactor data-loading part later
 class RolloutDataSource(DataSource):
@@ -84,7 +92,8 @@ class RolloutDataSource(DataSource):
             # TODO move (during the refactor)
             if (d := args.dump_details) is not None:
                 tokenizer.save_pretrained(Path(d) / "tokenizer")
-                if processor:
+                # Bespoke processors (e.g. Inkling's) are not ProcessorMixin and cannot serialise.
+                if hasattr(processor, "save_pretrained"):
                     processor.save_pretrained(Path(d) / "processor")
 
             # Build a record-stream filter that wraps Dataset's read_file: the user
@@ -172,20 +181,22 @@ class RolloutDataSource(DataSource):
             "sample_index": self.sample_index,
             "metadata": self.metadata,
         }
-        path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        path = compute_global_dataset_state_path(self.args.save, rollout_id=rollout_id)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(state_dict, path)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
+            logger.warning("--disable-rollout-global-dataset: the dataset starts where a fresh run's would")
             return
 
         if self.args.load is None:
+            logger.warning("no --load: the dataset starts where a fresh run's would")
             return
 
-        path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        path = compute_global_dataset_state_path(self.args.load, rollout_id=rollout_id)
         if not os.path.exists(path):
-            logger.info(f"Checkpoint {path} does not exist.")
+            logger.warning(f"no dataset state under {path}: the dataset starts where a fresh run's would")
             return
 
         logger.info(f"load metadata from {path}")

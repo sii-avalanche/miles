@@ -2,17 +2,16 @@
 title: Fault Tolerance
 description: Rollout-side health checks and engine recovery, gated by --use-fault-tolerance.
 ---
+> **Outdated.** This page describes the pre-refactor fault-tolerance stack; the new fault-tolerance machinery is still being merged and will be documented once it lands.
 
-# Fault Tolerance
-
-`--use-fault-tolerance` enables Miles's rollout-side fault-tolerance machinery.
-It gates two code paths:
+The `--use-fault-tolerance` flag enables Miles's rollout-side
+fault-tolerance machinery. It gates two code paths:
 
 1. A `RolloutHealthMonitor` thread per server group, started in
-   `miles/ray/rollout.py:379`, which periodically heart-beats each SGLang
-   engine.
+   `miles/ray/rollout/rollout_manager.py`, which periodically heart-beats
+   each SGLang engine.
 2. A recovery hook in the trainer's weight-update step
-   (`miles/backends/megatron_utils/actor.py:500`), which restarts engines
+   (`miles/backends/megatron_utils/actor.py`), which restarts engines
    that the health monitor has killed.
 
 ```bash
@@ -20,15 +19,16 @@ It gates two code paths:
 ```
 
 The flag is `action="store_true"`, default `False`
-(`miles/utils/arguments.py:528`).
+(`miles/utils/arguments.py`). The rollout paths below additionally require
+`rollout` in `--ft-components`, which is what that flag selects when omitted.
 
 ## Health monitor
 
 `RolloutHealthMonitor` (`miles/utils/health_monitor.py`) runs in a daemon
 thread. Lifecycle: `start` (called once during init), `pause` and `resume`
 (called when engines offload / onload), `stop` (called during dispose).
-`pause` / `resume` are wired up in `miles/ray/rollout.py:497, 501` and called
-around offload / onload events.
+`pause` / `resume` are wired up in `miles/ray/rollout/rollout_manager.py`
+and called around offload / onload events.
 
 Each loop iteration does:
 
@@ -37,7 +37,7 @@ Each loop iteration does:
 2. For every active engine in the group, call `engine.health_generate.remote(timeout=self._check_timeout)`.
 3. If the call raises, run `_kill_engine`: `engine.shutdown.remote()`,
    `ray.kill(engine)`, and the engine slot is set to `None`
-   (`miles/utils/health_monitor.py:160-180`).
+   (`miles/utils/health_monitor.py`).
 4. Sleep `--rollout-health-check-interval` seconds, then repeat.
 
 ### Flags
@@ -51,15 +51,15 @@ Each loop iteration does:
 ## Engine recovery
 
 When `--use-fault-tolerance` is on, `MegatronActor.update_weights` calls
-`rollout_manager.recover_updatable_engines` on rank 0 before each weight
-update (`miles/backends/megatron_utils/actor.py:500`).
+`inference_controller.recover_updatable_engines` before each weight
+update (`miles/backends/megatron_utils/actor.py`).
 
-`recover_updatable_engines` (`miles/ray/rollout.py:513`):
+`recover_updatable_engines` (`miles/ray/rollout/inference_controller.py`):
 
 1. Pauses health monitoring.
 2. Calls `srv.recover()` on the updatable server.
 
-`srv.recover()` (`miles/ray/rollout.py:263`):
+`srv.recover()` (`miles/ray/rollout/rollout_server.py`, which fans out to `ServerCell.init` in `miles/ray/rollout/server_cell.py`):
 
 1. Finds engine slots set to `None` (killed by the health monitor).
 2. Calls `start_engines` for each affected group.
@@ -72,14 +72,14 @@ the new engines and the next weight transfer proceeds normally.
 
 When `--update-weight-transfer-mode p2p` is on, every P2P transfer is
 bounded by `--p2p-transfer-timeout` (default `30.0`s, defined in
-`miles/utils/arguments.py:519`; consumed at
-`miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py:73`).
+`miles/utils/arguments.py`; consumed at
+`miles/backends/megatron_utils/update_weight/update_weight_from_distributed/p2p.py`).
 On timeout the failed transfer is logged (`[P2P] Transfer future failed: ...`)
 in `p2p_transfer_utils.py`. There is no automatic retry or automatic
 broadcast-mode fallback in the source today.
 
 ## Dumper-mode interaction
 
-In dumper mode (`miles/utils/arguments.py:2102`), Miles forces
+In dumper mode (`miles/utils/arguments.py`), Miles forces
 `use_fault_tolerance = False` and `rollout_health_check_interval = 1e18`
 to keep heartbeats from firing.

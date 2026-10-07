@@ -1,79 +1,92 @@
 """TITO tokenizer — incremental tokenization for pretokenized prefix reuse.
 
-``TITOTokenizer`` computes incremental token IDs for non-assistant messages
-(tool responses, user follow-ups, system injections) that follow the
-assistant's generated token sequence, then merges them with the pretokenized
-prefix — handling model-specific boundary tokens at the junction.
+``TITOTokenizer`` computes incremental token IDs for messages appended after the assistant's generated token sequence, then merges them with the pretokenized prefix — handling model-specific boundary tokens at the junction.
 
-The default implementation incrementally tokenizes appended non-assistant turns
-with role-specific synthetic prefixes:
-
-- contiguous ``tool`` runs use ``[dummy_system, dummy_assistant]``
-- each ``user`` or ``system`` message uses ``[dummy_system]``
-
-The appended suffix is processed left-to-right, then the generation prompt for
-the next assistant turn is appended once at the end.  Model-specific
-subclasses only override ``merge_tokens`` for boundary quirks at the prefix
-junction.
+The default implementation renders the complete appended suffix and the next generation prompt once under a synthetic ``[dummy_system, dummy_assistant]`` prefix.  Model-specific subclasses customize request rules and token-boundary handling.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
-from enum import StrEnum
+
+try:
+    from enum import StrEnum
+except ImportError:
+    from backports.strenum import StrEnum
+
 from pathlib import Path
 from typing import Any
 
-from miles.utils.chat_template_utils.template import apply_chat_template, assert_messages_append_only_with_allowed_role
+from miles.utils.chat_template_utils import deepseek, template
+from miles.utils.chat_template_utils.inkling_parser import InklingResponseParser
+from miles.utils.chat_template_utils.message_matcher_hub import (
+    assert_messages_append_only_with_allowed_role,
+    strict_message_matches,
+)
 from miles.utils.chat_template_utils.token_seq_comparator import TokenSeqComparator
 
 logger = logging.getLogger(__name__)
 
-# Bundled fixed-template files live under this directory; ``FixedTemplateRow.template``
+# Bundled fixed-template files live under this directory; ``FixedTemplate.template``
 # values are filenames relative to it.
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 
-# Roles the TITO merge logic understands; passing anything else is a typo.
-_VALID_ROLES = frozenset({"tool", "user", "system"})
+# Roles that a fixed template may support after the pretokenized assistant
+# prefix.  A family narrows this set only when its registered renderer cannot
+# preserve every role append-only.
+VALID_APPEND_ROLES: tuple[str, ...] = ("tool", "user", "system", "assistant")
+ALL_APPEND_ROLES: frozenset[str] = frozenset(VALID_APPEND_ROLES)
 
 _DUMMY_SYSTEM: dict[str, Any] = {"role": "system", "content": "dummy system"}
 
 
 @dataclass(frozen=True)
-class FixedTemplateRow:
-    """A ``(roles, template, extra_kwargs)`` row owned by a TITO tokenizer family.
+class FixedTemplate:
+    """A family's fixed chat template, required kwargs, and append surface.
 
-    Each row says: when the session is configured for ``allowed_roles``, this
-    family expects the given chat template plus the given extra kwargs.
     ``template`` is a path relative to ``TEMPLATE_DIR`` for a bundled fixed
     template, or ``None`` to keep the HF-native template (kwargs-only fix).
+    ``extra_kwargs`` carry the family's preserve-think constants, so renders
+    stay append-only.  ``allowed_append_roles`` defaults to the maximal
+    four-role surface; a known restricted template must narrow it explicitly.
+    ``consistant_kwargs`` lists fields that must retain their recorded value
+    or absence when continuing a turn.
     """
 
-    allowed_roles: frozenset[str]
     template: str | None = None
     extra_kwargs: dict[str, Any] = field(default_factory=dict)
+    allowed_append_roles: frozenset[str] = ALL_APPEND_ROLES
+    consistant_kwargs: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        roles = frozenset(self.allowed_append_roles)
+        invalid = roles - ALL_APPEND_ROLES
+        if invalid:
+            raise ValueError(
+                f"Unknown FixedTemplate allowed_append_roles: {sorted(invalid)}; "
+                f"supported roles are {sorted(ALL_APPEND_ROLES)}"
+            )
+        object.__setattr__(self, "allowed_append_roles", roles)
 
 
-def _build_dummy_assistant(tool_responses: list[dict[str, Any]]) -> dict[str, Any]:
-    """Build a dummy assistant message with tool_calls matching *tool_responses*,
-    so the template correctly renders the subsequent tool-response turn boundaries."""
+def extract_template_args(request_args: dict[str, Any]) -> dict[str, Any]:
+    """Select renderer kwargs from an already resolved request, including tools."""
+    args = dict(request_args.get("chat_template_kwargs") or {})
+    if request_args.get("tools"):
+        args["tools"] = request_args["tools"]
+    return args
+
+
+def _build_dummy_assistant(stored_assistant: dict[str, Any]) -> dict[str, Any]:
+    """Build a dummy assistant that preserves the stored turn's tool calls."""
     return {
         "role": "assistant",
         "content": "",
         "reasoning_content": " ",
-        "tool_calls": [
-            {
-                "id": resp.get("tool_call_id") or f"call0000{i}",
-                "type": "function",
-                "function": {
-                    "name": resp.get("name") or "dummy_func",
-                    "arguments": {},
-                },
-            }
-            for i, resp in enumerate(tool_responses)
-        ],
+        "tool_calls": stored_assistant.get("tool_calls") or [],
     }
 
 
@@ -84,15 +97,14 @@ def _build_dummy_assistant(tool_responses: list[dict[str, Any]]) -> dict[str, An
 
 
 class TITOTokenizer:
-    """Incremental tokenization and prefix merging for appended non-assistant turns."""
+    """Incremental tokenization and prefix merging for appended messages."""
 
     max_trim_tokens: int = 0
     trailing_token_ids: frozenset[int] = frozenset()
 
-    # ``(roles, template, extra_kwargs)`` rows this family supports.  Resolved
-    # by ``resolve_fixed_chat_template`` via smallest-superset match against
-    # the caller's ``allowed_append_roles``.
-    SUPPORTED_TEMPLATES: tuple[FixedTemplateRow, ...] = ()
+    # The family's fixed renderer contract. DEFAULT uses the model's native
+    # template with the maximal best-effort append surface.
+    FIXED_TEMPLATE: FixedTemplate = FixedTemplate()
 
     # sglang ``--reasoning-parser`` and ``--tool-call-parser`` values bound to
     # this family.
@@ -105,13 +117,104 @@ class TITOTokenizer:
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
         special_token_ids: set[int] | None = None,
-        allowed_append_roles: list[str] | None = None,
     ):
         self.tokenizer = tokenizer
-        self.chat_template_kwargs = chat_template_kwargs or {}
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self._assistant_start_str = assistant_start_str
-        self.allowed_append_roles: list[str] = allowed_append_roles if allowed_append_roles is not None else ["tool"]
+        self.allowed_append_roles = self.FIXED_TEMPLATE.allowed_append_roles
         self.special_token_ids: set[int] = special_token_ids
+        launch_args = TITOTokenizer.resolve_request_args(self, {}, turn_args=None)
+        self.chat_template_kwargs = extract_template_args(launch_args)
+
+    def request_arg_rules(self) -> list[Callable[..., None]]:
+        """Return this model's rules in execution order; subclasses may extend the list."""
+        return [
+            self.resolve_template_kwargs,
+            self.resolve_tools,
+            self.resolve_history_args,
+            self.apply_fixed_template_kwargs,
+        ]
+
+    def resolve_request_args(
+        self, request_args: dict[str, Any], *, turn_args: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Apply model rules in place and return the same full request.
+
+        Rules read request_source, turn_args and launch kwargs without modifying
+        them. Copy inherited mutable values before writing them into request_args.
+        """
+        request_source = dict(request_args)
+        for rule in self.request_arg_rules():
+            rule(request_args, request_source=request_source, turn_args=turn_args)
+        return request_args
+
+    def resolve_template_kwargs(
+        self,
+        request_args: dict[str, Any],
+        *,
+        request_source: dict[str, Any],
+        turn_args: dict[str, Any] | None,
+    ) -> None:
+        """Merge request template fields over history and launch defaults."""
+        kwargs = {
+            **self.chat_template_kwargs,
+            **((turn_args or {}).get("chat_template_kwargs") or {}),
+            **(request_source.get("chat_template_kwargs") or {}),
+        }
+        # Launch kwargs may contain tools; requests carry them at the top level.
+        kwargs.pop("tools", None)
+        request_args["chat_template_kwargs"] = deepcopy(kwargs)
+
+    def resolve_tools(
+        self,
+        request_args: dict[str, Any],
+        *,
+        request_source: dict[str, Any],
+        turn_args: dict[str, Any] | None,
+    ) -> None:
+        """Inherit omitted tools and reject changes to tools in a reused prefix."""
+        tools = request_source.get("tools") or None
+        if turn_args is None:
+            tools = tools or self.chat_template_kwargs.get("tools")
+        else:
+            recorded = turn_args.get("tools")
+            if tools is None:
+                tools = recorded
+            elif template.extract_tool_dicts(tools) != template.extract_tool_dicts(recorded):
+                raise ValueError(
+                    "tools changed on a continued turn: the turn being continued was rendered with different tools, "
+                    "and this model family renders tools in the prompt prefix"
+                )
+        request_args["tools"] = deepcopy(tools)
+
+    def apply_fixed_template_kwargs(
+        self,
+        request_args: dict[str, Any],
+        *,
+        request_source: dict[str, Any],
+        turn_args: dict[str, Any] | None,
+    ) -> None:
+        """Override requested template values with the family's required settings."""
+        if self.FIXED_TEMPLATE.extra_kwargs:
+            request_args.setdefault("chat_template_kwargs", {}).update(deepcopy(self.FIXED_TEMPLATE.extra_kwargs))
+
+    def resolve_history_args(
+        self,
+        request_args: dict[str, Any],
+        *,
+        request_source: dict[str, Any],
+        turn_args: dict[str, Any] | None,
+    ) -> None:
+        """Keep selected historical fields, including their absence, in a continued turn."""
+        if turn_args is None:
+            return
+        recorded = turn_args.get("chat_template_kwargs") or {}
+        kwargs = request_args.setdefault("chat_template_kwargs", {})
+        for key in self.FIXED_TEMPLATE.consistant_kwargs:
+            kwargs.pop(key, None)
+        kwargs.update(
+            deepcopy({key: recorded[key] for key in self.FIXED_TEMPLATE.consistant_kwargs if key in recorded})
+        )
 
     def create_comparator(self) -> TokenSeqComparator:
         """Create a :class:`TokenSeqComparator` configured with this
@@ -123,54 +226,69 @@ class TITOTokenizer:
             trim_trailing_ids=self.trailing_token_ids or None,
         )
 
-    def render_messages(
+    def default_template_args(self, tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """Return launch template kwargs with optional tools for direct rendering."""
+        args = dict(self.chat_template_kwargs)
+        if tools:
+            args["tools"] = tools
+        return args
+
+    def apply_chat_template(
         self,
         messages: list[dict[str, Any]],
         *,
         add_generation_prompt: bool,
-        tools: list[dict[str, Any]] | None = None,
         tokenize: bool = False,
+        template_args: dict[str, Any] | None = None,
     ) -> str | list[int]:
-        return apply_chat_template(
+        """Render messages using resolved template kwargs and tools.
+
+        Pass `template_args` as the complete argument set; it is not merged with
+        launch defaults. `None` uses this tokenizer's launch defaults.
+        """
+        # TODO: Use the unified kwargs resolver for launch and request arguments once
+        # available, then check whether callers still need this default fallback.
+        args = self.chat_template_kwargs if template_args is None else template_args
+        return template.apply_chat_template(
             messages,
             tokenizer=self.tokenizer,
             tokenize=tokenize,
             add_generation_prompt=add_generation_prompt,
-            tools=tools,
-            **self.chat_template_kwargs,
+            **args,
         )
+
+    def postprocess_completion(
+        self,
+        *,
+        choice: dict[str, Any],
+        assistant_message: dict[str, Any],
+        completion_token_ids: list[int],
+    ) -> dict[str, Any]:
+        """Postprocess an upstream completion and return the message to store.
+
+        The default path trusts SGLang's parsed message. Model families that
+        need token-aware response handling override this hook and may update
+        ``choice`` before returning their server-side message representation.
+        """
+        return assistant_message
+
+    def preserve_server_message_state(
+        self,
+        stored_messages: list[dict[str, Any]],
+        request_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Restore model-specific server-owned sidecars after client replay."""
+        return list(request_messages)
 
     def _encode_text(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
-
-    def _split_appended_segments(self, appended_messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-        segments: list[list[dict[str, Any]]] = []
-        i = 0
-        while i < len(appended_messages):
-            role = appended_messages[i]["role"]
-            # Many templates wrap a contiguous tool-response run as one logical
-            # block, so tool messages are diffed together instead of one-by-one.
-            if role == "tool":
-                j = i + 1
-                while j < len(appended_messages) and appended_messages[j]["role"] == "tool":
-                    j += 1
-                segments.append(appended_messages[i:j])
-                i = j
-                continue
-            if role in {"user", "system"}:
-                segments.append([appended_messages[i]])
-                i += 1
-                continue
-            raise ValueError(f"unsupported appended role for TITO segmentation: {role}")
-
-        return segments
 
     def _tokenize_rendered_suffix(
         self,
         base_messages: list[dict[str, Any]],
         appended_messages: list[dict[str, Any]],
         *,
-        tools: list[dict[str, Any]] | None = None,
+        template_args: dict[str, Any] | None = None,
         add_generation_prompt: bool = False,
     ) -> list[int]:
         """Render *base_messages* and *base_messages + appended_messages*, return
@@ -179,60 +297,38 @@ class TITOTokenizer:
         When *add_generation_prompt* is True and *appended_messages* is empty,
         this computes the generation-prompt suffix (the assistant opener tokens).
         """
-        text_without = self.render_messages(base_messages, add_generation_prompt=False, tools=tools)
-        text_with = self.render_messages(
+        text_without = self.apply_chat_template(
+            base_messages, add_generation_prompt=False, template_args=template_args
+        )
+        text_with = self.apply_chat_template(
             base_messages + appended_messages,
             add_generation_prompt=add_generation_prompt,
-            tools=tools,
+            template_args=template_args,
         )
         if not text_with.startswith(text_without):
             roles = [msg["role"] for msg in appended_messages] if appended_messages else ["generation_prompt"]
             raise ValueError(f"rendered suffix diff failed for {roles}")
         return self._encode_text(text_with[len(text_without) :])
 
-    def _tokenize_tool_segment(
-        self,
-        appended_messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-    ) -> list[int]:
-        # No dummy user to avoid cut think issues.
-        return self._tokenize_rendered_suffix(
-            [_DUMMY_SYSTEM, _build_dummy_assistant(appended_messages)],
-            appended_messages,
-            tools=tools,
-        )
-
-    def _tokenize_user_and_system_segment(
-        self,
-        appended_message: dict[str, Any],
-        tools: list[dict[str, Any]] | None = None,
-    ) -> list[int]:
-        # User/system single-message appends share one synthetic context.
-        return self._tokenize_rendered_suffix(
-            [_DUMMY_SYSTEM],
-            [appended_message],
-            tools=tools,
-        )
-
-    def tokenize_additional_non_assistant(
+    def tokenize_additional_messages(
         self,
         old_messages: list[dict[str, Any]],
         new_messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
+        *,
+        template_args: dict[str, Any] | None = None,
     ) -> list[int]:
-        """Compute incremental token IDs for non-assistant messages appended
-        after the pretokenized prefix.
+        """Compute incremental token IDs for messages appended after the
+        pretokenized prefix.
 
-        Handles tool responses, user, and system messages —
-        never an assistant message.  Validates that *new_messages* is an
-        append-only extension of *old_messages* via
-        ``assert_messages_append_only_with_allowed_role``.
+        Appended roles must be listed in ``self.allowed_append_roles``.  The
+        method validates that *new_messages* is an append-only extension of
+        *old_messages* via ``assert_messages_append_only_with_allowed_role``.
 
         Args:
             old_messages: Previously stored messages (prefix).
             new_messages: Full new message list (must be a superset of
                 *old_messages* with only allowed-role messages appended).
-            tools: Tool definitions in OpenAI format (may vary per call).
+            template_args: Resolved template kwargs and tools, or `None` for launch defaults.
 
         Returns:
             Incremental token IDs (including the generation prompt) that,
@@ -241,26 +337,10 @@ class TITOTokenizer:
         """
         assert_messages_append_only_with_allowed_role(old_messages, new_messages, self.allowed_append_roles)
         appended_messages = new_messages[len(old_messages) :]
-        incremental: list[int] = []
-
-        # Incremental non-assistant content is assembled segment-by-segment
-        # using the smallest synthetic context that preserves each role's
-        # boundary tokens.
-        for segment in self._split_appended_segments(appended_messages):
-            role = segment[0]["role"]
-            if role == "tool":
-                incremental.extend(self._tokenize_tool_segment(segment, tools))
-            elif role == "user" or role == "system":
-                incremental.extend(self._tokenize_user_and_system_segment(segment[0], tools))
-            else:
-                raise ValueError(f"unsupported appended role for TITO tokenization: {role}")
-
-        # The next assistant opener depends on the full post-append history, so
-        # it is derived from the real messages once and appended only at the end.
-        return incremental + self._tokenize_rendered_suffix(
-            new_messages,
-            [],
-            tools=tools,
+        return self._tokenize_rendered_suffix(
+            [_DUMMY_SYSTEM, _build_dummy_assistant(old_messages[-1])],
+            appended_messages,
+            template_args=template_args,
             add_generation_prompt=True,
         )
 
@@ -269,7 +349,8 @@ class TITOTokenizer:
         old_messages: list[dict[str, Any]],
         new_messages: list[dict[str, Any]],
         pretokenized_token_ids: list[int],
-        tools: list[dict[str, Any]] | None = None,
+        *,
+        template_args: dict[str, Any] | None = None,
     ) -> list[int]:
         """Merge *pretokenized_token_ids* with incremental tokens to produce
         the complete prompt token IDs (including generation prompt).
@@ -277,7 +358,7 @@ class TITOTokenizer:
         The default implementation is simple concatenation.  Subclasses
         override this to handle model-specific boundary token logic.
         """
-        incremental = self.tokenize_additional_non_assistant(old_messages, new_messages, tools)
+        incremental = self.tokenize_additional_messages(old_messages, new_messages, template_args=template_args)
         return list(pretokenized_token_ids) + incremental
 
 
@@ -298,16 +379,9 @@ class Qwen3TITOTokenizer(TITOTokenizer):
     reasoning_parser = "qwen3"
     tool_call_parser = "qwen25"
 
-    SUPPORTED_TEMPLATES = (
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool"}),
-            template="qwen3_fixed.jinja",
-        ),
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user"}),
-            template="qwen3_fixed.jinja",
-            extra_kwargs={"clear_thinking": False},
-        ),
+    FIXED_TEMPLATE = FixedTemplate(
+        template="qwen3_fixed.jinja",
+        extra_kwargs={"clear_thinking": False},
     )
 
     _default_assistant_start_str: str = "<|im_start|>assistant"
@@ -317,13 +391,11 @@ class Qwen3TITOTokenizer(TITOTokenizer):
         tokenizer: Any,
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
-        allowed_append_roles: list[str] | None = None,
     ):
         super().__init__(
             tokenizer,
             chat_template_kwargs,
             assistant_start_str or self._default_assistant_start_str,
-            allowed_append_roles=allowed_append_roles,
         )
         nl_ids = tokenizer.encode("\n", add_special_tokens=False)
         assert len(nl_ids) == 1, f"Expected single newline token, got {nl_ids}"
@@ -336,37 +408,60 @@ class Qwen3TITOTokenizer(TITOTokenizer):
         old_messages: list[dict[str, Any]],
         new_messages: list[dict[str, Any]],
         pretokenized_token_ids: list[int],
-        tools: list[dict[str, Any]] | None = None,
+        *,
+        template_args: dict[str, Any] | None = None,
     ) -> list[int]:
-        incremental = self.tokenize_additional_non_assistant(old_messages, new_messages, tools)
+        incremental = self.tokenize_additional_messages(old_messages, new_messages, template_args=template_args)
         prefix = list(pretokenized_token_ids)
+        # Weakly post-trained Qwen3 models, notably 0.6B, may emit the pretraining/padding token `<|endoftext|>`.
+        # Seen in TITO's March 2026 bring-up; rare in larger models. See https://github.com/radixark/miles/issues/3113.
+        # This is model degeneration, not a valid `<|im_end|>` alias; keep the strict checker reporting it.
         if prefix and prefix[-1] == self._im_end_id:
             prefix.append(self._newline_id)
         return prefix + incremental
 
 
-# Qwen3.5 and Qwen3-Next-Thinking share the ``<|im_end|>`` boundary handling
-# with Qwen3, so they reuse Qwen3TITOTokenizer's token-level logic via plain
-# inheritance.  They are still split into named subclasses because each owns
-# its own ``SUPPORTED_TEMPLATES`` row pointing to a distinct fixed jinja, even
-# though their boundary behavior is identical.
+# Qwen3.5/3.6 and Qwen3-Next-Thinking share the ``<|im_end|>`` boundary
+# handling with Qwen3. Their subclasses only own the distinct fixed-template
+# contracts layered on that token boundary.
 
 
 class Qwen35TITOTokenizer(Qwen3TITOTokenizer):
-    """Qwen3.5 — same boundary behavior as Qwen3, distinct fixed template."""
+    """Qwen3.5 template and Qwen3 token boundary."""
 
     tool_call_parser = "qwen3_coder"
 
-    SUPPORTED_TEMPLATES = (
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool"}),
-            template="qwen3.5_fixed.jinja",
-        ),
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user"}),
-            template="qwen3.5_fixed.jinja",
-            extra_kwargs={"clear_thinking": False},
-        ),
+    FIXED_TEMPLATE = FixedTemplate(
+        template="qwen3.5_fixed.jinja",
+        extra_kwargs={"preserve_thinking": True},
+        allowed_append_roles=frozenset({"tool", "user", "assistant"}),
+        consistant_kwargs=["add_vision_id"],
+    )
+
+
+class Qwen36TITOTokenizer(Qwen3TITOTokenizer):
+    """Qwen3.6 template and Qwen3 token boundary."""
+
+    tool_call_parser = "qwen3_coder"
+
+    FIXED_TEMPLATE = FixedTemplate(
+        template="qwen3.6_fixed.jinja",
+        extra_kwargs={"preserve_thinking": True},
+        allowed_append_roles=frozenset({"tool", "user", "assistant"}),
+        consistant_kwargs=["add_vision_id"],
+    )
+
+
+class Qwen38SmallTITOTokenizer(Qwen3TITOTokenizer):
+    """Qwen3.8 reasoning-effort template with the Qwen3 token boundary."""
+
+    tool_call_parser = "qwen3_coder"
+
+    FIXED_TEMPLATE = FixedTemplate(
+        template="qwen3.8_small_and_flash_next_fixed.jinja",
+        extra_kwargs={"preserve_thinking": True},
+        allowed_append_roles=frozenset({"tool", "user", "assistant"}),
+        consistant_kwargs=["add_vision_id", "enable_thinking", "reasoning_effort"],
     )
 
 
@@ -374,21 +469,14 @@ class QwenNextTITOTokenizer(Qwen3TITOTokenizer):
     """Qwen3-Thinking-2507 / Qwen3-Next-Thinking — same boundary behavior as
     Qwen3, distinct (shared) fixed template."""
 
-    SUPPORTED_TEMPLATES = (
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool"}),
-            template="qwen3_thinking_2507_and_next_fixed.jinja",
-        ),
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user"}),
-            template="qwen3_thinking_2507_and_next_fixed.jinja",
-            extra_kwargs={"clear_thinking": False},
-        ),
+    FIXED_TEMPLATE = FixedTemplate(
+        template="qwen3_thinking_2507_and_next_fixed.jinja",
+        extra_kwargs={"clear_thinking": False},
     )
 
 
 # ---------------------------------------------------------------------------
-# GLM 4.7 implementation
+# GLM family implementation
 # ---------------------------------------------------------------------------
 
 
@@ -409,21 +497,9 @@ class GLM47TITOTokenizer(TITOTokenizer):
 
     # GLM's HF-native chat template already exposes a ``clear_thinking`` kwarg,
     # so no fixed-jinja patch is needed for either append surface.
-    SUPPORTED_TEMPLATES = (
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool"}),
-            template=None,
-        ),
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user"}),
-            template=None,
-            extra_kwargs={"clear_thinking": False},
-        ),
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user", "system"}),
-            template=None,
-            extra_kwargs={"clear_thinking": False},
-        ),
+    FIXED_TEMPLATE = FixedTemplate(
+        template=None,
+        extra_kwargs={"clear_thinking": False},
     )
 
     max_trim_tokens: int = 1
@@ -434,13 +510,11 @@ class GLM47TITOTokenizer(TITOTokenizer):
         tokenizer: Any,
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
-        allowed_append_roles: list[str] | None = None,
     ):
         super().__init__(
             tokenizer,
             chat_template_kwargs,
             assistant_start_str or self._default_assistant_start_str,
-            allowed_append_roles=allowed_append_roles,
         )
         self._observation_id: int = tokenizer.convert_tokens_to_ids("<|observation|>")
         self._user_id: int = tokenizer.convert_tokens_to_ids("<|user|>")
@@ -452,13 +526,27 @@ class GLM47TITOTokenizer(TITOTokenizer):
         old_messages: list[dict[str, Any]],
         new_messages: list[dict[str, Any]],
         pretokenized_token_ids: list[int],
-        tools: list[dict[str, Any]] | None = None,
+        *,
+        template_args: dict[str, Any] | None = None,
     ) -> list[int]:
-        incremental = self.tokenize_additional_non_assistant(old_messages, new_messages, tools)
+        incremental = self.tokenize_additional_messages(old_messages, new_messages, template_args=template_args)
         prefix = list(pretokenized_token_ids)
         if prefix and prefix[-1] in self._ambiguous_boundary_ids:
             prefix = prefix[:-1]
         return prefix + incremental
+
+
+class GLM53TITOTokenizer(GLM47TITOTokenizer):
+    """GLM-5.3 native text renderer with the shared GLM token boundary.
+
+    The GLM-5.3 and GLM-5.3-Flash templates start generation with ``<think>`` even when ``enable_thinking=False``, so this family pins ``enable_thinking=True``. Flash support covers tokenizer text inputs, not multimodal processor inputs.
+    """
+
+    FIXED_TEMPLATE = FixedTemplate(
+        template=None,
+        extra_kwargs={"clear_thinking": False, "enable_thinking": True},
+        consistant_kwargs=["reasoning_effort"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -488,21 +576,10 @@ class Nemotron3TITOTokenizer(Qwen3TITOTokenizer):
     reasoning_parser = "nemotron_3"
     tool_call_parser = "qwen3_coder"
 
-    SUPPORTED_TEMPLATES = (
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool"}),
-            template=None,
-        ),
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user"}),
-            template=None,
-            extra_kwargs={"truncate_history_thinking": False},
-        ),
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user", "system"}),
-            template=None,
-            extra_kwargs={"truncate_history_thinking": False},
-        ),
+    FIXED_TEMPLATE = FixedTemplate(
+        template=None,
+        extra_kwargs={"truncate_history_thinking": False},
+        consistant_kwargs=["low_effort"],
     )
 
     _default_assistant_start_str: str = "<|im_start|>assistant\n"
@@ -512,13 +589,11 @@ class Nemotron3TITOTokenizer(Qwen3TITOTokenizer):
         tokenizer: Any,
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
-        allowed_append_roles: list[str] | None = None,
     ):
         super().__init__(
             tokenizer,
             chat_template_kwargs,
             assistant_start_str or self._default_assistant_start_str,
-            allowed_append_roles=allowed_append_roles,
         )
 
 
@@ -544,12 +619,10 @@ class Kimi25TITOTokenizer(TITOTokenizer):
     ``{tool, user}`` surface is registered (per current onboarding scope).
     """
 
-    SUPPORTED_TEMPLATES = (
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user"}),
-            template="kimi_k25_fixed.jinja",
-            extra_kwargs={"preserve_thinking": True},
-        ),
+    FIXED_TEMPLATE = FixedTemplate(
+        template="kimi_k25_fixed.jinja",
+        extra_kwargs={"preserve_thinking": True},
+        consistant_kwargs=["thinking", "tools_ts_str"],
     )
 
     _default_assistant_start_str: str = "<|im_assistant|>"
@@ -559,14 +632,12 @@ class Kimi25TITOTokenizer(TITOTokenizer):
         tokenizer: Any,
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
-        allowed_append_roles: list[str] | None = None,
     ):
         super().__init__(
             tokenizer,
             chat_template_kwargs,
             assistant_start_str or self._default_assistant_start_str,
             special_token_ids=_kimi_segment_special_token_ids(tokenizer),
-            allowed_append_roles=allowed_append_roles,
         )
 
 
@@ -587,12 +658,10 @@ class Kimi26TITOTokenizer(TITOTokenizer):
     reasoning_parser = "kimi_k2"
     tool_call_parser = "kimi_k2_raw_id"
 
-    SUPPORTED_TEMPLATES = (
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user"}),
-            template=None,
-            extra_kwargs={"preserve_thinking": True},
-        ),
+    FIXED_TEMPLATE = FixedTemplate(
+        template=None,
+        extra_kwargs={"preserve_thinking": True},
+        consistant_kwargs=["tools_ts_str"],
     )
 
     _default_assistant_start_str: str = "<|im_assistant|>"
@@ -602,14 +671,12 @@ class Kimi26TITOTokenizer(TITOTokenizer):
         tokenizer: Any,
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
-        allowed_append_roles: list[str] | None = None,
     ):
         super().__init__(
             tokenizer,
             chat_template_kwargs,
             assistant_start_str or self._default_assistant_start_str,
             special_token_ids=_kimi_segment_special_token_ids(tokenizer),
-            allowed_append_roles=allowed_append_roles,
         )
 
 
@@ -633,22 +700,18 @@ class MinimaxM25TITOTokenizer(TITOTokenizer):
     ``<think>`` blocks and breaks append-only.  Only ``{tool}`` surface is
     registered on HF-native template for that reason; multi-user-turn
     requires the fixed jinja with ``clear_thinking=False`` to always
-    preserve history reasoning.
+    preserve history reasoning.  The fixed Jinja renders tool, user, and
+    assistant appends, but ignores mid-session system messages, so that role
+    is excluded from its capability.
     """
 
     reasoning_parser = "minimax-append-think"
     tool_call_parser = "minimax-m2"
 
-    SUPPORTED_TEMPLATES = (
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool"}),
-            template=None,
-        ),
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user"}),
-            template="minimax_m25_fixed.jinja",
-            extra_kwargs={"clear_thinking": False},
-        ),
+    FIXED_TEMPLATE = FixedTemplate(
+        template="minimax_m25_fixed.jinja",
+        extra_kwargs={"clear_thinking": False},
+        allowed_append_roles=frozenset({"tool", "user", "assistant"}),
     )
 
     _default_assistant_start_str: str = "]~b]ai"
@@ -658,13 +721,11 @@ class MinimaxM25TITOTokenizer(TITOTokenizer):
         tokenizer: Any,
         chat_template_kwargs: dict[str, Any] | None = None,
         assistant_start_str: str | None = None,
-        allowed_append_roles: list[str] | None = None,
     ):
         super().__init__(
             tokenizer,
             chat_template_kwargs,
             assistant_start_str or self._default_assistant_start_str,
-            allowed_append_roles=allowed_append_roles,
         )
         nl_ids = tokenizer.encode("\n", add_special_tokens=False)
         assert len(nl_ids) == 1, f"Expected single newline token, got {nl_ids}"
@@ -677,9 +738,10 @@ class MinimaxM25TITOTokenizer(TITOTokenizer):
         old_messages: list[dict[str, Any]],
         new_messages: list[dict[str, Any]],
         pretokenized_token_ids: list[int],
-        tools: list[dict[str, Any]] | None = None,
+        *,
+        template_args: dict[str, Any] | None = None,
     ) -> list[int]:
-        incremental = self.tokenize_additional_non_assistant(old_messages, new_messages, tools)
+        incremental = self.tokenize_additional_messages(old_messages, new_messages, template_args=template_args)
         prefix = list(pretokenized_token_ids)
         if prefix and prefix[-1] == self._eos_id:
             prefix.append(self._newline_id)
@@ -691,22 +753,295 @@ class MinimaxM27TITOTokenizer(MinimaxM25TITOTokenizer):
     to M2.5; the chat template only differs by default system identity string.
 
     Inherits parsers, ``__init__``, ``merge_tokens``, and
-    ``_default_assistant_start_str`` from M2.5; only ``SUPPORTED_TEMPLATES``
+    ``_default_assistant_start_str`` from M2.5; only ``FIXED_TEMPLATE``
     is rebound to ``minimax_m27_fixed.jinja`` so the fixed-template lookup
     points at the M2.7-derived jinja.
     """
 
-    SUPPORTED_TEMPLATES = (
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool"}),
-            template=None,
-        ),
-        FixedTemplateRow(
-            allowed_roles=frozenset({"tool", "user"}),
-            template="minimax_m27_fixed.jinja",
-            extra_kwargs={"clear_thinking": False},
-        ),
+    FIXED_TEMPLATE = FixedTemplate(
+        template="minimax_m27_fixed.jinja",
+        extra_kwargs={"clear_thinking": False},
+        allowed_append_roles=frozenset({"tool", "user", "assistant"}),
     )
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek V3.2 implementation
+# ---------------------------------------------------------------------------
+
+_DEEPSEEK_MODE_KWARG_ALIASES = frozenset({"thinking_mode", "enable_thinking", "thinking"})
+
+
+class DeepSeekV32TITOTokenizer(TITOTokenizer):
+    """DeepSeek V3.2 — miles' vendored copy of the official ``encoding_dsv32``.
+
+    V3.2 ships no jinja chat_template; prompts render through
+    ``templates.encoding_dsv32.encode_messages``, and miles'
+    ``apply_chat_template`` routes any V3.2 tokenizer to the thin
+    ``chat_template_utils.deepseek`` bridge.  TITO incremental tokenization
+    rides that same bridge.
+
+    Upstream ``encoding_dsv32`` gates every thinking block on
+    ``last_user_idx``: appending a *user* turn re-classifies every prior
+    assistant as "before last user" and strips its thinking block, which is
+    not append-only.  The vendored copy honors ``drop_thinking=False`` at the
+    render level (like ``encoding_dsv4``), so every surface pins it and the
+    ``{tool, user}`` surface becomes legal.
+    """
+
+    reasoning_parser = "deepseek-v3"
+    tool_call_parser = "deepseekv32"
+
+    FIXED_TEMPLATE = FixedTemplate(
+        template=None,
+        extra_kwargs={"drop_thinking": False},
+        consistant_kwargs=["add_default_bos_token", "context"],
+    )
+
+    _DEFAULT_ASSISTANT_START = "<｜Assistant｜>"
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        assistant_start_str: str | None = None,
+    ):
+        # V3.2 has no jinja template, so assistant_start_str can't be sniffed
+        # from one; pin it explicitly.  The comparator keys off the User /
+        # Assistant sentinels to find assistant-content boundaries.
+        super().__init__(
+            tokenizer,
+            chat_template_kwargs=chat_template_kwargs,
+            assistant_start_str=assistant_start_str or self._DEFAULT_ASSISTANT_START,
+            special_token_ids={
+                tokenizer.convert_tokens_to_ids("<｜User｜>"),
+                tokenizer.convert_tokens_to_ids("<｜Assistant｜>"),
+            },
+        )
+
+    def request_arg_rules(self) -> list[Callable[..., None]]:
+        rules = super().request_arg_rules()
+        rules.append(self.resolve_thinking)
+        return rules
+
+    def resolve_template_kwargs(
+        self,
+        request_args: dict[str, Any],
+        *,
+        request_source: dict[str, Any],
+        turn_args: dict[str, Any] | None,
+    ) -> None:
+        super().resolve_template_kwargs(request_args, request_source=request_source, turn_args=turn_args)
+        # Thinking aliases are one setting: history overrides the request and launch defaults.
+        for source in (
+            (turn_args or {}).get("chat_template_kwargs") or {},
+            request_source.get("chat_template_kwargs") or {},
+            self.chat_template_kwargs,
+        ):
+            mode = {key: source[key] for key in _DEEPSEEK_MODE_KWARG_ALIASES if key in source}
+            if mode:
+                break
+        kwargs = request_args["chat_template_kwargs"]
+        for alias in _DEEPSEEK_MODE_KWARG_ALIASES:
+            kwargs.pop(alias, None)
+        kwargs.update(mode)
+
+    def resolve_thinking(
+        self,
+        request_args: dict[str, Any],
+        *,
+        request_source: dict[str, Any],
+        turn_args: dict[str, Any] | None,
+    ) -> None:
+        kwargs = request_args["chat_template_kwargs"]
+        thinking = deepseek.V32.render_thinking_enabled(kwargs)
+        for alias in _DEEPSEEK_MODE_KWARG_ALIASES:
+            kwargs.pop(alias, None)
+        # SGLang's reasoning parser reads the canonical thinking flag.
+        kwargs["thinking"] = thinking
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek V4 implementation
+# ---------------------------------------------------------------------------
+
+
+class DeepSeekV4TITOTokenizer(TITOTokenizer):
+    """DeepSeek V4 — official encoder via sglang's ``encoding_dsv4``.
+
+    Like V3.2, V4 ships no jinja chat_template; miles' ``apply_chat_template``
+    routes any V4 tokenizer to the ``chat_template_utils.deepseek`` bridge, and
+    TITO incremental tokenization rides that same bridge to stay byte-aligned
+    with what the runtime serves.
+    """
+
+    reasoning_parser = "deepseek-v4"
+    tool_call_parser = "deepseekv4"
+
+    FIXED_TEMPLATE = FixedTemplate(
+        template=None,
+        extra_kwargs={"drop_thinking": False},
+        allowed_append_roles=frozenset({"tool", "user", "assistant"}),
+        consistant_kwargs=["add_default_bos_token", "context", "reasoning_effort"],
+    )
+
+    _DEFAULT_ASSISTANT_START = "<｜Assistant｜>"
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        assistant_start_str: str | None = None,
+    ):
+        super().__init__(
+            tokenizer,
+            chat_template_kwargs=chat_template_kwargs,
+            assistant_start_str=assistant_start_str or self._DEFAULT_ASSISTANT_START,
+            special_token_ids={
+                tokenizer.convert_tokens_to_ids("<｜User｜>"),
+                tokenizer.convert_tokens_to_ids("<｜Assistant｜>"),
+            },
+        )
+        self._assistant_id: int = tokenizer.convert_tokens_to_ids("<｜Assistant｜>")
+        self._think_bracket_ids: set[int] = {
+            tokenizer.convert_tokens_to_ids("<think>"),
+            tokenizer.convert_tokens_to_ids("</think>"),
+        }
+        self.trailing_token_ids = frozenset({self._assistant_id} | self._think_bracket_ids)
+
+    def request_arg_rules(self) -> list[Callable[..., None]]:
+        rules = super().request_arg_rules()
+        rules.append(self.resolve_thinking)
+        return rules
+
+    def resolve_template_kwargs(
+        self,
+        request_args: dict[str, Any],
+        *,
+        request_source: dict[str, Any],
+        turn_args: dict[str, Any] | None,
+    ) -> None:
+        super().resolve_template_kwargs(request_args, request_source=request_source, turn_args=turn_args)
+        # Thinking aliases are one setting: history overrides the request and launch defaults.
+        for source in (
+            (turn_args or {}).get("chat_template_kwargs") or {},
+            request_source.get("chat_template_kwargs") or {},
+            self.chat_template_kwargs,
+        ):
+            mode = {key: source[key] for key in _DEEPSEEK_MODE_KWARG_ALIASES if key in source}
+            if mode:
+                break
+        kwargs = request_args["chat_template_kwargs"]
+        for alias in _DEEPSEEK_MODE_KWARG_ALIASES:
+            kwargs.pop(alias, None)
+        kwargs.update(mode)
+
+    def resolve_thinking(
+        self,
+        request_args: dict[str, Any],
+        *,
+        request_source: dict[str, Any],
+        turn_args: dict[str, Any] | None,
+    ) -> None:
+        kwargs = request_args["chat_template_kwargs"]
+        thinking = deepseek.V4.render_thinking_enabled(kwargs)
+        for alias in _DEEPSEEK_MODE_KWARG_ALIASES:
+            kwargs.pop(alias, None)
+        # SGLang's reasoning parser reads the canonical thinking flag.
+        kwargs["thinking"] = thinking
+
+    def tokenize_additional_messages(
+        self,
+        old_messages: list[dict[str, Any]],
+        new_messages: list[dict[str, Any]],
+        *,
+        template_args: dict[str, Any] | None = None,
+    ) -> list[int]:
+        """Diff real-history renders because V4 folds adjacent ``tool``/``user`` turns."""
+        assert_messages_append_only_with_allowed_role(old_messages, new_messages, self.allowed_append_roles)
+        text_old = self.apply_chat_template(old_messages, add_generation_prompt=False, template_args=template_args)
+        text_new = self.apply_chat_template(new_messages, add_generation_prompt=True, template_args=template_args)
+        if not text_new.startswith(text_old):
+            raise ValueError(
+                "deepseek_v4 render is not append-only for the appended messages "
+                "(prefix render changed; check drop_thinking and tool-result ordering)"
+            )
+        return self._encode_text(text_new[len(text_old) :])
+
+
+class InklingTITOTokenizer(TITOTokenizer):
+    """Inkling family (Inkling / Inkling-Small).
+
+    The runtime serves Inkling through sglang's token-level renderer
+    (``chat_encoding_spec == "inkling"``).  The fixed template matches its
+    empty scalar-content behavior: no empty text block, and no bare assistant
+    terminator when the turn contains no rendered blocks.  All four message-role
+    sentinels remain comparator boundaries so non-assistant mismatches are hard
+    failures after an assistant turn.
+    """
+
+    FIXED_TEMPLATE = FixedTemplate(template="inkling_fixed.jinja", consistant_kwargs=["reasoning_effort"])
+
+    _DEFAULT_ASSISTANT_START = "<|message_model|>"
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        assistant_start_str: str | None = None,
+    ):
+        super().__init__(
+            tokenizer,
+            chat_template_kwargs=chat_template_kwargs,
+            assistant_start_str=assistant_start_str or self._DEFAULT_ASSISTANT_START,
+            special_token_ids={
+                tokenizer.convert_tokens_to_ids("<|message_user|>"),
+                tokenizer.convert_tokens_to_ids("<|message_model|>"),
+                tokenizer.convert_tokens_to_ids("<|message_system|>"),
+                tokenizer.convert_tokens_to_ids("<|message_tool|>"),
+            },
+        )
+        self._response_parser = None
+
+    def postprocess_completion(
+        self,
+        *,
+        choice: dict[str, Any],
+        assistant_message: dict[str, Any],
+        completion_token_ids: list[int],
+    ) -> dict[str, Any]:
+        if self._response_parser is None:
+            self._response_parser = InklingResponseParser(self.tokenizer)
+        parsed = self._response_parser.parse(
+            completion_token_ids,
+            finish_reason=choice.get("finish_reason"),
+        )
+        choice["message"] = parsed.client_message
+        meta_info = choice.setdefault("meta_info", {})
+        meta_info["miles_response_parser"] = parsed.parser_name
+        if parsed.parse_error is not None:
+            meta_info["miles_response_parse_error"] = parsed.parse_error
+        elif parsed.client_message.get("tool_calls") and choice.get("finish_reason") == "stop":
+            choice["finish_reason"] = "tool_calls"
+        return parsed.stored_message
+
+    def preserve_server_message_state(
+        self,
+        stored_messages: list[dict[str, Any]],
+        request_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        preserved = list(request_messages)
+        for index, request_message in enumerate(preserved):
+            if index >= len(stored_messages):
+                break
+            stored_message = stored_messages[index]
+            if stored_message.get("role") != "assistant" or not strict_message_matches(
+                stored_message, request_message
+            ):
+                continue
+            if "content_blocks" in stored_message:
+                preserved[index] = {**request_message, "content_blocks": stored_message["content_blocks"]}
+        return preserved
 
 
 # ---------------------------------------------------------------------------
@@ -718,13 +1053,20 @@ class TITOTokenizerType(StrEnum):
     DEFAULT = "default"
     QWEN3 = "qwen3"
     QWEN35 = "qwen35"
+    QWEN36 = "qwen36"
+    QWEN38_SMALL = "qwen38small"
+    QWEN4_EXP = "qwen4exp"
     QWENNEXT = "qwennext"
     GLM47 = "glm47"
+    GLM53 = "glm53"
     NEMOTRON3 = "nemotron3"
     KIMI25 = "kimi25"
     KIMI26 = "kimi26"
     MINIMAX_M25 = "minimax_m25"
     MINIMAX_M27 = "minimax_m27"
+    DEEPSEEKV32 = "deepseekv32"
+    DEEPSEEKV4 = "deepseekv4"
+    INKLING = "inkling"
 
     @classmethod
     def get_tokenizer_class(cls, t: TITOTokenizerType) -> type[TITOTokenizer]:
@@ -736,10 +1078,16 @@ class TITOTokenizerType(StrEnum):
                 return Qwen3TITOTokenizer
             case cls.QWEN35:
                 return Qwen35TITOTokenizer
+            case cls.QWEN36:
+                return Qwen36TITOTokenizer
+            case cls.QWEN38_SMALL | cls.QWEN4_EXP:
+                return Qwen38SmallTITOTokenizer
             case cls.QWENNEXT:
                 return QwenNextTITOTokenizer
             case cls.GLM47:
                 return GLM47TITOTokenizer
+            case cls.GLM53:
+                return GLM53TITOTokenizer
             case cls.NEMOTRON3:
                 return Nemotron3TITOTokenizer
             case cls.KIMI25:
@@ -750,6 +1098,12 @@ class TITOTokenizerType(StrEnum):
                 return MinimaxM25TITOTokenizer
             case cls.MINIMAX_M27:
                 return MinimaxM27TITOTokenizer
+            case cls.DEEPSEEKV32:
+                return DeepSeekV32TITOTokenizer
+            case cls.DEEPSEEKV4:
+                return DeepSeekV4TITOTokenizer
+            case cls.INKLING:
+                return InklingTITOTokenizer
             case _:
                 raise ValueError(f"Unknown TITOTokenizerType: {t!r}")
 
@@ -759,7 +1113,6 @@ def get_tito_tokenizer(
     tokenizer_type: TITOTokenizerType | str = TITOTokenizerType.DEFAULT,
     chat_template_kwargs: dict[str, Any] | None = None,
     assistant_start_str: str | None = None,
-    allowed_append_roles: list[str] | None = None,
 ) -> TITOTokenizer:
     """Create a ``TITOTokenizer`` instance.
 
@@ -767,13 +1120,10 @@ def get_tito_tokenizer(
         tokenizer: HuggingFace tokenizer object.
         tokenizer_type: Explicit type (string or enum).  Corresponds to the
             ``--tito-model`` CLI argument.
-        chat_template_kwargs: Extra kwargs forwarded to ``apply_chat_template``.
+        chat_template_kwargs: Extra kwargs forwarded to ``template.apply_chat_template``.
         assistant_start_str: Decoded text prefix identifying assistant content
             segments (e.g. ``"<|im_start|>assistant"``).  Auto-detected from
             the chat template by default; pass explicitly to override.
-        allowed_append_roles: Roles allowed in appended messages.  Defaults to
-            ``["tool"]``.  Passed to
-            ``assert_messages_append_only_with_allowed_role``.
     """
     if tokenizer is None:
         raise ValueError("tokenizer must not be None")
@@ -783,75 +1133,44 @@ def get_tito_tokenizer(
     kwargs: dict[str, Any] = {"chat_template_kwargs": chat_template_kwargs}
     if assistant_start_str is not None:
         kwargs["assistant_start_str"] = assistant_start_str
-    if allowed_append_roles is not None:
-        kwargs["allowed_append_roles"] = allowed_append_roles
     return cls(tokenizer, **kwargs)
 
 
 # ---------------------------------------------------------------------------
-# Fixed-template resolution (smallest-superset over SUPPORTED_TEMPLATES)
+# Fixed-template resolution (one template per family)
 # ---------------------------------------------------------------------------
 
 
 def resolve_fixed_chat_template(
     tito_model: TITOTokenizerType | str,
-    allowed_append_roles: Iterable[str],
 ) -> tuple[str | None, dict[str, Any]]:
-    """Smallest-superset lookup over the requested family's ``SUPPORTED_TEMPLATES``.
+    """The family's fixed chat template and required kwargs.
 
     Returns ``(template_path, extra_kwargs)``:
 
     - ``template_path``: absolute path to a bundled ``.jinja`` file, or ``None``
-      when the matched row registers HF-native (kwargs-only fix) or when no
-      row matches at all.
-    - ``extra_kwargs``: kwargs the caller should merge into
-      ``apply_chat_template`` (caller's explicit user kwargs win on conflict).
-      Empty when no row matches or the matched row needs none.
+      when the family registers HF-native (kwargs-only fix).
+    - ``extra_kwargs``: kwargs owned by the registration and merged into
+      ``template.apply_chat_template``.  Conflicting caller values are invalid.
 
-    Raises ``ValueError`` on equally-minimal supersets — register a stricter
-    row to disambiguate.
+    Template resolution depends only on ``tito_model``.  The DEFAULT family
+    resolves to its native template (``None``) with no fixed kwargs.
     """
     if isinstance(tito_model, str):
         tito_model = TITOTokenizerType(tito_model)
 
-    requested = frozenset(allowed_append_roles)
-    invalid = requested - _VALID_ROLES
-    if invalid:
-        raise ValueError(
-            f"Unknown roles in allowed_append_roles: {sorted(invalid)}. " f"Supported: {sorted(_VALID_ROLES)}."
-        )
-
     cls = TITOTokenizerType.get_tokenizer_class(tito_model)
-    candidates = [row for row in cls.SUPPORTED_TEMPLATES if requested.issubset(row.allowed_roles)]
-    if not candidates:
-        raise ValueError(
-            f"No SUPPORTED_TEMPLATES row registered for tito_model={tito_model.value} "
-            f"with allowed_append_roles={sorted(requested)}. Register a row in "
-            f"{cls.__name__}.SUPPORTED_TEMPLATES (template=None for HF-native models)."
-        )
+    fixed = cls.FIXED_TEMPLATE
 
-    # Pick the most specific superset. Ties surface registration mistakes
-    # immediately rather than depending on iteration order.
-    min_size = min(len(row.allowed_roles) for row in candidates)
-    minimal = [row for row in candidates if len(row.allowed_roles) == min_size]
-    if len(minimal) > 1:
-        raise ValueError(
-            f"Ambiguous fixed-template registration for tito_model={tito_model.value}, "
-            f"requested_roles={sorted(requested)}: multiple equally-minimal supersets "
-            f"{[sorted(row.allowed_roles) for row in minimal]}. Register a stricter row to disambiguate."
-        )
-    row = minimal[0]
-
-    path = str(TEMPLATE_DIR / row.template) if row.template else None
+    path = str(TEMPLATE_DIR / fixed.template) if fixed.template else None
     logger.info(
-        "tito_model=%s requested_roles=%s -> matched registered_roles=%s -> template=%s kwargs=%s",
+        "tito_model=%s -> template=%s kwargs=%s allowed_append_roles=%s",
         tito_model.value,
-        sorted(requested),
-        sorted(row.allowed_roles),
         path,
-        row.extra_kwargs,
+        fixed.extra_kwargs,
+        sorted(fixed.allowed_append_roles),
     )
-    return path, dict(row.extra_kwargs)
+    return path, dict(fixed.extra_kwargs)
 
 
 # ---------------------------------------------------------------------------

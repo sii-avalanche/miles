@@ -3,8 +3,9 @@ import os
 from copy import deepcopy
 
 import wandb
+from wandb.sdk.lib.runid import generate_id
 
-from miles.utils.env_report import decode_env_report
+from miles.utils.env_report.launcher_report import read_launcher_report
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def init_wandb_primary(args):
     # Prepare wandb init parameters
     # add random 6 length string with characters
     if args.wandb_random_suffix:
-        group = args.wandb_group + "_" + wandb.util.generate_id()
+        group = args.wandb_group + "_" + generate_id()
         run_name = f"{group}-RANK_{args.rank}"
     else:
         group = args.wandb_group
@@ -97,7 +98,7 @@ def _compute_config_for_logging(args):
     output["env_vars"] = {k: v for k, v in os.environ.items() if k in whitelist_env_vars}
 
     if env_report_raw := args.env_report:
-        if launcher_report := decode_env_report(env_report_raw):
+        if launcher_report := read_launcher_report(env_report_raw):
             output["launcher_env_report"] = launcher_report
 
     return output

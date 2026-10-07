@@ -1,92 +1,77 @@
+import asyncio
 import logging
-import multiprocessing
-import random
-import uuid
+from collections.abc import Sequence
 
-
-from miles.utils.http_utils import (
-    _wrap_ipv6,
-    find_available_port,
-    get_host_info,
-    is_port_available,
-    wait_for_server_ready,
+from miles.backends.sglang_utils.sglang_config import resolve_sglang_config
+from miles.ray.specs.inference import (
+    compute_router_worker_name,
+    compute_session_server_instance_id,
+    session_server_worker_name,
 )
-
+from miles.rollout.session.types import SessionServerInstance
+from miles.utils.http_utils import wait_tcp_ready_async
+from miles.utils.workers.worker_provider.base import BaseWorkerProvider
+from miles.utils.workers.worker_spec import HostAndPort
 
 logger = logging.getLogger(__name__)
 
+# Readiness budget for the spawned router/session-server children. The spawn
+# context re-imports the heavy transformers/megatron chain (~13s typical in
+# CI), and transient CI stalls have pushed startup past a 30s budget.
+_ROUTER_READY_TIMEOUT_SECONDS = 120.0
+_SESSION_SERVER_READY_TIMEOUT_SECONDS = 300.0
 
-def start_router(args, *, has_pd_disaggregation: bool = False, force_new: bool = False) -> tuple[str, int]:
-    """Start sgl router or miles router and return (router_ip, router_port).
 
-    If ``args.sglang_router_ip`` is already set and ``force_new`` is False,
-    skip launching and return the existing values.
+async def resolve_router_addrs(args, *, router_providers: Sequence[BaseWorkerProvider]) -> dict[str, HostAndPort]:
+    """Wait for every model's router and record its address on ``args``, keyed by model name.
+
+    A second call in the same process answers from the record, so the driver and an
+    in-process controller may both resolve the same ``args``.
     """
-    if not force_new and args.sglang_router_ip is not None:
-        return args.sglang_router_ip, args.sglang_router_port
-
-    router_ip = _wrap_ipv6(get_host_info()[1])
-    if force_new:
-        router_port = find_available_port(random.randint(3000, 4000))
-    else:
-        router_port = args.sglang_router_port
-        if router_port is None:
-            router_port = find_available_port(random.randint(3000, 4000))
-
-    if args.use_miles_router:
-        import copy
-
-        assert not has_pd_disaggregation, "miles router does not support PD disaggregation."
-        from miles.router.router import run_router
-
-        router_args = copy.copy(args)
-        router_args.sglang_router_ip = router_ip
-        router_args.sglang_router_port = router_port
-
-    else:
-        from sglang_router.launch_router import RouterArgs
-
-        from miles.utils.http_utils import run_router
-
-        router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
-        router_args.host = router_ip
-        router_args.port = router_port
-        router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
-        router_args.log_level = "warn"
-        router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
-
-        if args.sglang_router_policy:
-            router_args.policy = args.sglang_router_policy
-
-        if has_pd_disaggregation:
-            router_args.pd_disaggregation = True
-
-        logger.info(f"Launch router with args: {router_args}")
-
-    port = router_port
-    if not is_port_available(port):
-        raise RuntimeError(
-            f"Port {port} is already in use — a stale router process may still be running. "
-            f"Run 'pkill -9 python' to kill it, then retry."
+    if args.sglang_router_ip is not None:
+        assert args.sglang_model_routers is not None, (
+            "external router mode was removed: miles always resolves its own routers "
+            "(a pre-set router address without the per-model map means a misconfigured run)"
         )
+        return {name: HostAndPort(host=host, port=port) for name, (host, port) in args.sglang_model_routers.items()}
 
-    process = multiprocessing.Process(
-        target=run_router,
-        args=(router_args,),
+    config = resolve_sglang_config(args)  # TODO avoid resolve repeatedly
+    assert len(router_providers) == len(config.models), (
+        f"every model is served by its own router, so it needs its own provider "
+        f"(got {len(router_providers)} for {len(config.models)} models)"
     )
-    process.daemon = True
-    process.start()
-    wait_for_server_ready(router_ip, router_port, process, timeout=30)
-    logger.info(f"Router launched at {router_ip}:{router_port}")
-    return router_ip, router_port
+    ready = await asyncio.gather(
+        *[
+            wait_router_ready(model_idx=model_idx, provider=router_providers[model_idx])
+            for model_idx in range(len(config.models))
+        ]
+    )
+    router_addrs = {model_cfg.name: addr for model_cfg, addr in zip(config.models, ready, strict=True)}
+
+    primary = router_addrs[config.models[0].name]
+    args.sglang_router_ip = primary.host
+    args.sglang_router_port = primary.port
+    args.sglang_model_routers = {name: (addr.host, addr.port) for name, addr in router_addrs.items()}
+
+    return router_addrs
 
 
-def start_session_server(args):
-    """Start a standalone session server when ``--use-session-server`` is set.
+async def wait_router_ready(*, model_idx: int, provider: BaseWorkerProvider) -> HostAndPort:
+    """Wait until the model's router, launched by the platform, is reachable and return its address."""
+    worker_name = compute_router_worker_name(model_idx)
+    router_addr = (await provider.get_addrs(worker_name=worker_name))["primary"]
+    await wait_tcp_ready_async(router_addr.host, router_addr.port, timeout=_ROUTER_READY_TIMEOUT_SECONDS)
+    logger.info(f"Router ready at {router_addr}")
+    return router_addr
 
-    The session server runs as a separate process with its own port and proxies
-    inference requests directly to SGLang worker engines.  It is always started
-    as a standalone process regardless of whether ``--use-miles-router`` is active.
+
+async def wait_session_server_ready(args, *, provider: BaseWorkerProvider | None):
+    """Wait for the standalone session servers when ``--use-session-server`` is set.
+
+    One independent single-process server per resolved port; the rollout side
+    picks one per session and its URL carries the affinity from then on.
+    Always runs standalone regardless of whether ``--use-miles-router`` is
+    active.
     """
     if not getattr(args, "use_session_server", False):
         return
@@ -95,26 +80,57 @@ def start_session_server(args):
     if not hf_checkpoint:
         raise ValueError("--use-session-server requires --hf-checkpoint to be set.")
 
-    if getattr(args, "session_server_ip", None) is None:
-        args.session_server_ip = args.sglang_router_ip
-    if getattr(args, "session_server_port", None) is None:
-        args.session_server_port = find_available_port(random.randint(5000, 6000))
-    if getattr(args, "session_server_instance_id", None) is None:
-        args.session_server_instance_id = uuid.uuid4().hex
+    if args.session_server_workers < 1:
+        raise ValueError("--session-server-workers must be at least 1.")
 
-    ip, port = args.session_server_ip, args.session_server_port
-    if not is_port_available(port):
-        raise RuntimeError(
-            f"Port {port} is already in use — a stale session server may still be running. "
-            f"Run 'pkill -9 python' to kill it, then retry."
+    assert provider is not None
+    addrs = [
+        named["primary"]
+        for named in await asyncio.gather(
+            *[
+                provider.get_addrs(worker_name=session_server_worker_name(index))
+                for index in range(args.session_server_workers)
+            ]
         )
+    ]
+    # OpenAIEndpointTracer.create picks each session's instance from this list.
+    args.session_server_instances = [
+        SessionServerInstance(
+            addr=addr.netloc,
+            external_addr=_compute_external_addr(args, addr),
+            instance_id=compute_session_server_instance_id(args, instance_index),
+        )
+        for instance_index, addr in enumerate(addrs)
+    ]
+    _assert_hosts_keep_their_own_external_host(args.session_server_instances)
 
-    router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+    await asyncio.gather(
+        *[wait_tcp_ready_async(addr.host, addr.port, timeout=_SESSION_SERVER_READY_TIMEOUT_SECONDS) for addr in addrs]
+    )
+    logger.info(
+        f"Session servers ready at {[instance.addr for instance in args.session_server_instances]} "
+        f"({len(addrs)} instances), "
+        f"externally at {[instance.external_addr for instance in args.session_server_instances]}"
+    )
 
-    from miles.rollout.session.session_server import run_session_server
 
-    process = multiprocessing.Process(target=run_session_server, args=(args, router_url))
-    process.daemon = True
-    process.start()
-    wait_for_server_ready(ip, port, process, timeout=30)
-    logger.info(f"Session server launched at {ip}:{port}")
+def _compute_external_addr(args, addr: HostAndPort) -> str:
+    # spec_session_server keeps every instance on the head whenever this host is set
+    if args.session_server_external_host:
+        return f"{args.session_server_external_host}:{addr.port}"
+    return addr.external_netloc
+
+
+def _assert_hosts_keep_their_own_external_host(instances: list[SessionServerInstance]) -> None:
+    placed_hosts_by_external_host: dict[str, set[str]] = {}
+    for instance in instances:
+        external_host = instance.external_addr.rsplit(":", 1)[0]
+        placed_hosts_by_external_host.setdefault(external_host, set()).add(instance.addr.rsplit(":", 1)[0])
+    for external_host, placed_hosts in placed_hosts_by_external_host.items():
+        if len(placed_hosts) > 1:
+            raise ValueError(
+                f"Session servers on {sorted(placed_hosts)} are all published at the external host {external_host}, "
+                "so agents outside the cluster would reach only one of those hosts. Set MILES_NODE_EXTERNAL_IP on "
+                "each node to its own address, or pass --session-server-external-host, which keeps the session "
+                "servers on the head node."
+            )

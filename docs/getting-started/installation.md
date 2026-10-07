@@ -2,9 +2,6 @@
 title: Installation
 description: Install Miles on NVIDIA or AMD GPUs. Docker is the recommended path.
 ---
-
-# Installation
-
 There are three ways to install Miles. Docker is recommended because Miles pins patched
 versions of SGLang, Megatron-LM, and a few CUDA kernels.
 
@@ -25,18 +22,21 @@ versions of SGLang, Megatron-LM, and a few CUDA kernels.
     ```
 
   </Tab>
-  <Tab title="AMD MI300X / MI350X">
+  <Tab title="AMD">
 
     ```bash
-    docker pull rlsys/miles:MI350-355-latest    # or MI300-latest
+    docker pull rocm/sgl-dev:miles-rocm10-mi35x    # or miles-rocm724-mi35x; miles-rocm10-mi30x on MI300X / MI325X
 
     docker run --rm \
-      --device /dev/dri --device /dev/kfd \
-      --group-add video --ipc=host --shm-size=32g \
-      --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
-      --privileged \
-      -it rlsys/miles:MI350-355-latest /bin/bash
+      --device /dev/kfd --device /dev/dri --group-add video --group-add render \
+      --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged \
+      --shm-size 128G \
+      --ulimit memlock=-1 --ulimit stack=67108864 \
+      --network=host \
+      -it rocm/sgl-dev:miles-rocm10-mi35x /bin/bash
     ```
+
+    See [AMD ROCm](/hardware-platforms/amd-gpus) for more details.
 
   </Tab>
 
@@ -48,7 +48,7 @@ The image ships with:
 - Megatron-LM, SGLang, FlashAttention-3, DeepGEMM, Apex
 - Ray, uv, and Miles installed editable at `/root/miles`
 
-See [Platforms](../platforms/index.md) for platform-specific notes.
+See [Hardware requirements](#hardware-requirements) for per-GPU status.
 
 ## Method 2: From source
 
@@ -88,14 +88,14 @@ python -c "import miles; print('Miles import OK')"
 nvidia-smi
 ```
 
-If either command fails, see [Debugging](../developer/debug.md) or the [FAQ](../faq.md).
+If either command fails, see [Debugging](/developer/debug).
 
 ## Hardware requirements
 
 | Hardware | Status |
 |---|---|
-| NVIDIA H100 / H200 | Production (CI guarded) |
-| NVIDIA B100 / B200 | Production |
+| NVIDIA GB300 / GB200 / B300 / B200 | Production |
+| NVIDIA H200 / H100 | Production (CI guarded) |
 | NVIDIA A100 | Supported — FP8 features disabled |
 | AMD MI300X, MI325, MI350X, MI355X | Supported via ROCm |
 
@@ -104,6 +104,6 @@ or Slingshot — and 200+ GB/s per node. Single-node jobs run fine over NVLink o
 
 ## Next steps
 
-- [Quick Start](quick-start.md) — run your first training job.
-- [Core concepts](../user-guide/concepts.md) — the mental model behind Miles.
-- [Training backends](../user-guide/usage.md) — Megatron vs FSDP.
+- [Quick Start](/getting-started/quick-start) — run your first training job.
+- [Core concepts](/user-guide/concepts) — the mental model behind Miles.
+- [Training backends](/user-guide/training-backend) — Megatron vs FSDP.

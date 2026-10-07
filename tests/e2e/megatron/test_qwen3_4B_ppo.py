@@ -1,31 +1,33 @@
 import os
 
-from tests.ci.ci_register import register_cuda_ci
+from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
 # FIXME: fix this
 register_cuda_ci(
     est_time=1500,
     suite="stage-c-4-gpu-h200",
     labels=["megatron"],
-    disabled="PPO placement group has conflict on port, need fix later.",
+    hardware=["hopper", "blackwell"],
+)
+register_rocm_ci(
+    est_time=800,
+    suite="nightly-stage-c-4-gpu-mi350",
+    labels=["megatron"],
 )
 
 ENABLE_EVAL = bool(int(os.environ.get("MILES_TEST_ENABLE_EVAL", "0")))
 
 MODEL_NAME = "Qwen3-4B"
 MODEL_TYPE = "qwen3-4B"
-# PPO allocates critic on separate placement-group bundles from actor (even with
-# --colocate, which only shares rollout with actor), so total GPUs needed is
-# actor_world + critic_world. Keep actor_world = TP * CP = 2 (TP=1, CP=2) so
-# actor (2) + critic (2) fits the 4-GPU suite.
 NUM_GPUS = 4
 
 
 def prepare():
-    U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command("hf download Qwen/Qwen3-4B --local-dir /root/models/Qwen3-4B")
+    U = command_utils.default_config().create_backend()
+    U.exec_command_cpu("mkdir -p /root/models /root/datasets")
+    U.exec_command_cpu("hf download Qwen/Qwen3-4B --local-dir /root/models/Qwen3-4B")
     U.hf_download_dataset("zhuzilin/dapo-math-17k")
     U.hf_download_dataset("zhuzilin/aime-2024")
 
@@ -33,6 +35,7 @@ def prepare():
 
 
 def execute():
+    U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
 
     rollout_args = (
@@ -42,6 +45,8 @@ def execute():
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
+        # 3, not 2: rollout 0 trains only the critic (--num-critic-only-steps 1), so rollout 2 is
+        # the first one generated on trained actor weights.
         "--num-rollout 3 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
@@ -61,7 +66,7 @@ def execute():
 
     perf_args = (
         "--tensor-model-parallel-size 1 "
-        "--pipeline-model-parallel-size 1 "
+        "--pipeline-model-parallel-size 2 "
         "--context-parallel-size 2 "
         "--recompute-granularity full "
         "--recompute-method uniform "
@@ -111,7 +116,7 @@ def execute():
         # need to comment this when using model with MLA
         "--attention-backend flash "
         "--actor-num-nodes 1 "
-        f"--actor-num-gpus-per-node {NUM_GPUS // 2} "
+        f"--actor-num-gpus-per-node {NUM_GPUS} "
         "--colocate "
     )
 
@@ -120,7 +125,7 @@ def execute():
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{ppo_args} "
-        f"{U.get_default_wandb_args(__file__)} "
+        f"{command_utils.get_default_wandb_args(__file__)} "
         f"{perf_args} "
         f"{eval_args} "
         f"{sglang_args} "
@@ -132,7 +137,6 @@ def execute():
         train_args=train_args,
         num_gpus_per_node=NUM_GPUS,
         megatron_model_type=MODEL_TYPE,
-        extra_env_vars={"MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1"},
     )
 
 

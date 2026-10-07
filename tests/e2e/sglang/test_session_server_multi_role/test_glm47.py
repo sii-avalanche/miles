@@ -1,7 +1,11 @@
-from tests.ci.ci_register import register_cuda_ci
-from tests.e2e.sglang.test_session_server_multi_role._common import ModelConfig, run_one
+from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
+from tests.ci.metric_history import register_ci_gate
+from tests.e2e.sglang.test_session_server_multi_role._common import ModelConfig, run_both_versions
 
-register_cuda_ci(est_time=400, suite="stage-c-4-gpu-h200", labels=["sglang"])
+register_cuda_ci(est_time=900, suite="stage-c-2-gpu-h200", labels=["sglang"], hardware=["hopper", "blackwell"])
+register_rocm_ci(est_time=600, suite="nightly-stage-c-2-gpu-mi350", labels=["sglang"])
+register_ci_gate(metric_key="rollout/tito_session_mismatch_rate/v1/assistant_text")
+register_ci_gate(metric_key="rollout/tito_session_mismatch_rate/v2/assistant_text")
 
 
 CONFIG = ModelConfig(
@@ -9,17 +13,19 @@ CONFIG = ModelConfig(
     reasoning_parser="glm45",
     tool_call_parser="glm47",
     tito_model="glm47",
-    allowed_append_roles=("tool", "user", "system"),
-    tp_size=4,
+    num_gpus=2,
+    tp_size=1,
+    enable_spec=True,
     # Lenient template: tool message is rendered without validating that the
     # preceding assistant carries a matching tool_call.id, so the APPEND_TOOL
     # sentinel ("tool_call_id": "none") roundtrips cleanly.
     tool_call_failure_mode="append_tool",
+    anthropic_intermediate_system_expectation="required",
 )
 
 
 def test_glm47():
-    run_one(CONFIG)
+    run_both_versions(CONFIG)
 
 
 if __name__ == "__main__":

@@ -17,11 +17,12 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
 
-from miles.backends.training_utils.loss import compute_advantages_and_returns, loss_function
-from miles.backends.training_utils.loss_hub.corrections import icepop_function, vanilla_tis_function
-from miles.backends.training_utils.loss_hub.logit_processors import get_log_probs_and_entropy, get_values
-from miles.backends.training_utils.loss_hub.losses import policy_loss_function, sft_loss_function, value_loss_function
+from miles.backends.training_utils.loss.hub.corrections import icepop_function, vanilla_tis_function
+from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values
+from miles.backends.training_utils.loss.hub.losses import policy_loss_function, sft_loss_function, value_loss_function
+from miles.backends.training_utils.loss.objective import compute_advantages_and_returns, loss_function
 
 from .loss_test_utils import (
     args_from_dict,
@@ -62,7 +63,6 @@ CONFIGS = [
         [50, 80],
         [30, 60],
     ),
-    ("opd_b2", dict(advantage_estimator="on_policy_distillation", loss_type="policy_loss"), 2, [40, 60], [20, 40]),
     ("value_loss_b2", dict(advantage_estimator="grpo", loss_type="value_loss"), 2, [30, 50], [15, 35]),
     ("sft_loss_b2", dict(advantage_estimator="grpo", loss_type="sft_loss"), 2, [64, 128], [32, 64]),
     (
@@ -71,6 +71,27 @@ CONFIGS = [
         2,
         [40, 60],
         [20, 40],
+    ),
+    # chunked non-true-on-policy path (fused vocab-parallel CE)
+    (
+        "grpo_chunked_temp_b2",
+        dict(
+            advantage_estimator="grpo",
+            loss_type="policy_loss",
+            true_on_policy_mode=False,
+            log_probs_chunk_size=8,
+            rollout_temperature=0.7,
+        ),
+        2,
+        [40, 60],
+        [20, 40],
+    ),
+    (
+        "sft_chunked_b2",
+        dict(loss_type="sft_loss", true_on_policy_mode=False, log_probs_chunk_size=8),
+        2,
+        [64, 128],
+        [32, 64],
     ),
     # bshd format (padded sequences)
     (
@@ -95,6 +116,21 @@ CONFIGS = [
 # ---------------------------------------------------------------------------
 
 
+# The non-true-on-policy configs reach collectives (fused CE); give them a 1-rank group.
+@pytest.fixture(scope="module", autouse=True)
+def process_group(tmp_path_factory):
+    if dist.is_initialized():
+        yield
+        return
+
+    rendezvous = tmp_path_factory.mktemp("loss-snapshot") / "process-group"
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.fixture
 def mode(request):
     snapshot = request.config.getoption("--snapshot", default=False)
@@ -112,7 +148,7 @@ def mode(request):
 
 
 def _get_sum_of_sample_mean(batch, args, parallel_state):
-    from miles.backends.training_utils.cp_utils import get_sum_of_sample_mean
+    from miles.backends.training_utils.data.context_parallel import get_sum_of_sample_mean
 
     return get_sum_of_sample_mean(
         batch["total_lengths"],

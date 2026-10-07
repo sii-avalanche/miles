@@ -12,14 +12,14 @@ from transformers.activations import ACT2FN
 
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 except ImportError:
     pass
 
 from miles.backends.megatron_utils.fp32_param_utils import mark_param_dtype
-from miles.backends.training_utils.cp_utils import build_gdn_cp_context
+from miles_plugins.models.cp_utils import build_gdn_cp_context
 
 from .hf_attention import HuggingfaceAttention
+from .qwen_gdn_backend import get_chunk_gated_delta_rule
 
 
 def _get_text_config(hf_config):
@@ -37,8 +37,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     separate in_proj_qkv (for Q,K,V) and in_proj_z (for Z).
     """
 
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, args=None):
         super().__init__()
+        self.gdn_backend = getattr(args, "linear_attention_backend", "fla")
+        self.chunk_gated_delta_rule = get_chunk_gated_delta_rule(self.gdn_backend)
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
@@ -51,6 +53,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.layer_idx = layer_idx
         self.activation = config.hidden_act
         self.act = ACT2FN[config.hidden_act]
+        # Qwen3.8-Next gates the output norm with sigmoid while hidden_act stays silu
+        self.output_gate_activation = getattr(config, "output_gate_type", None) or config.hidden_act
         self.layer_norm_epsilon = config.rms_norm_eps
 
         # QKV
@@ -86,7 +90,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.norm = FusedRMSNormGated(
             self.head_v_dim,
             eps=self.layer_norm_epsilon,
-            activation=self.activation,
+            activation=self.output_gate_activation,
             device=torch.cuda.current_device(),
             dtype=config.dtype if config.dtype is not None else torch.get_current_dtype(),
         )
@@ -135,7 +139,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if cp_context is not None:
-            core_attn_out, _ = chunk_gated_delta_rule(
+            if self.gdn_backend != "fla":
+                raise NotImplementedError(
+                    f"GDN context parallelism requires the 'fla' backend, got {self.gdn_backend!r}."
+                )
+            core_attn_out, _ = self.chunk_gated_delta_rule(
                 query,
                 key,
                 value,
@@ -146,7 +154,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 cp_context=cp_context,
             )
         else:
-            core_attn_out, _ = chunk_gated_delta_rule(
+            if self.gdn_backend == "flashqla":
+                query = query.contiguous()
+                key = key.contiguous()
+                value = value.contiguous()
+                g = g.contiguous()
+                beta = beta.contiguous()
+            core_attn_out, _ = self.chunk_gated_delta_rule(
                 query,
                 key,
                 value,
@@ -178,6 +192,7 @@ class Attention(HuggingfaceAttention):
         layer_number: int,
         cp_comm_type: str = "p2p",
         pg_collection=None,
+        name: str | None = None,
     ):
         super().__init__(
             args,
@@ -185,12 +200,13 @@ class Attention(HuggingfaceAttention):
             layer_number,
             cp_comm_type,
             pg_collection,
+            name=name,
         )
         # Qwen3.5 is a VLM model with nested text_config
         self.hf_config = _get_text_config(self.hf_config)
         self.hf_config._attn_implementation = "flash_attention_2"
 
-        self.linear_attn = Qwen3_5GatedDeltaNet(self.hf_config, self.hf_layer_idx)
+        self.linear_attn = Qwen3_5GatedDeltaNet(self.hf_config, self.hf_layer_idx, args=args)
 
         # Use a simple RMSNorm
         try:

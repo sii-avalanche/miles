@@ -2,10 +2,16 @@ import os
 
 from tests.ci.ci_register import register_cuda_ci
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
 # FIXME: need to modify megatron, better fix later.
-register_cuda_ci(est_time=2400, suite="stage-c-8-gpu-h100", labels=["ckpt"], disabled="Disabled due to bugs.")
+register_cuda_ci(
+    est_time=2400,
+    suite="stage-c-8-gpu-h100",
+    labels=["ckpt"],
+    hardware=["hopper", "blackwell"],
+    disabled="Disabled due to bugs.",
+)
 
 ENABLE_EVAL = 0
 USE_DEEPEP = 0
@@ -27,9 +33,10 @@ def _get_latest_checkpointed_iteration() -> int:
 
 
 def prepare():
-    U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command(f"hf download zai-org/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
-    U.exec_command(f"rm -rf /root/models/{MODEL_NAME}_miles")
+    U = command_utils.default_config().create_backend()
+    U.exec_command_cpu("mkdir -p /root/models /root/datasets")
+    U.exec_command_cpu(f"hf download zai-org/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
+    U.exec_command_cpu(f"rm -rf /root/models/{MODEL_NAME}_miles")
     U.hf_download_dataset("zhuzilin/dapo-math-17k")
     U.hf_download_dataset("zhuzilin/aime-2024")
 
@@ -42,13 +49,14 @@ def prepare():
 
 
 def execute(mode: str = "", ckpt_step: int | None = None):
+    U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/models/{MODEL_NAME}_torch_dist "
     if mode == "save":
         ckpt_args += f"--save /root/models/{MODEL_NAME}_miles "
-        ckpt_args += "--save-interval 2 "
+        ckpt_args += "--save-interval 1 "
     elif mode == "async_save":
         ckpt_args += f"--save /root/models/{MODEL_NAME}_miles "
-        ckpt_args += "--save-interval 2 "
+        ckpt_args += "--save-interval 1 "
         ckpt_args += "--async-save "
         ckpt_args += "--use-persistent-ckpt-worker "
     elif mode == "load":
@@ -62,7 +70,7 @@ def execute(mode: str = "", ckpt_step: int | None = None):
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
-        "--num-rollout 3 "
+        "--num-rollout 2 "
         "--rollout-batch-size 4 "
         "--n-samples-per-prompt 2 "
         "--rollout-max-response-len 1024 "
@@ -163,7 +171,7 @@ def execute(mode: str = "", ckpt_step: int | None = None):
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
-        f"{U.get_default_wandb_args(__file__)} "
+        f"{command_utils.get_default_wandb_args(__file__)} "
         f"{perf_args} "
         f"{eval_args} "
         f"{sglang_args} "
@@ -177,7 +185,6 @@ def execute(mode: str = "", ckpt_step: int | None = None):
         num_gpus_per_node=NUM_GPUS,
         megatron_model_type=MODEL_TYPE,
         extra_env_vars={
-            "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
             "MILES_TEST_R3_THRESHOLD": "1.0",
         },
     )

@@ -8,13 +8,18 @@ sys.modules stubbing below cannot leak across files.
 
 from __future__ import annotations
 
-from tests.ci.ci_register import register_cuda_ci
+from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
 
 register_cuda_ci(
     est_time=30,
     suite="stage-b-2-gpu-h200",
-    labels=[],
-    disabled="FIXME: re-enable after worker/main.py stubbing is safe in script-mode CI.",
+    labels=["megatron"],
+    hardware=["hopper", "blackwell"],
+)
+register_rocm_ci(
+    est_time=20,
+    suite="nightly-stage-c-2-gpu-mi350",
+    labels=["megatron"],
 )
 
 import argparse
@@ -37,6 +42,16 @@ def _ensure_module(dotted: str) -> ModuleType:
             sys.modules[partial] = ModuleType(partial)
     return sys.modules[dotted]
 
+
+# Import the real `miles` package tree before any stubbing below. `_ensure_module`
+# walks dotted ancestors and stubs every missing segment, so stubbing a
+# `miles.backends.megatron_utils.*` leaf while `miles` is not yet imported would
+# replace the real `miles` package with an empty (non-package) stub -- and the
+# later `from miles.utils...main import` would then fail with "miles is not a
+# package". Importing the real parent package here registers the genuine
+# `miles`, `miles.backends`, and `miles.backends.megatron_utils` packages in
+# sys.modules so only the leaf modules get stubbed.
+import miles.backends.megatron_utils  # noqa: E402,F401
 
 # Stub modules whose top-level imports in main.py would fail.
 _STUBS: dict[str, dict[str, Any]] = {

@@ -5,6 +5,8 @@ import re
 import torch
 import torch.nn as nn
 
+from miles.utils.mxfp4 import quantize_mxfp4
+
 try:
     import fake_int4_quant_cuda
 except ImportError:
@@ -263,33 +265,39 @@ def pack_layer(weight, group_size, sym=True):
     return packed_weight, scale, packed_zp
 
 
-def quantize_params_compressed_tensors(converted_named_params, quantization_config):
+def quantize_params_compressed_tensors(converted_named_params, quantization_config, packed_weight_basenames):
+    quant_format = quantization_config["format"]
     w_cfg = quantization_config["config_groups"]["group_0"]["weights"]
     group_size = w_cfg["group_size"]
     is_symmetric = w_cfg["symmetric"]
-    ignore_rules = quantization_config.get("ignore", [])
-
+    is_mxfp4 = quant_format == "mxfp4-pack-quantized"
+    if is_mxfp4:
+        assert w_cfg["type"] == "float"
+        assert w_cfg["num_bits"] == 4
+        assert w_cfg["scale_dtype"] == "torch.uint8"
+        assert is_symmetric
     results = []
 
     for name, param in converted_named_params:
-        is_ignored = any(
-            (r.startswith("re:") and re.match(r[3:], name)) or r == name or name.startswith(r) for r in ignore_rules
-        )
-
-        if is_ignored or not name.endswith(".weight") or param.dim() < 2:
+        if not (name.endswith(".weight") and name.removesuffix(".weight") in packed_weight_basenames):
             results.append((name, param))
             continue
 
-        qw, s, zp = pack_layer(param, group_size, is_symmetric)
         qweight_name = name.replace(".weight", ".weight_packed")
         scale_name = name.replace(".weight", ".weight_scale")
-        weight_shape = torch.tensor(param.shape, dtype=torch.int32, device="cuda")
-        weight_shape_name = name.replace(".weight", ".weight_shape")
-        if zp is not None:
-            zp_name = name.replace(".weight", ".weight_zero_point")
-            results.append((zp_name, zp))
-        results.append((qweight_name, qw))
-        results.append((scale_name, s))
-        results.append((weight_shape_name, weight_shape))
+        if is_mxfp4:
+            qw, s = quantize_mxfp4(param, group_size)
+            results.append((qweight_name, qw))
+            results.append((scale_name, s))
+        else:
+            qw, s, zp = pack_layer(param, group_size, is_symmetric)
+            weight_shape = torch.tensor(param.shape, dtype=torch.int32, device="cuda")
+            weight_shape_name = name.replace(".weight", ".weight_shape")
+            if zp is not None:
+                zp_name = name.replace(".weight", ".weight_zero_point")
+                results.append((zp_name, zp))
+            results.append((qweight_name, qw))
+            results.append((scale_name, s))
+            results.append((weight_shape_name, weight_shape))
 
     return results

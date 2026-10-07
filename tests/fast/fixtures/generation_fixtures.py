@@ -2,23 +2,23 @@
 Fixtures to test custom-generate-function
 """
 
-import uuid
 from argparse import Namespace
 from contextlib import contextmanager
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+
 from miles.rollout.base_types import GenerateFnInput
 from miles.rollout.inference_rollout.compatibility import load_generate_function
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState
-from miles.rollout.session.session_server import SessionServer
+from miles.rollout.session.config import compute_session_server_config
+from miles.rollout.session.server import SessionServer
+from miles.rollout.session.types import SessionServerInstance
 from miles.utils.async_utils import run
 from miles.utils.http_utils import find_available_port, init_http_client
 from miles.utils.misc import SingletonMeta
-from miles.utils.test_utils import mock_tools
 from miles.utils.test_utils.mock_sglang_server import ProcessResult, ProcessResultMetaInfo, with_mock_server
 from miles.utils.test_utils.uvicorn_thread_server import UvicornThreadServer
 from miles.utils.types import Sample
@@ -32,10 +32,8 @@ DEFAULT_SAMPLING_PARAMS = {"max_new_tokens": 64, "temperature": 0.7}
 VARIANT_TO_GENERATE_FN_PATH = {
     "old_sglang_rollout": "miles.rollout.sglang_rollout.generate",
     "single_turn": "miles.rollout.generate_hub.single_turn.generate",
-    "multi_turn_single_sample": "miles.rollout.generate_hub.multi_turn.generate",
-    "multi_turn_multi_samples": "miles.rollout.generate_hub.multi_turn.generate",
-    "agentic_tool_call_single_sample": "miles.rollout.generate_hub.agentic_tool_call.generate",
-    "agentic_tool_call_multi_samples": "miles.rollout.generate_hub.agentic_tool_call.generate",
+    "multi_turn": "miles.rollout.generate_hub.multi_turn.generate",
+    "agentic_tool_call": "miles.rollout.generate_hub.agentic_tool_call.generate",
 }
 
 
@@ -54,7 +52,7 @@ def extra_argv_for_variant(
         custom_generate_function_path or VARIANT_TO_GENERATE_FN_PATH[variant],
     ]
 
-    if variant in ("multi_turn_single_sample", "multi_turn_multi_samples"):
+    if variant == "multi_turn":
         argv += [
             "--generate-max-turns",
             str(generate_max_turns),
@@ -64,13 +62,9 @@ def extra_argv_for_variant(
             generate_execute_tool_function_path,
         ]
         argv += ["--generate-tool-call-parser", generate_tool_call_parser]
-        if variant == "multi_turn_multi_samples":
-            argv.append("--generate-multi-samples")
-    elif variant in ("agentic_tool_call_single_sample", "agentic_tool_call_multi_samples"):
+    elif variant == "agentic_tool_call":
         argv += ["--custom-agent-function-path", custom_agent_function_path]
-        argv += ["--use-session-server", "--tito-model", "qwen3", "--tito-allowed-append-roles", "tool"]
-        if variant == "agentic_tool_call_multi_samples":
-            argv.append("--generate-multi-samples")
+        argv += ["--use-session-server", "v2", "--tito-model", "qwen3"]
 
     return argv
 
@@ -158,6 +152,8 @@ def make_args(
     generate_execute_tool_function_path: str = "miles.utils.test_utils.mock_tools.execute_tool_call",
     rollout_max_context_len: int | None = None,
     chat_template_path: str | None = None,
+    num_layers: int | None = None,
+    moe_router_topk: int | None = None,
 ) -> Namespace:
     argv = [
         "pytest",
@@ -213,6 +209,14 @@ def make_args(
     with patch("sys.argv", argv):
         args = parse_args()
 
+    # R3 decode shape overrides — not CLI flags (derived from the model config
+    # in production). Applied here, before with_session_server copies args into
+    # the worker namespace, because sample assembly runs inside the worker.
+    if num_layers is not None:
+        args.num_layers = num_layers
+    if moe_router_topk is not None:
+        args.moe_router_topk = moe_router_topk
+
     init_http_client(args)
     return args
 
@@ -230,16 +234,21 @@ def with_session_server(
     *,
     port: int,
 ):
-    args = SimpleNamespace(
-        miles_router_timeout=30,
-        hf_checkpoint=args.hf_checkpoint,
-        chat_template_path=args.chat_template_path,
-        tito_model=args.tito_model,
-        tito_allowed_append_roles=args.tito_allowed_append_roles,
-        use_rollout_routing_replay=args.use_rollout_routing_replay,
-        session_server_instance_id=uuid.uuid4().hex,
+    # Mirror wait_session_server_ready (router_manager.py): publish the instance record,
+    # id included, that OpenAIEndpointTracer.create picks from.
+    instance_id = f"{args.run_uuid}-0"
+    args.session_server_instances = [SessionServerInstance(addr=f"127.0.0.1:{port}", instance_id=instance_id)]
+    # Sample assembly runs inside the server, so the R3 decode shape args
+    # must reach the server config (set them via args_kwargs BEFORE the
+    # server starts; assigning to the driver args afterwards has no effect).
+    config = compute_session_server_config(
+        args,
+        host="127.0.0.1",
+        port=port,
+        instance_id=instance_id,
+        backend_url=backend_url,
     )
-    session_server = SessionServer(args, backend_url=backend_url)
+    session_server = SessionServer(config)
 
     server = UvicornThreadServer(session_server.app, host="127.0.0.1", port=port)
     server.start()
@@ -252,6 +261,9 @@ def with_session_server(
 
 @pytest.fixture
 def generation_env(request, variant):
+    # tests/conftest.py imports this fixture for every test; load the tokenizer-backed helper only when it is used.
+    from miles.utils.test_utils import mock_tools
+
     SingletonMeta.clear_all_instances()
     params = getattr(request, "param", {})
     args_kwargs = params.get("args_kwargs", {})
@@ -267,8 +279,8 @@ def generation_env(request, variant):
             meta_info=ProcessResultMetaInfo(
                 weight_version=x.get("weight_version"),
                 routed_experts=x.get("routed_experts"),
-                spec_accept_token_num=x.get("spec_accept_token_num"),
-                spec_draft_token_num=x.get("spec_draft_token_num"),
+                spec_num_correct_drafts=x.get("spec_num_correct_drafts"),
+                spec_num_proposed_drafts=x.get("spec_num_proposed_drafts"),
                 spec_verify_ct=x.get("spec_verify_ct"),
             ),
         )
@@ -293,9 +305,6 @@ def generation_env(request, variant):
 
         with cm:
             if is_agentic:
-                # Point session server address to the SessionServer we just started
-                args.session_server_ip = "127.0.0.1"
-                args.session_server_port = server_port
                 mock_tools.AGENTIC_MAX_TURNS = args_kwargs.get("generate_max_turns")
                 mock_tools.AGENTIC_RETURN_METADATA = args_kwargs.get("agentic_return_metadata")
             yield GenerateEnv(args=args, mock_server=mock_server)

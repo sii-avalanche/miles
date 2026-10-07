@@ -1,14 +1,7 @@
 from .math_utils import extract_answer, grade_answer_mathd, grade_answer_sympy
 
 
-def get_deepscaler_rule_based_reward(response, label):
-    if "</think>" in response:
-        model_solution = response.split("</think>")[-1]
-    elif "###Response" in response:
-        model_solution = response.split("###Response")[1]
-    else:
-        return 0
-
+def _grade_boxed_solution(model_solution, label):
     model_answer = extract_answer(model_solution)
     if model_answer is None:
         return 0
@@ -40,3 +33,18 @@ def get_deepscaler_rule_based_reward(response, label):
             return 1
 
     return 0
+
+
+def get_deepscaler_rule_based_reward(response, label):
+    # markers that end the reasoning segment; Kimi K-series uses the tagged <|open|>response<|sep|>
+    for closer in ("<|open|>response<|sep|>", "</think>", "###Response"):
+        if closer in response:
+            return _grade_boxed_solution(response.split(closer)[-1], label)
+    return 0
+
+
+def get_gemma_math_reward(response, label):
+    # Gemma-4 closes thinking with <channel|>; grade text after the last one.
+    if "<channel|>" in response:
+        response = response.split("<channel|>")[-1]
+    return _grade_boxed_solution(response, label)

@@ -2,29 +2,31 @@ import os
 
 from tests.ci.ci_register import register_cuda_ci
 
-import miles.utils.external_utils.command_utils as U
+from miles.utils.external_utils import command_utils
 
 register_cuda_ci(
-    est_time=600,
-    suite="stage-c-8-gpu-h100",
+    est_time=800,
+    suite="stage-c-2-gpu-h200",
     labels=["fsdp"],
-    disabled="FSDP backend has known issues, not actively maintained",
+    hardware=["hopper"],
 )
 
 ENABLE_EVAL = bool(int(os.environ.get("MILES_TEST_ENABLE_EVAL", "1")))
-NUM_GPUS = 8
+NUM_GPUS = 2
 
 MODEL_NAME = "Qwen3-4B"
 
 
 def prepare():
-    U.exec_command("mkdir -p /root/models /root/datasets")
-    U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
+    U = command_utils.default_config().create_backend()
+    U.exec_command_cpu("mkdir -p /root/models /root/datasets")
+    U.exec_command_cpu(f"hf download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
     U.hf_download_dataset("zhuzilin/dapo-math-17k")
     U.hf_download_dataset("zhuzilin/aime-2024")
 
 
 def execute():
+    U = command_utils.default_config().create_backend()
     ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
 
     rollout_args = (
@@ -34,7 +36,7 @@ def execute():
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type math "
-        "--num-rollout 3 "
+        "--num-rollout 2 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 4096 "
@@ -76,7 +78,7 @@ def execute():
         "--sglang-decode-log-interval 1000 "
         "--sglang-enable-metrics "
         "--sglang-enable-deterministic-inference "
-        "--sglang-rl-on-policy-target fsdp "
+        "--sglang-true-on-policy-contract qwen3_dense_true_on_policy_v1 "
         "--sglang-attention-backend fa3 "
         "--attn-implementation flash_attention_3 "
         "--deterministic-mode "
@@ -92,7 +94,7 @@ def execute():
         f"{rollout_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
-        f"{U.get_default_wandb_args(__file__)} "
+        f"{command_utils.get_default_wandb_args(__file__)} "
         f"{fsdp_args} "
         f"{eval_args} "
         f"{sglang_args} "
@@ -105,7 +107,6 @@ def execute():
         "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "MILES_EXPERIMENTAL_ROLLOUT_REFACTOR": "1",
     }
 
     U.execute_train(

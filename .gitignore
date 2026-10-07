@@ -188,9 +188,10 @@ local/
 .idea
 *.iml
 
-glm/
 _examples_synced/
 .env
 .DS_Store
 
 .humanize/
+
+charts/*/charts/

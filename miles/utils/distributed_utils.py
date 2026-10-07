@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import Any
 
@@ -14,6 +15,7 @@ from torch.distributed.distributed_c10d import (
     rendezvous,
 )
 
+from miles.utils.ft_utils.process_group_utils import GeneralPGUtil
 
 GLOO_GROUP = None
 
@@ -32,6 +34,14 @@ def get_gloo_group():
     if GLOO_GROUP is None:
         raise RuntimeError("Gloo group has not been initialized. Call _init_gloo_group() first.")
     return GLOO_GROUP
+
+
+@contextmanager
+def one_rank_at_a_time():
+    for rank in range(dist.get_world_size()):
+        if rank == dist.get_rank():
+            yield
+        dist.barrier(group=get_gloo_group())
 
 
 # Copy from pytorch to allow creating multiple main groups.
@@ -129,7 +139,7 @@ def distributed_masked_whiten(
     )
 
     # Aggregate via all_reduce within the DP group
-    dist.all_reduce(stats_tensor, group=process_group)
+    GeneralPGUtil.create(process_group).all_reduce(stats_tensor, process_group, op=dist.ReduceOp.SUM)
 
     # Calculate global stats from aggregated results
     global_sum, global_sum_sq, global_mask_sum = stats_tensor
