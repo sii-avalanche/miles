@@ -697,6 +697,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "returned-support limit because cutoff ties can retain more than top-k tokens."
                 ),
             )
+            parser.add_argument("--disable-sampling-support-replay", action="store_true", default=False)
             parser.add_argument(
                 "--rollout-top-logprobs-num",
                 type=int,
@@ -3399,7 +3400,9 @@ def miles_validate_args(args):
         raise ValueError(f"--rollout-top-p must be in (0, 1], got {args.rollout_top_p}")
     if args.rollout_top_k != -1 and args.rollout_top_k < 1:
         raise ValueError(f"--rollout-top-k must be -1 or at least 1, got {args.rollout_top_k}")
-    args.use_sampling_support_replay = args.rollout_top_p < 1.0 or args.rollout_top_k > 0
+    args.use_sampling_support_replay = (
+        args.rollout_top_p < 1.0 or args.rollout_top_k > 0
+    ) and not args.disable_sampling_support_replay
     args.rollout_sampling_logprobs_mode = "support" if args.use_sampling_support_replay else "selected"
     if args.use_sampling_support_replay:
         if args.rollout_top_k == -1:
