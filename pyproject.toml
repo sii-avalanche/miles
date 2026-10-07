@@ -14,7 +14,7 @@ dependencies = [
     "fake-int4-quant-cuda",
     "flash-attn==2.7.4.post1",
     "flash-attn-3",
-    "flash-linear-attention==0.4.2",
+    "flash-linear-attention==0.5.2",
     "httpx[http2]>=0.28.1",
     "mamba-ssm==2.3.1",
     "math-verify",
@@ -35,20 +35,20 @@ dependencies = [
     "pytest-asyncio>=1.4.0",
     "pyyaml",
     "qwen-vl-utils>=0.0.14",
-    "ray[default]>=2.55.1",
+    "ray[default]>=2.56.0",
     "ring-flash-attn>=0.1.8 ; sys_platform == 'linux'",
     "sglang[all]",
     "sglang-router>=0.2.3",
     "tensorboard>=2.20.0",
     "tilelang>=0.1.8",
-    "torch==2.11.0",
+    "torch==2.13.0",
     "torch-memory-saver",
     "torchft-nightly==2026.4.3 ; sys_platform == 'linux'",
-    "torchvision==0.26.0",
-    "transformer-engine==2.12.0",
-    "transformer-engine-cu13==2.12.0",
-    "transformer-engine-torch==2.12.0",
-    "transformers>=5.9.0",
+    "torchvision==0.28.0",
+    "transformer-engine==2.17.0",
+    "transformer-engine-cu13==2.17.0",
+    "transformer-engine-torch==2.17.0",
+    "transformers==5.12.1",
     "wandb>=0.27.0",
 ]
 [tool.uv]
@@ -65,14 +65,14 @@ no-build-isolation-package = [
     "transformer-engine-torch",
 ]
 override-dependencies = [
-    "transformers>=5.9.0",
+    "transformers==5.12.1",
     "blobfile>=3.2.0",
-    "torch==2.11.0",
+    "torch==2.13.0",
     "torch-memory-saver",
 ]
 dependency-metadata = [
-    { name = "megatron-bridge", version = "0.5.0+6fde1c85", requires-dist = [] },
-    { name = "transformer-engine-torch", version = "2.12.0", requires-dist = [
+    { name = "megatron-bridge", version = "0.5.0+8cd3466d", requires-dist = [] },
+    { name = "transformer-engine-torch", version = "2.17.0", requires-dist = [
         "einops",
         "nvdlfw-inspect",
         "onnx",
@@ -85,16 +85,16 @@ dependency-metadata = [
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
-apex = { url = "https://github.com/fnlp-agentRL/AvaWheels/releases/download/apex-cu130-x86_64/apex-0.1-cp312-cp312-linux_x86_64.whl" }
-fake-int4-quant-cuda = { url = "https://github.com/yueming-yuan/miles-wheels/releases/download/cu130-x86_64/fake_int4_quant_cuda-0.0.0-cp312-cp312-linux_x86_64.whl" }
-# flash-attn = { url = "https://github.com/yueming-yuan/miles-wheels/releases/download/cu130-x86_64/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" }
-flash-attn-3 = { url = "https://github.com/fnlp-agentRL/AvaWheels/releases/download/fa3-cu130-x86_64/flash_attn_3-3.0.0b1-1-cp39-abi3-linux_x86_64.whl" }
+apex = { url = "https://github.com/yueming-yuan/miles-wheels/releases/download/cu130-torch213-x86_64/apex-0.1-cp312-cp312-linux_x86_64.whl" }
+fake-int4-quant-cuda = { url = "https://github.com/yueming-yuan/miles-wheels/releases/download/cu130-torch213-x86_64/fake_int4_quant_cuda-0.0.0-cp312-cp312-linux_x86_64.whl" }
+# flash-attn = { url = "https://github.com/yueming-yuan/miles-wheels/releases/download/cu130-torch213-x86_64/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl" }
+flash-attn-3 = { url = "https://github.com/yueming-yuan/miles-wheels/releases/download/cu130-torch213-x86_64/flash_attn_3-3.0.0-cp310-abi3-linux_x86_64.whl" }
 mbridge = { git = "https://github.com/ISEEKYAN/mbridge.git", rev = "89eb10887887bc74853f89a4de258c0702932a1c" }
-torch-memory-saver = { git = "https://github.com/fzyzcjy/torch_memory_saver.git", rev = "d64a639" }
-megatron-bridge = { git = "https://github.com/radixark/Megatron-Bridge.git", rev = "6fde1c8538ea4ad966c7fba5f759be54f943b598" }
+torch-memory-saver = { git = "https://github.com/fzyzcjy/torch_memory_saver.git", rev = "b5588e83de86412a48689a6583a4b567e75f7acc" }
+megatron-bridge = { git = "https://github.com/radixark/Megatron-Bridge.git", rev = "8cd3466d14d2337c8492827b3712482c2b3e4866" }
 megatron-core = { workspace = true }
 sglang = { workspace = true }
-sglang-router = { url = "https://github.com/yueming-yuan/miles-wheels/releases/download/cu130-x86_64/sglang_router-0.3.2-cp38-abi3-manylinux_2_39_x86_64.whl" }
+sglang-router = { url = "https://github.com/yueming-yuan/miles-wheels/releases/download/cu130-torch213-x86_64/sglang_router-0.3.2-cp38-abi3-manylinux_2_39_x86_64.whl" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
