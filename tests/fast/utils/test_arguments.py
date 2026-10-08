@@ -88,6 +88,12 @@ def _clear_mooncake_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+def test_help_is_renderable():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+    assert "Specify the key in the reward dict" in " ".join(parser.format_help().split())
+
+
 @pytest.mark.parametrize("extra,expected", [([], 0), (["--rollout-sample-max-retries", "2"], 2)])
 def test_rollout_sample_retry_budget(extra, expected):
     with patch.object(sys, "argv", ["test"] + REQUIRED_ARGS + extra):
