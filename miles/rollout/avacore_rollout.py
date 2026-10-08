@@ -33,11 +33,11 @@ class AvaCoreRollout:
         os.environ["SGLANG_ROUTER_URL"] = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
         os.environ["HF_CHECKPOINT"] = args.hf_checkpoint
         self.args = args
-        self.document = config
+        self.config = config
         conv = launch_converter()
-        self.generate_fn = conv.structure(interpolated(self.document["generate"]), GenerateFunction)
-        self.reward_fn = conv.structure(interpolated(self.document["reward"]), RewardFunction)
-        self.postgres = interpolated(self.document["record"])["postgres"] if "record" in self.document else None
+        self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
+        self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
+        self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
         self.writes: set[asyncio.Task[None]] = set()
@@ -63,7 +63,7 @@ class AvaCoreRollout:
             return sample
 
         assert isinstance(trace, TokenTrace), "AvaCore rollouts must drive the policy through a token-level client"
-        if self.postgres is not None:
+        if self.recording is not None:
             write = asyncio.create_task(self.record(row, sample, trace, reward, sampling_params))
             self.writes.add(write)
             write.add_done_callback(self.writes.discard)
@@ -75,16 +75,19 @@ class AvaCoreRollout:
         return samples[0] if len(samples) == 1 else samples
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
-        store = await self.stack.enter_async_context(PostgresBackend(self.postgres, min_size=1, max_size=4))
-        run_dir = Path(os.environ["RUN_DIR"])
+        assert self.recording is not None
+        store = await self.stack.enter_async_context(
+            PostgresBackend(self.recording["postgres"], min_size=1, max_size=4)
+        )
         run = await self.stack.enter_async_context(
             store.rl_run(
-                model=run_dir.parent.name,
-                run=run_dir.name,
+                model=self.recording["model"],
+                run=self.recording["run"],
                 collection=Path(self.args.prompt_data).stem,
                 sampling_params=sampling_params,
-                config=self.document,
+                config=self.config,
                 schema=Schema(),
+                resume=True,
             )
         )
         await run.update(status="running")
