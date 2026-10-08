@@ -1160,9 +1160,10 @@ class TestLogStepEndEvent:
             [NORMAL],
         ]
 
-        with patch("miles.ray.train.group.is_event_logger_initialized", return_value=True), patch(
-            "miles.ray.train.group.get_event_logger"
-        ) as mock_get_logger:
+        with (
+            patch("miles.ray.train.group.is_event_logger_initialized", return_value=True),
+            patch("miles.ray.train.group.get_event_logger") as mock_get_logger,
+        ):
             mock_logger = MagicMock()
             mock_get_logger.return_value = mock_logger
 

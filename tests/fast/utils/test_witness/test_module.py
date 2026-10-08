@@ -374,9 +374,10 @@ class TestWitnessDumpAndClearStale:
         optimizer = _make_chained_optimizer_for_witnesses(model)
         witness_info = WitnessInfo(witness_ids=[1, 2, 3, 4], stale_ids=[5, 6])
 
-        with patch("miles.utils.audit_utils.witness.module.get_event_logger") as mock_get_logger, patch(
-            "miles.utils.audit_utils.witness.module.get_parallel_state"
-        ) as mock_get_parallel_state:
+        with (
+            patch("miles.utils.audit_utils.witness.module.get_event_logger") as mock_get_logger,
+            patch("miles.utils.audit_utils.witness.module.get_parallel_state") as mock_get_parallel_state,
+        ):
             mock_get_parallel_state.return_value.pp.rank = 0
             mock_logger = MagicMock()
             mock_get_logger.return_value = mock_logger
@@ -406,9 +407,10 @@ class TestWitnessDumpAndClearStale:
         optimizer = _make_chained_optimizer_for_witnesses(model)
         witness_info = WitnessInfo(witness_ids=[0], stale_ids=[3, 7])
 
-        with patch("miles.utils.audit_utils.witness.module.get_event_logger") as mock_get_logger, patch(
-            "miles.utils.audit_utils.witness.module.get_parallel_state"
-        ) as mock_get_parallel_state:
+        with (
+            patch("miles.utils.audit_utils.witness.module.get_event_logger") as mock_get_logger,
+            patch("miles.utils.audit_utils.witness.module.get_parallel_state") as mock_get_parallel_state,
+        ):
             mock_get_parallel_state.return_value.pp.rank = 0
             mock_get_logger.return_value = MagicMock()
             witness_dump_and_clear_stale(model=model, witness_info=witness_info, optimizer=optimizer)
@@ -429,9 +431,10 @@ class TestWitnessDumpAndClearStale:
         optimizer = _make_chained_optimizer_for_witnesses(model)
         witness_info = WitnessInfo(witness_ids=[0], stale_ids=[])
 
-        with patch("miles.utils.audit_utils.witness.module.get_event_logger") as mock_get_logger, patch(
-            "miles.utils.audit_utils.witness.module.get_parallel_state"
-        ) as mock_get_parallel_state:
+        with (
+            patch("miles.utils.audit_utils.witness.module.get_event_logger") as mock_get_logger,
+            patch("miles.utils.audit_utils.witness.module.get_parallel_state") as mock_get_parallel_state,
+        ):
             mock_get_parallel_state.return_value.pp.rank = 0
             mock_get_logger.return_value = MagicMock()
             witness_dump_and_clear_stale(model=model, witness_info=witness_info, optimizer=optimizer)

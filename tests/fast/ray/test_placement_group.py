@@ -79,14 +79,12 @@ def fake_components():
 
     capability = FakeBackendCapability(static_provider=object())
 
-    with patch(
-        "miles.ray.placement_group.create_inference_controller_handle", lambda *, capability: controller_handle
-    ), patch("miles.ray.placement_group.resolve_router_addrs", resolve_router_addrs), patch(
-        "miles.ray.placement_group.wait_session_server_ready", fake_wait_session_server_ready
-    ), patch(
-        "miles.ray.placement_group.create_rollout_executor_handle", lambda *, capability: executor_handle
-    ), patch(
-        "miles.ray.placement_group.get_backend_capability", lambda args: capability
+    with (
+        patch("miles.ray.placement_group.create_inference_controller_handle", lambda *, capability: controller_handle),
+        patch("miles.ray.placement_group.resolve_router_addrs", resolve_router_addrs),
+        patch("miles.ray.placement_group.wait_session_server_ready", fake_wait_session_server_ready),
+        patch("miles.ray.placement_group.create_rollout_executor_handle", lambda *, capability: executor_handle),
+        patch("miles.ray.placement_group.get_backend_capability", lambda args: capability),
     ):
         yield Namespace(
             controller_handle=controller_handle,

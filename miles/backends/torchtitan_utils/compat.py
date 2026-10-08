@@ -40,7 +40,7 @@ def _patch_pipeline_schedule_microbatch_api() -> None:
             losses=None,
             return_outputs=True,
             loss_kwargs=None,
-            **kwargs
+            **kwargs,
         ):
             if arg_mbs is None and kwarg_mbs is None and target_mbs is None:
                 return original_step(

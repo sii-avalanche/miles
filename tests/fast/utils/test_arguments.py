@@ -118,8 +118,9 @@ class TestAddArgumentsSupport:
     @pytest.mark.parametrize("fn_factory", [make_class_with_add_arguments, make_function_with_add_arguments])
     def test_add_arguments_is_called_and_arg_is_parsed(self, path_arg, fn_factory):
         fn = fn_factory()
-        with function_registry.temporary("test:fn", fn), patch.object(
-            sys, "argv", ["test", path_arg, "test:fn", "--my-custom-arg", "100"] + REQUIRED_ARGS
+        with (
+            function_registry.temporary("test:fn", fn),
+            patch.object(sys, "argv", ["test", path_arg, "test:fn", "--my-custom-arg", "100"] + REQUIRED_ARGS),
         ):
             parser = argparse.ArgumentParser()
             get_miles_extra_args_provider()(parser)
@@ -128,8 +129,9 @@ class TestAddArgumentsSupport:
 
     def test_skips_function_without_add_arguments(self, path_arg):
         fn = make_function_without_add_arguments()
-        with function_registry.temporary("test:fn", fn), patch.object(
-            sys, "argv", ["test", path_arg, "test:fn"] + REQUIRED_ARGS
+        with (
+            function_registry.temporary("test:fn", fn),
+            patch.object(sys, "argv", ["test", path_arg, "test:fn"] + REQUIRED_ARGS),
         ):
             parser = argparse.ArgumentParser()
             get_miles_extra_args_provider()(parser)

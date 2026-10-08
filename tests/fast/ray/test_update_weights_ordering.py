@@ -176,9 +176,11 @@ async def test_the_window_is_scoped_to_the_policy_the_script_is_publishing():
     order: list[str] = []
     inference_controller = _OrderRecordingInferenceController(order)
 
-    with patch("miles.ray.placement_group.is_event_logger_initialized", return_value=True), patch(
-        "miles.ray.placement_group.get_event_logger"
-    ), patch("miles.ray.placement_group.flatten_inference_engine_checksums", return_value=[]):
+    with (
+        patch("miles.ray.placement_group.is_event_logger_initialized", return_value=True),
+        patch("miles.ray.placement_group.get_event_logger"),
+        patch("miles.ray.placement_group.flatten_inference_engine_checksums", return_value=[]),
+    ):
         await update_weights(
             _orchestration_args(),
             _actor_model(order),
@@ -215,8 +217,9 @@ class TestTheScriptLogsTheChecksumsTheEnginesNowServe:
         inference_controller = MagicMock()
         inference_controller.check_weights = AsyncMock(return_value=response) if response is not None else MagicMock()
         event_logger = MagicMock()
-        with patch("miles.ray.placement_group.is_event_logger_initialized", return_value=initialized), patch(
-            "miles.ray.placement_group.get_event_logger", return_value=event_logger
+        with (
+            patch("miles.ray.placement_group.is_event_logger_initialized", return_value=initialized),
+            patch("miles.ray.placement_group.get_event_logger", return_value=event_logger),
         ):
             await _maybe_log_inference_engine_weight_checksums(
                 args, inference_controller=inference_controller, rollout_id=0, trainer_model_id=trainer_model_id

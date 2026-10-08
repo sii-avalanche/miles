@@ -3,6 +3,7 @@ name = "miles"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "accelerate>=1.13.0",
     "apex",
@@ -140,6 +141,7 @@ line_length = 119
 
 [tool.ruff]
 line-length = 119  # TODO
+target-version = "py310"
 select = [
     "E",      # Pycodestyle Errors (Structural/Fundamental Errors like bad indentation)
     "F",      # Pyflakes (Core Errors: Unused imports, undefined names)
