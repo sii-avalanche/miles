@@ -98,9 +98,9 @@ def convert_samples_to_train_data(
         if sample.loss_mask is None:
             sample.loss_mask = [1] * sample.response_length
 
-        assert len(sample.loss_mask) == sample.response_length, (
-            f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
-        )
+        assert (
+            len(sample.loss_mask) == sample.response_length
+        ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
         if sample.remove_sample:
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)

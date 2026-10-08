@@ -29,5 +29,7 @@ def check_passrate(args, samples: list[Sample], **kwargs):
     threshold_low = args.passrate_threshold_low
     threshold_high = args.passrate_threshold_high + 1e-5
     keep = threshold_low < passrate < threshold_high
-    print("[dynamic filter] passrate: %.3f, threshold_low: %.3f, threshold_high: %.3f, keep: %s" % (passrate, threshold_low, threshold_high, keep))
+    print(
+        f"[dynamic filter] passrate: {passrate:.3f}, threshold_low: {threshold_low:.3f}, threshold_high: {threshold_high:.3f}, keep: {keep}"
+    )
     return DynamicFilterOutput(keep=keep, reason=None if keep else f"passrate_{passrate:.3f}")

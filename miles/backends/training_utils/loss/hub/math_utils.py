@@ -265,9 +265,9 @@ def compute_policy_loss(
     clipfrac = torch.gt(pg_losses2, pg_losses1).float()
 
     if eps_clip_c is not None:
-        assert eps_clip_c > 1.0, (
-            f"The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0, but get the value: {eps_clip_c}."
-        )
+        assert (
+            eps_clip_c > 1.0
+        ), f"The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0, but get the value: {eps_clip_c}."
         pg_losses3 = -eps_clip_c * advantages
         clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
         clipfrac_lower = (torch.lt(clip_pg_losses2, clip_pg_losses1) & (advantages < 0)).float()
@@ -317,9 +317,9 @@ def compute_dppo_loss(
     blocked = (div > delta) & moved_away
     pg_losses = -(~blocked).to(ratio.dtype) * ratio * advantages
     if eps_clip_c is not None:
-        assert eps_clip_c > 1.0, (
-            f"The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0, but get the value: {eps_clip_c}."
-        )
+        assert (
+            eps_clip_c > 1.0
+        ), f"The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0, but get the value: {eps_clip_c}."
         pg_losses3 = -eps_clip_c * advantages
         clipfrac_lower = (torch.lt(pg_losses3, pg_losses) & (advantages < 0)).float()
         pg_losses = torch.where(advantages < 0, torch.min(pg_losses3, pg_losses), pg_losses)

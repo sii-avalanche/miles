@@ -6,7 +6,6 @@ These examples are runnable starting points for your own RL workflow. A few are 
 
 End-to-end training workflows — the place to start.
 
-- **[agentic_swe](./agentic_swe)**: RL on an unmodified coding CLI (qwen-code) over SWE tasks: a local OpenAI proxy keeps a token-exact ledger per conversation, sandboxes run the agent, a fresh sandbox grades the diff.
 - **[geo3k_vlm](./geo3k_vlm)**: Training VLMs with FSDP using GRPO on the GEO3K dataset.
   - **[multi_turn](./geo3k_vlm/multi_turn)**: The same dataset over multiple turns, with the model cropping images through an interactive environment.
 - **[lora](./lora)**: LoRA fine-tuning with the Megatron backend.

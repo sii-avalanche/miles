@@ -3584,9 +3584,9 @@ def miles_validate_args(args):
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
 
     if args.get_mismatch_metrics:
-        assert args.custom_tis_function_path is not None, (
-            "custom_tis_function_path must be set when get_mismatch_metrics is set"
-        )
+        assert (
+            args.custom_tis_function_path is not None
+        ), "custom_tis_function_path must be set when get_mismatch_metrics is set"
 
         if args.use_rollout_logprobs and not args.skip_actor_forward_only:
             logger.info(
@@ -3687,9 +3687,9 @@ def miles_validate_args(args):
             logger.warning("Force train_memory_margin_bytes=0 since debug_rollout_only does not support it")
             args.train_memory_margin_bytes = 0
 
-    assert not (args.debug_rollout_only and args.debug_train_only), (
-        "debug_rollout_only and debug_train_only cannot be set at the same time, please set only one of them."
-    )
+    assert not (
+        args.debug_rollout_only and args.debug_train_only
+    ), "debug_rollout_only and debug_train_only cannot be set at the same time, please set only one of them."
 
     if (
         args.ci_test
@@ -3955,9 +3955,9 @@ def miles_validate_args(args):
             )
 
     if args.snr_filter_keep_ratio is not None:
-        assert 0.0 < args.snr_filter_keep_ratio <= 1.0, (
-            f"snr_filter_keep_ratio must be in (0, 1], got {args.snr_filter_keep_ratio}"
-        )
+        assert (
+            0.0 < args.snr_filter_keep_ratio <= 1.0
+        ), f"snr_filter_keep_ratio must be in (0, 1], got {args.snr_filter_keep_ratio}"
         assert args.use_dynamic_global_batch_size, (
             "snr_filter_keep_ratio requires --use-dynamic-global-batch-size so the kept groups are "
             "split across num_steps_per_rollout with the per-step loss renormalized to them."
@@ -3965,13 +3965,14 @@ def miles_validate_args(args):
 
     if args.dppo_delta is not None:
         assert args.dppo_delta > 0, f"dppo_delta must be > 0, got {args.dppo_delta}"
-        assert args.use_rollout_logprobs, (
-            "dppo_delta requires --use-rollout-logprobs so the divergence anchors to the behavior policy."
-        )
+        assert (
+            args.use_rollout_logprobs
+        ), "dppo_delta requires --use-rollout-logprobs so the divergence anchors to the behavior policy."
         assert not args.use_tis, "DPPO replaces PPO clipping and is incompatible with --use-tis."
-        assert args.advantage_estimator not in ("gspo", "cispo"), (
-            "DPPO is a per-token policy loss; it cannot combine with the gspo/cispo losses."
-        )
+        assert args.advantage_estimator not in (
+            "gspo",
+            "cispo",
+        ), "DPPO is a per-token policy loss; it cannot combine with the gspo/cispo losses."
 
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
@@ -4028,9 +4029,9 @@ def miles_validate_args(args):
             logger.info(
                 f"args.rollout_max_prompt_len is not set. Use args.rollout_max_context_len - 1 ({args.rollout_max_context_len} - 1) as default value so that there is at least one generated token to compute loss."
             )
-        assert args.rollout_max_prompt_len <= args.rollout_max_context_len - 1, (
-            f"args.rollout_max_prompt_len ({args.rollout_max_prompt_len}) must be smaller than args.rollout_max_context_len ({args.rollout_max_context_len}) so that there is at least one generated token to compute loss."
-        )
+        assert (
+            args.rollout_max_prompt_len <= args.rollout_max_context_len - 1
+        ), f"args.rollout_max_prompt_len ({args.rollout_max_prompt_len}) must be smaller than args.rollout_max_context_len ({args.rollout_max_context_len}) so that there is at least one generated token to compute loss."
 
     assert not (
         args.prefill_num_servers is not None and args.rollout_external
@@ -4050,9 +4051,9 @@ def miles_validate_args(args):
 
     if args.qkv_format == "bshd":
         assert args.train_backend == "megatron", "bshd format is only supported for megatron backend."
-        assert args.use_dynamic_batch_size is False, (
-            "Dynamic batch size is not supported for bshd format. Please specify --micro-batch-size instead."
-        )
+        assert (
+            args.use_dynamic_batch_size is False
+        ), "Dynamic batch size is not supported for bshd format. Please specify --micro-batch-size instead."
 
     if args.skip_actor_forward_only:
         validate_skip_actor_forward_only(args)

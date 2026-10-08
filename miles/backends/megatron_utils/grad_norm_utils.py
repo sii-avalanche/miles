@@ -91,16 +91,17 @@ def grad_norms_split_by_mtp(optimizer, model):
     tp_group = getattr(_suboptimizers(optimizer)[0], "tp_group", None)
 
     if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+
         def get_grad(param):
             return getattr(param, "decoupled_grad", None)
+
     else:
+
         def get_grad(param):
             return param.grad
 
     def keep(param):
-        return param_is_not_shared(param) and tensor_parallel.param_is_not_tensor_parallel_duplicate(
-            param, tp_group
-        )
+        return param_is_not_shared(param) and tensor_parallel.param_is_not_tensor_parallel_duplicate(param, tp_group)
 
     non_mtp, mtp = _split_grads_by_mtp(optimizer, model, keep, get_grad)
     group = optimizer.get_grad_stats_parallel_group()

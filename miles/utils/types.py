@@ -245,13 +245,13 @@ class Sample:
 
     def validate(self):
         assert self.response_length >= 0, f"response_length must be >= 0, got {self.response_length}"
-        assert len(self.tokens) >= self.response_length, (
-            f"tokens length ({len(self.tokens)}) must be >= response_length ({self.response_length})"
-        )
+        assert (
+            len(self.tokens) >= self.response_length
+        ), f"tokens length ({len(self.tokens)}) must be >= response_length ({self.response_length})"
         if self.loss_mask is not None:
-            assert len(self.loss_mask) == self.response_length, (
-                f"loss_mask length ({len(self.loss_mask)}) != response_length ({self.response_length})"
-            )
+            assert (
+                len(self.loss_mask) == self.response_length
+            ), f"loss_mask length ({len(self.loss_mask)}) != response_length ({self.response_length})"
         if self.rollout_log_probs is not None:
             assert (
                 len(self.rollout_log_probs) == self.response_length
@@ -305,9 +305,9 @@ class Sample:
         """Remove the last *n* output tokens and all associated per-token info."""
         if n <= 0:
             return
-        assert n <= self.response_length, (
-            f"cannot strip {n} tokens: only {self.response_length} output tokens available"
-        )
+        assert (
+            n <= self.response_length
+        ), f"cannot strip {n} tokens: only {self.response_length} output tokens available"
         self.tokens = self.tokens[:-n]
         self.response_length -= n
         if self.rollout_topk_token_ids is not None:

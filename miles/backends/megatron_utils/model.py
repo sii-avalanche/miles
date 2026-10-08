@@ -445,9 +445,7 @@ def run_forward_backward_pass(
     )
 
     @dumper_phase_util.wrap_forward_step
-    def forward_step(
-        data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
-    ) -> tuple[
+    def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
         torch.Tensor,
         Callable[[torch.Tensor], tuple[torch.Tensor, int, dict]],
     ]:

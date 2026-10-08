@@ -106,7 +106,9 @@ def add_uncovered_source_tensors(checkpoint_dir: Path, source: Path) -> None:
     covered = {name.rsplit(".", depth)[0] for name in exported for depth in range(1, name.count(".") + 1)}
     with ExitStack() as stack:
         source_files = {name: stack.enter_context(safe_open(source / name, "pt")) for name in set(source_map.values())}
-        exported_files = {name: stack.enter_context(safe_open(checkpoint_dir / name, "pt")) for name in set(exported.values())}
+        exported_files = {
+            name: stack.enter_context(safe_open(checkpoint_dir / name, "pt")) for name in set(exported.values())
+        }
         mismatched = sorted(
             name
             for name, file in exported.items()
@@ -123,7 +125,9 @@ def add_uncovered_source_tensors(checkpoint_dir: Path, source: Path) -> None:
     if not kept:
         return
     shard = f"model-{len(set(exported.values())) + 1:05d}.safetensors"
-    save_file({name: tensor.contiguous() for name, tensor in kept.items()}, checkpoint_dir / shard, metadata={"format": "pt"})
+    save_file(
+        {name: tensor.contiguous() for name, tensor in kept.items()}, checkpoint_dir / shard, metadata={"format": "pt"}
+    )
     index["weight_map"] = exported | dict.fromkeys(kept, shard)
     index["metadata"]["total_size"] += sum(tensor.numel() * tensor.element_size() for tensor in kept.values())
     (checkpoint_dir / index_name).write_text(json.dumps(index, indent=2))

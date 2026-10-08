@@ -1,4 +1,3 @@
-from functools import partial
 import itertools
 import json
 import logging
@@ -6,6 +5,7 @@ import os
 import random
 import re
 from collections.abc import Sequence
+from functools import partial
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -13,6 +13,7 @@ import numpy as np
 from miles.ray.rollout.train_data_conversion import split_train_data_by_dp_raw
 from miles.utils import object_store
 from miles.utils.pydantic_utils import StrictBaseModel
+
 from .audit_utils.witness.allocator import WitnessInfo
 
 if TYPE_CHECKING:

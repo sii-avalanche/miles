@@ -231,9 +231,7 @@ class UpdateWeightP2P(WeightTransferProtocol):
         elif hasattr(model_loader_module, "post_load_weights"):
             post_load_weights_attr = "post_load_weights"
         else:
-            raise AttributeError(
-                "sglang.srt.model_loader.loader has neither _post_load_weights nor post_load_weights"
-            )
+            raise AttributeError("sglang.srt.model_loader.loader has neither _post_load_weights nor post_load_weights")
 
         original_post_load_weights = getattr(model_loader_module, post_load_weights_attr)
         setattr(model_loader_module, post_load_weights_attr, lambda *args, **kwargs: None)
