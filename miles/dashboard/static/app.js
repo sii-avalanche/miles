@@ -1,4 +1,4 @@
-import { getMeta } from "./api.js";
+import { APP_BASE, getMeta } from "./api.js";
 import { renderMetrics } from "./views_metrics.js";
 import { renderRollout } from "./views_rollout.js";
 import { renderTimeline } from "./views_timeline.js";
@@ -74,7 +74,11 @@ function parseRoute() {
 function crumbs(route, meta) {
   const nav = (label, href, active, onclick = null) =>
     el("a", { class: `nav${active ? " active" : ""}`, href, onclick }, [label]);
-  const parts = [nav("Metrics", "#/", route.view === "metrics")];
+  const parts = [];
+  if (/\/runs\/[a-f0-9]+\/$/.test(APP_BASE.pathname)) {
+    parts.push(nav("All runs", new URL("../../", APP_BASE).href, false));
+  }
+  parts.push(nav("Metrics", "#/", route.view === "metrics"));
   parts.push(nav("RL Bottlenecks", "#/runtime", route.view === "runtime"));
   if (meta.capabilities.has_timeline) {
     parts.push(nav("Compute Utilization", "#/timeline", route.view === "timeline"));

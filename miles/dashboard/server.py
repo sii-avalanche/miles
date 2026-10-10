@@ -26,6 +26,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.routing import get_route_path
 
 from miles.dashboard.advisory import DEFAULT_LOW_MFU, compute_advisories, mfu_summary
 from miles.dashboard.dump_reader import STEP_AGGREGATE_METRICS, DumpReader, DumpStillWriting
@@ -322,8 +323,9 @@ def make_app(
             # without Cache-Control browsers cache heuristically and keep
             # serving a STALE SPA after a stack upgrade; no-cache forces a
             # revalidation (cheap 304s) so the frontend always matches serve
+            path = get_route_path(request.scope)
             response = await call_next(request)
-            if request.url.path == "/" or request.url.path.startswith("/static"):
+            if path == "/" or path.startswith("/static"):
                 response.headers["Cache-Control"] = "no-cache"
             return response
 

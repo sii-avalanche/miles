@@ -1,7 +1,9 @@
 const RETRIES_503 = 3;
+// Derive the mounted run prefix from this module, including reverse-proxy prefixes.
+export const APP_BASE = new URL("../", import.meta.url);
 
 async function fetchOk(path, params, { retry503 = true } = {}) {
-  const url = new URL(path, location.origin);
+  const url = new URL(path.replace(/^\//, ""), APP_BASE);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) url.searchParams.set(k, v);
   }

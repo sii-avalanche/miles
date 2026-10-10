@@ -685,6 +685,10 @@ export async function renderTimeline(view, meta, route) {
           : []),
         el("span", { style: `color: ${UTIL_STROKE}` }, ["— gpu util"]),
       ]),
+      el("p", { class: "muted" }, [
+        "Rollout phase bars mark batch collection; background generation can overlap training. ",
+        "GPU utilization curves show observed activity. The fleet blue line is the median, not the mean.",
+      ]),
     );
   };
 
@@ -772,7 +776,7 @@ export async function renderTimeline(view, meta, route) {
         applyRange((await api("/api/meta")).time_range);
         await Promise.all([loadData(), loadAdvisories()]);
         renderAll();
-        await carpet.refresh(carpetRange());
+        await refreshOverview();
       } catch {
         // transient fetch failure (server restart, network blip): keep polling
       } finally {
