@@ -265,19 +265,10 @@ class RuntimeMonitor:
                 except Exception:
                     self._warn("performance log write failed; events dropped")
             if events and getattr(self.args, "use_miles_dashboard", False):
-                # Optional backend; never resolve an actor on the hot path.
-                from miles.dashboard.backend import current_collector
-                from miles.dashboard.store import RuntimeEvent
-
-                if (handle := current_collector()) is not None:
-                    handle.push_runtime_events.remote(
-                        [
-                            RuntimeEvent(
-                                ts=event["t1"] or event["t0"], **{k: v for k, v in event.items() if k != "kind"}
-                            )
-                            for event in events
-                        ]
-                    )
+                try:
+                    self._publish_events(events)
+                except Exception:
+                    self._warn("performance event push failed; other tracking continues")
             # A separate backend failure cannot prevent local records from landing.
             if self._sink is not None:
                 self._sink(metrics)
@@ -287,6 +278,19 @@ class RuntimeMonitor:
                 tracking.log(self.args, metrics, step_key="runtime/time_s")
         except Exception:
             self._warn("performance tracking failed; next interval will retry")
+
+    def _publish_events(self, events: list[dict]) -> None:
+        # Optional backend; never resolve an actor on the hot path.
+        from miles.dashboard.backend import current_collector
+        from miles.dashboard.store import RuntimeEvent
+
+        if (handle := current_collector()) is not None:
+            handle.push_runtime_events.remote(
+                [
+                    RuntimeEvent(ts=event["t1"] or event["t0"], **{k: v for k, v in event.items() if k != "kind"})
+                    for event in events
+                ]
+            )
 
     def _warn(self, message: str) -> None:
         now = time.monotonic()

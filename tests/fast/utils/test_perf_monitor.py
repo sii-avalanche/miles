@@ -5,6 +5,7 @@ from argparse import ArgumentParser, Namespace
 
 import pytest
 
+from miles.utils import perf_monitor as module
 from miles.utils.perf_monitor import (
     RuntimeMonitor,
     add_perf_monitor_arguments,
@@ -104,3 +105,45 @@ def test_launch_validation_rejects_invalid_interval_and_inconsistent_workloads()
     args = parser.parse_args(["--perf-monitor-workload-key", "source"])
     with pytest.raises(AssertionError, match="together"):
         validate_perf_monitor_args(args)
+
+
+def test_pool_rates_skip_historical_errors_and_measure_new_errors(monkeypatch):
+    m = monitor()
+
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    key = "runtime/test/record/pool/connections_errors_total"
+    assert key.removesuffix("_total") + "_per_s" not in m._rates({key: 800})
+    clock[0] += 10
+    values = m._rates({key: 805})
+    assert values["runtime/test/record/pool/connections_errors_per_s"] == 0.5
+
+
+def test_live_wait_rate_includes_blocked_operations_not_yet_completed(monkeypatch):
+    m = monitor()
+
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    m._last_rate_time = clock[0]
+    with m.wait("blocked"):
+        with m.wait("blocked"):
+            clock[0] += 10
+            assert m._rates(m.snapshot())["runtime/test/blocked/seconds_per_s"] == 2
+        clock[0] += 10
+        assert m._rates(m.snapshot())["runtime/test/blocked/seconds_per_s"] == 1
+
+
+def test_dashboard_event_failure_does_not_skip_scalar_tracking(tmp_path, monkeypatch):
+    collected = []
+    m = monitor(tmp_path, sink=collected.append)
+    m.args.use_miles_dashboard = True
+
+    def broken_event_sink(events):
+        raise RuntimeError("collector unavailable")
+
+    monkeypatch.setattr(m, "_publish_events", broken_event_sink)
+    with m.phase("train", rollout_id=4):
+        pass
+    m.emit()
+    assert len(collected) == 1
+    assert collected[0]["runtime/test/phase/train/count_total"] == 1

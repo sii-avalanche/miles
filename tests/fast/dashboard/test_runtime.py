@@ -1,4 +1,6 @@
 import time
+from argparse import Namespace
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -56,6 +58,10 @@ def test_fleet_gauges_exclude_stale_and_unassigned_gpus(tmp_path):
     )
     assert "inference/queued_requests" not in collector.runtime_snapshot()
 
+    collector._append(EngineSample(ts=now, addr="http://engine", metric="sglang_mamba_usage", labels={}, value=0.9))
+    assert collector.runtime_snapshot()["inference/mamba_usage_mean"] == 0.9
+    assert collector.runtime_snapshot()["inference/mamba_usage_max"] == 0.9
+
 
 def test_runtime_events_roundtrip_and_api_work_without_sample_dumps(tmp_path):
     collector = DashboardCollector(
@@ -82,3 +88,50 @@ def test_runtime_events_roundtrip_and_api_work_without_sample_dumps(tmp_path):
     ).json()
     assert series["runtime/rollout/record/pending_writes"]["y"] == []
     assert client.get("/api/runtime/events", params={"limit": 5001}).status_code == 422
+
+
+def test_runtime_monitor_to_tracking_collector_files_and_http(tmp_path, monkeypatch):
+    # Real tracking/backend/store/API, with only the Ray transport replaced.
+    # No cluster, CUDA, W&B service or database is started for this check.
+    from miles.dashboard import backend
+    from miles.utils import perf_monitor
+    from miles.utils.tracking_utils import tracking
+
+    collector = DashboardCollector(
+        config=CollectorConfig(
+            dashboard_dir=str(tmp_path / "dashboard"),
+            run_name="runtime-wiring",
+            start_ts=time.time(),
+        )
+    )
+    handle = SimpleNamespace(
+        push_metrics=SimpleNamespace(remote=collector.push_metrics),
+        push_runtime_events=SimpleNamespace(remote=collector.push_runtime_events),
+    )
+
+    def connect(args, **kwargs):
+        monkeypatch.setattr(backend, "_handle", handle)
+        monkeypatch.setattr(backend, "_is_primary", False)
+
+    monkeypatch.setattr(backend, "init_dashboard", connect)
+    monkeypatch.setattr(perf_monitor, "_fleet_snapshot", collector.runtime_snapshot)
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    args = Namespace(use_miles_dashboard=True, perf_monitor_interval=10)
+    tracking.init_tracking(args)
+    try:
+        monitor = perf_monitor.get_monitor(args, "driver")
+        with monitor.phase("wait_rollout", rollout_id=2):
+            time.sleep(0.001)
+    finally:
+        tracking.finish_tracking()
+    collector.flush()
+
+    store = MetricStore.load(tmp_path / "dashboard")
+    client = TestClient(make_app(store, DumpReader(tmp_path), follow=False))
+    key = "runtime/driver/phase/wait_rollout/count_total"
+    values = client.get("/api/metrics", params={"keys": key, "x": "runtime/time_s"}).json()
+    assert values[key]["y"][-1] == 1
+    events = client.get("/api/runtime/events").json()["events"]
+    assert {event["status"] for event in events} == {"running", "completed"}
+    assert all(event["rollout_id"] == 2 for event in events)
+    assert list((tmp_path / "logs" / "perf").glob("driver-*.jsonl"))

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -129,5 +130,7 @@ async def test_fully_async_collection_tracks_workload_targets_without_rescheduli
         assert values["runtime/rollout/workload/math/collection_progress_fraction"] == 2
         assert values["runtime/rollout/workload/code/collection_progress_fraction"] == 0
         assert values["runtime/rollout/workload/math/target_fraction"] == 0.5
+        fn._last_heartbeat = time.monotonic() - 10
+        assert monitor.snapshot()["runtime/rollout/event_loop/heartbeat_age_seconds"] >= 10
     finally:
         await fn.dispose()

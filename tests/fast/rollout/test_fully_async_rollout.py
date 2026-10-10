@@ -218,7 +218,7 @@ async def test_aborted_group_recycled(monkeypatch):
     assert all(sample.response == "" and sample.weight_versions == [] for sample in aborted)
     assert output.samples[0][0].group_index != 1
     assert output.metrics["rollout/fully_async/aborted_groups_filtered"] == 1
-    assert "rollout/dynamic_filter/drop_group_has_missing_reward" not in output.metrics
+    assert "rollout/dynamic_filter_drop_group_has_missing_reward" not in output.metrics
 
 
 async def test_missing_reward_group_dropped_without_recycling(monkeypatch):
@@ -537,7 +537,7 @@ async def test_buffer_reports_unfiltered_raw_reward_across_kept_and_dropped():
 
     metrics = buffer.get_metrics()
     assert metrics["rollout/raw_reward_unfiltered"] == 0.5
-    assert metrics["rollout/dynamic_filter/drop_rejected"] == 1
+    assert metrics["rollout/dynamic_filter_drop_rejected"] == 1
     assert "rollout/raw_reward_unfiltered" not in buffer.get_metrics()
 
 

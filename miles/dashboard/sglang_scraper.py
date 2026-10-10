@@ -44,6 +44,7 @@ DEFAULT_METRIC_WHITELIST = (
     "sglang_num_queue_reqs",
     "sglang_gen_throughput",
     "sglang_token_usage",
+    "sglang_mamba_usage",
     "sglang_cache_hit_rate",
     # PD disaggregation; these families simply don't exist when PD is off
     "sglang_num_prefill_prealloc_queue_reqs",

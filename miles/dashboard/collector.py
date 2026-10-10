@@ -269,6 +269,7 @@ class DashboardCollector:
             "sglang_num_queue_reqs": ("queued_requests", "sum"),
             "sglang_gen_throughput": ("generated_tokens_per_s", "sum"),
             "sglang_token_usage": ("kv_usage_mean", "mean"),
+            "sglang_mamba_usage": ("mamba_usage_mean", "mean"),
         }
         for metric, (name, aggregation) in aggregations.items():
             fresh = [
@@ -280,8 +281,8 @@ class DashboardCollector:
             if fresh:
                 total = sum(point.value for point in fresh)
                 result[f"inference/{name}"] = total / len(fresh) if aggregation == "mean" else total
-                if metric == "sglang_token_usage":
-                    result["inference/kv_usage_max"] = max(point.value for point in fresh)
+                if aggregation == "mean":
+                    result[f"inference/{name.removesuffix('_mean')}_max"] = max(point.value for point in fresh)
         return result
 
     def update_topology(self, snapshot: TopologySnapshot) -> None:

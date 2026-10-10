@@ -96,6 +96,7 @@ def make_app(
             mode="follow" if follow else "static",
             run_name=store.meta.run_name if store.meta else None,
             start_ts=store.meta.start_ts if store.meta else None,
+            runtime_interval_s=store.meta.args.get("perf_monitor_interval") if store.meta else None,
             wandb_url=_wandb_url(store.meta.args) if store.meta else None,
             data_buffer_length=store.latest_data_buffer_length(),
             time_range=store.time_range(),

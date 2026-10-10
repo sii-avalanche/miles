@@ -381,7 +381,7 @@ export function drawMultiLine(canvas, seriesList, opts = {}) {
   // x origin stays the run-wide first sample so +m:ss labels keep meaning under zoom
   const withData = seriesList.filter((s) => s.ts.length);
   const x0 = opts.timeOrigin ?? (withData.length ? Math.min(...withData.map((s) => s.ts[0])) : 0);
-  const [xMin, xMax] = zoom?.x ?? [x0, alive.length ? Math.max(...alive.map((s) => s.ts.at(-1))) : x0 + 1];
+  const [xMin, xMax] = zoom?.x ?? opts.xDomain ?? [x0, alive.length ? Math.max(...alive.map((s) => s.ts.at(-1))) : x0 + 1];
   let yMin, yMax;
   if (zoom?.y) {
     [yMin, yMax] = zoom.y;
@@ -419,7 +419,7 @@ export function drawMultiLine(canvas, seriesList, opts = {}) {
     const idx = opts.colorIndex ? opts.colorIndex(s.label) : i;
     ctx.strokeStyle = SERIES_COLORS[idx % SERIES_COLORS.length];
     ctx.beginPath();
-    s.ts.forEach((t, j) => (j ? ctx.lineTo(X(t), Y(s.value[j])) : ctx.moveTo(X(t), Y(s.value[j]))));
+    s.ts.forEach((t, j) => (j && t - s.ts[j - 1] <= (opts.maxGapSeconds ?? Infinity) ? ctx.lineTo(X(t), Y(s.value[j])) : ctx.moveTo(X(t), Y(s.value[j]))));
     ctx.stroke();
   });
   ctx.restore();

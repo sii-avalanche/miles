@@ -34,7 +34,9 @@ fleet GPU/engine sampling requires the dashboard collector.
 
 Open `http://127.0.0.1:7788/#/runtime` for **RL Bottlenecks** or `#/timeline`
 for per-GPU utilization and trainer phase lanes. The page refreshes every five
-seconds in follow mode. For a remote server, forward the port with SSH.
+seconds in follow mode and charts the most recent four hours of runtime gauges.
+The Metrics view and W&B retain the full scalar history. For a remote server,
+forward the port with SSH.
 W&B receives the same runtime counters through the existing shared run; use
 `runtime/time_s` as X and choose the fields below as Y.
 
@@ -88,7 +90,7 @@ they complete; `seconds_per_s` includes the change in ongoing wait time.
 | --- | --- |
 | `drain/progress_fraction`, `drain/target_groups`, `drain/collected_groups` | fraction and counts of valid groups in the requested batch |
 | `producer/in_flight_samples`, `producer/sample_budget` | scheduler sample slots in use / effective group-aligned limit; sample metric exists for the sample-backfill scheduler |
-| `producer/in_flight_groups`, `producer/completed_pending_groups` | unfinished group tasks vs finished tasks the producer has yet to deliver |
+| `producer/in_flight_groups`, `producer/completed_pending_groups` | unfinished group tasks vs finished tasks not yet collected by the worker; a collected entry blocked inside `put` is counted by `full_wait/waiting` separately |
 | `producer/oldest_in_flight_seconds`, `producer/group_generation/p95_seconds` | current long tail vs recent completed group latency |
 | `buffer/fill_fraction`, `buffer/queued_groups`, `buffer/capacity_groups` | completed groups held in the default buffer, independent of database records |
 | `buffer/full_wait/waiting`, `buffer/full_wait/oldest_wait_seconds`, `buffer/full_wait/seconds_per_s` | producer blocked by a full buffer; prolonged values suggest consumption is slower than supply |
@@ -97,10 +99,11 @@ they complete; `seconds_per_s` includes the change in ongoing wait time.
 | `buffer/groups_seen_per_s`, `buffer/groups_consumed_per_s` | group-level input and valid output rates; rates are not token throughput |
 | `buffer/{dynamic_rejected,stale_rejected,aborted,missing_reward}_groups_per_s` | reasons production is failing to become training data |
 | `producer/recycled_groups_total` | original prompt groups returned for retry, not reused old generated answers |
-| `sample/generate/*`, `sample/reward/*`, `event_loop/lag_seconds` | generation end-to-end time, reward time and scheduling delay; generation includes API/engine/network waits |
+| `sample/generate/*`, `sample/reward/*`, `event_loop/lag_seconds`, `event_loop/heartbeat_age_seconds` | generation/reward latency, completed heartbeat delay and live time since a heartbeat; a blocked loop can leave the last lag value small while heartbeat age rises |
 | `record/pending_writes`, `record/oldest_pending_seconds` | detached writes still unfinished; no new queue or connection limit is introduced |
 | `record/{success,failed,pool_timeout,other_errors}_total` | completed outcomes; a successful rollout does not imply a successful database record |
 | `record/pool/{pool_size,pool_available,requests_waiting,connections_errors}` | actual psycopg pool gauges/counters; fields appear after the pool opens |
+| `record/pool/{connections_errors,connections_lost,requests_errors}_per_s` | interval rates derived without resetting pool counters; pre-monitor historical totals are excluded from the first rate |
 | `record/open_wait/*` | awaiting the shared store/run initialization task |
 | `record/create_rollout/*`, `record/end_to_end/*` | complete create call vs complete record operation; both include waits/serialization/SQL, not isolated server SQL execution |
 | `host/process_cpu_seconds_per_s` | process CPU core equivalents: 1 means approximately one fully busy CPU core |
@@ -110,6 +113,7 @@ they complete; `seconds_per_s` includes the change in ongoing wait time.
 | `runtime/driver/fleet/{train,inference}/gpu_util_mean_pct` | mean of fresh GPU activity samples assigned to that role; inference includes registered eval engines if present |
 | `runtime/driver/fleet/{train,inference}/coverage_fraction` | sampled / expected-or-mapped GPUs; low coverage makes averages partial |
 | `runtime/driver/fleet/inference/{running_requests,queued_requests,kv_usage_mean,kv_usage_max}` | fresh engine gauges; reporting-engine counts reveal incomplete scrape coverage |
+| `runtime/driver/fleet/inference/{mamba_usage_mean,mamba_usage_max}` | active Mamba state-pool usage for hybrid GDN models; this can be the limiting resource while attention KV usage is low |
 | `moe/rollout_layer_9/{cv,max_over_mean,cold_experts_fraction,sample_coverage}` | optional selected-batch routing statistics: std/mean; max/mean; fraction below 0.1×mean; replay coverage |
 
 Per-policy default buffers use `buffer/<trainer_model_id>/...`; the Metrics
@@ -164,3 +168,23 @@ waits and connection health. The monitor does not run SQL probes or load tests.
 * Recording behavior, staleness policy, task concurrency and training losses
   are unchanged by enabling these fields. Monitor `telemetry/expert_counts`
   duration when assessing the optional routing-count overhead.
+
+## Local validation
+
+Run from the Miles checkout with the AvaTrain virtual environment:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ../.venv/bin/python -m pytest \
+  tests/fast/utils/test_perf_monitor.py \
+  tests/fast/rollout/test_perf_monitoring.py \
+  tests/fast/rollout/test_fully_async_rollout.py \
+  tests/fast/rollout/test_fully_async_data_buffer.py \
+  tests/fast/dashboard \
+  --ignore=tests/fast/dashboard/test_core_integration.py
+node --experimental-vm-modules tests/fast/dashboard/runtime_frontend.mjs
+```
+
+These checks cover buffer instrumentation, rates and open waits, collector/file/API
+wiring, and frontend refresh/rendering logic. They do not validate a live Ray
+cluster, GPU kernels, W&B service or production database. The frontend check uses
+a simulated DOM/canvas and does not perform browser screenshot comparison.

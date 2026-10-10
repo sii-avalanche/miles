@@ -88,6 +88,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._pending_groups: dict[asyncio.Task, tuple[float, str]] = {}
         self._last_group_completed: float | None = None
         self._heartbeat: asyncio.Task | None = None
+        self._last_heartbeat: float | None = None
         self._workload_targets = dict(workload_targets(self.args))
         self._monitor.register("", self._perf_snapshot)
 
@@ -104,6 +105,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             )
             self._worker = asyncio.create_task(self._worker_loop())
             if self._monitor.enabled:
+                self._last_heartbeat = time.monotonic()
                 self._heartbeat = asyncio.create_task(self._monitor_event_loop())
             logger.info("Started fully-async rollout worker")
         with self._monitor.phase("drain_batch", rollout_id=input.rollout_id):
@@ -124,19 +126,25 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             metrics["in_flight_samples"] = self._scheduler.samples_in_flight
         if self._last_group_completed is not None:
             metrics["seconds_since_group_completed"] = time.monotonic() - self._last_group_completed
+        if self._last_heartbeat is not None:
+            metrics["event_loop/heartbeat_age_seconds"] = time.monotonic() - self._last_heartbeat
         for name, target in (self._workload_targets | {"other": self._workload_targets.get("other", 0)}).items():
             metrics[f"workload/{name}/target_fraction"] = target
             metrics[f"workload/{name}/in_flight_group_fraction"] = (
                 sum(workload == name for _, workload in live) / len(live) if live else 0
             )
         # Workload gauges live alongside the buffer and recorder, not under producer/.
-        return {key if key.startswith("workload/") else f"producer/{key}": value for key, value in metrics.items()}
+        return {
+            key if key.startswith(("workload/", "event_loop/")) else f"producer/{key}": value
+            for key, value in metrics.items()
+        }
 
     async def _monitor_event_loop(self) -> None:
         while True:
             started = time.monotonic()
             await asyncio.sleep(1)
-            self._monitor.update({"event_loop/lag_seconds": max(0, time.monotonic() - started - 1)})
+            self._last_heartbeat = time.monotonic()
+            self._monitor.update({"event_loop/lag_seconds": max(0, self._last_heartbeat - started - 1)})
 
     async def dispose(self) -> None:
         if (worker := self._worker) is None:

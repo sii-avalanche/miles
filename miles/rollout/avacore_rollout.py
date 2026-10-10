@@ -97,7 +97,11 @@ class AvaCoreRollout:
             "oldest_pending_seconds": max((time.monotonic() - t for t in started), default=0.0),
         }
         if self._record_pool is not None:
-            metrics.update({f"pool/{key}": value for key, value in self._record_pool.get_stats().items()})
+            stats = self._record_pool.get_stats()  # get_stats never resets the real pool's counters
+            metrics.update({f"pool/{key}": value for key, value in stats.items()})
+            for key in ("connections_errors", "connections_lost", "requests_errors"):
+                # Mark cumulative fields explicitly so the monitor can derive interval rates.
+                metrics[f"pool/{key}_total"] = stats.get(key, 0)
         return metrics
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
