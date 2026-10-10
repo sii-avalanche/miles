@@ -3,6 +3,7 @@ import { renderMetrics } from "./views_metrics.js";
 import { renderRollout } from "./views_rollout.js";
 import { renderTimeline } from "./views_timeline.js";
 import { renderTokens } from "./views_tokens.js";
+import { renderRuntime } from "./views_runtime.js";
 
 // tiny DOM builder: el("div", {class: "x", onclick: fn}, [children|strings])
 export function el(tag, attrs = {}, children = []) {
@@ -43,6 +44,7 @@ function parseRoute() {
   const [path, query] = (location.hash.slice(1) || "/").split("?");
   const segments = path.split("/").filter(Boolean);
   const params = new URLSearchParams(query || "");
+  if (segments[0] === "runtime") return { view: "runtime" };
   if (segments[0] === "timeline") {
     return { view: "timeline", lanes: params.get("lanes") };
   }
@@ -73,6 +75,7 @@ function crumbs(route, meta) {
   const nav = (label, href, active, onclick = null) =>
     el("a", { class: `nav${active ? " active" : ""}`, href, onclick }, [label]);
   const parts = [nav("Metrics", "#/", route.view === "metrics")];
+  parts.push(nav("RL Bottlenecks", "#/runtime", route.view === "runtime"));
   if (meta.capabilities.has_timeline) {
     parts.push(nav("Compute Utilization", "#/timeline", route.view === "timeline"));
   }
@@ -126,6 +129,7 @@ async function render() {
     if (meta.wandb_url) runinfo.push(" · ", el("a", { href: meta.wandb_url, target: "_blank" }, ["wandb ↗"]));
     document.getElementById("runinfo").replaceChildren(...runinfo);
     if (route.view === "metrics") await renderMetrics(view, meta);
+    else if (route.view === "runtime") await renderRuntime(view, meta);
     else if (route.view === "timeline") await renderTimeline(view, meta, route);
     else if (route.view === "rollout") await renderRollout(view, meta, route);
     else await renderTokens(view, meta, route);

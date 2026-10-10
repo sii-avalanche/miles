@@ -2,6 +2,7 @@ import asyncio
 import copy
 import logging
 import os
+import time
 from argparse import Namespace
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
@@ -21,6 +22,7 @@ from ava_core.store.core import Run
 from ava_core.store.postgres import PostgresBackend
 
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.utils.perf_monitor import get_monitor
 from miles.utils.types import Sample, WeightVersionsPerCall
 
 __all__ = ["AvaCoreRollout", "generate"]
@@ -42,12 +44,17 @@ class AvaCoreRollout:
         self.stack = AsyncExitStack()
         self.writes: set[asyncio.Task[None]] = set()
         self.failed_writes = 0
+        self._monitor = get_monitor(args)
+        self._record_pool = None
+        self._writes_started: dict[asyncio.Task, float] = {}
+        self._monitor.register("record", self._record_perf_snapshot)
 
     async def generate(self, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         try:
-            trace = await self.generate_fn(row, sampling_params=sampling_params, **replay)
+            with self._monitor.wait("sample/generate"):
+                trace = await self.generate_fn(row, sampling_params=sampling_params, **replay)
             if any(
                 message.metadata["finish_reason"]["type"] == "abort"
                 for node in flattened(trace)
@@ -56,8 +63,10 @@ class AvaCoreRollout:
             ):
                 sample.status = Sample.Status.ABORTED
                 return sample
-            reward = await self.reward_fn(trace, row)
+            with self._monitor.wait("sample/reward"):
+                reward = await self.reward_fn(trace, row)
         except RECOVERABLE_ERRORS as error:
+            self._monitor.increment("sample/recoverable_errors_total")
             logger.warning("AvaCore rollout of sample %s aborted: %r", sample.index, error)
             sample.status = Sample.Status.ABORTED
             return sample
@@ -66,7 +75,10 @@ class AvaCoreRollout:
         if self.recording is not None:
             write = asyncio.create_task(self.record(row, sample, trace, reward, sampling_params))
             self.writes.add(write)
-            write.add_done_callback(self.writes.discard)
+            if self._monitor.enabled:
+                self._writes_started[write] = time.monotonic()
+            self._monitor.increment("record/scheduled_total")
+            write.add_done_callback(self._write_done)
         samples = [
             filled(self.args, copy.deepcopy(sample), node, reward.score)
             for node in flattened(trace)
@@ -74,11 +86,26 @@ class AvaCoreRollout:
         ]
         return samples[0] if len(samples) == 1 else samples
 
+    def _write_done(self, write: asyncio.Task) -> None:
+        self.writes.discard(write)
+        self._writes_started.pop(write, None)
+
+    def _record_perf_snapshot(self) -> dict[str, float]:
+        started = self._writes_started.copy().values()
+        metrics = {
+            "pending_writes": len(self.writes),
+            "oldest_pending_seconds": max((time.monotonic() - t for t in started), default=0.0),
+        }
+        if self._record_pool is not None:
+            metrics.update({f"pool/{key}": value for key, value in self._record_pool.get_stats().items()})
+        return metrics
+
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
         store = await self.stack.enter_async_context(
             PostgresBackend(self.recording["postgres"], min_size=1, max_size=4)
         )
+        self._record_pool = store.pool
         run = await self.stack.enter_async_context(
             store.rl_run(
                 model=self.recording["model"],
@@ -101,6 +128,7 @@ class AvaCoreRollout:
         reward: Reward,
         sampling_params: dict[str, Any],
     ) -> None:
+        started = time.monotonic()
         try:
             assert sample.epoch is not None and sample.index is not None
             n = self.args.n_samples_per_prompt
@@ -108,22 +136,32 @@ class AvaCoreRollout:
             trial_id = sample.epoch * n + sample.index % n
             if self.run is None:
                 self.run = asyncio.create_task(self.open(sampling_params))
-            run = await self.run
-            await run.create_rollout(
-                query_id=query_id,
-                trial_id=trial_id,
-                instance=row,
-                trace=trace,
-                reward=reward,
-                status="completed",
-                metadata={"weight_version": int(trace.last_assistant().metadata["weight_version"])},
-            )
+            with self._monitor.wait("record/open_wait"):
+                run = await self.run
+            with self._monitor.wait("record/create_rollout"):
+                await run.create_rollout(
+                    query_id=query_id,
+                    trial_id=trial_id,
+                    instance=row,
+                    trace=trace,
+                    reward=reward,
+                    status="completed",
+                    metadata={"weight_version": int(trace.last_assistant().metadata["weight_version"])},
+                )
+            self._monitor.increment("record/success_total")
         except Exception as error:
             self.failed_writes += 1
+            self._monitor.increment("record/failed_total")
+            if type(error).__name__ == "PoolTimeout":
+                self._monitor.increment("record/pool_timeout_total")
+            else:
+                self._monitor.increment("record/other_errors_total")
             if self.failed_writes in (1, 10, 100) or self.failed_writes % 1000 == 0:
                 logger.warning(
                     "Recording rollouts to Postgres failed %d times; last error: %r", self.failed_writes, error
                 )
+        finally:
+            self._monitor.observe("record/end_to_end", time.monotonic() - started)
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:

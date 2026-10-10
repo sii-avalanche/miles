@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from miles.dashboard.collector import CollectorConfig
 from miles.dashboard.sglang_scraper import DEFAULT_METRIC_WHITELIST
@@ -34,6 +35,18 @@ _SNAPSHOT_KEYS = (
     "router_policy",
     "sglang_router_policy",
     "router_assignment_mode",
+    "tensor_model_parallel_size",
+    "pipeline_model_parallel_size",
+    "context_parallel_size",
+    "expert_model_parallel_size",
+    "global_batch_size",
+    "async_max_concurrent_samples",
+    "async_data_buffer_capacity_factor",
+    "max_weight_staleness",
+    "perf_monitor_interval",
+    "perf_monitor_expert_layer",
+    "perf_monitor_workload_key",
+    "perf_monitor_workload_targets",
 )
 
 
@@ -43,8 +56,14 @@ def add_dashboard_arguments(parser) -> None:
         "--use-miles-dashboard",
         action="store_true",
         default=False,
-        help="Collect dashboard telemetry (phases, GPU util, engine metrics) under {dump-details}/dashboard/. "
-        "Requires --dump-details. View with `python -m miles.dashboard.serve`.",
+        help="Collect phases, GPU utilization and engine metrics. Use --dashboard-dir for telemetry only, "
+        "or --dump-details for telemetry plus sample dumps. View with `python -m miles.dashboard.serve`.",
+    )
+    group.add_argument(
+        "--dashboard-dir",
+        type=str,
+        default=None,
+        help="Telemetry directory without full rollout/train tensor dumps. Overrides the dashboard location in --dump-details.",
     )
     group.add_argument("--dashboard-flush-interval", type=float, default=5.0, help="collector disk flush cadence (s)")
     group.add_argument("--dashboard-gpu-sample-interval", type=float, default=1.0, help="NVML sampling cadence (s)")
@@ -73,11 +92,14 @@ def add_dashboard_arguments(parser) -> None:
 def validate_dashboard_args(args) -> None:
     if not args.use_miles_dashboard:
         return
-    assert args.dump_details is not None, (
-        "--use-miles-dashboard writes telemetry under {dump-details}/dashboard/ and the "
-        "trajectory views read the rollout/train dumps, so --dump-details is required"
-    )
-    if not args.use_rollout_entropy:
+    assert (
+        args.dump_details is not None or getattr(args, "dashboard_dir", None) is not None
+    ), "--use-miles-dashboard requires --dashboard-dir (telemetry only) or --dump-details (including sample dumps)"
+    for name in ("dashboard_flush_interval", "dashboard_gpu_sample_interval", "dashboard_sglang_scrape_interval"):
+        assert (
+            math.isfinite(getattr(args, name)) and getattr(args, name) > 0
+        ), f"--{name.replace('_', '-')} must be finite and positive"
+    if args.dump_details is not None and not args.use_rollout_entropy:
         logger.warning(
             "--use-miles-dashboard without --use-rollout-entropy: per-token entropy "
             "will be missing from the dashboard token view"
@@ -92,7 +114,9 @@ def collector_config_from_args(args, *, start_ts: float) -> CollectorConfig:
         whitelist = DEFAULT_METRIC_WHITELIST
     snapshot = {key: getattr(args, key) for key in _SNAPSHOT_KEYS if hasattr(args, key)}
     return CollectorConfig(
-        dashboard_dir=f"{args.dump_details}/dashboard",
+        # Explicit telemetry location wins; dump_details retains its existing
+        # meaning and never gets enabled merely for performance monitoring.
+        dashboard_dir=getattr(args, "dashboard_dir", None) or f"{args.dump_details}/dashboard",
         run_name=args.wandb_group or "miles-run",
         start_ts=start_ts,
         args_snapshot=snapshot,

@@ -265,6 +265,10 @@ def make_app(
                     series[key] = dict(x=[p[0] for p in points], y=[_json_safe(p[1]) for p in points], ts=[])
             return _json_safe(series)
 
+    @app.get("/api/runtime/events")
+    def runtime_events(limit: int = Query(500, ge=1, le=5000)):
+        return dict(events=[record.to_dict() for record in store.records[Stream.RUNTIME_EVENTS][-limit:]])
+
     @app.get("/api/rollout/{rollout_id}/summary")
     def rollout_summary(rollout_id: int, evaluation: bool = Query(False, alias="eval")):
         with _translate_errors():

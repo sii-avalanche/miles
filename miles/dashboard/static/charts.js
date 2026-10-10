@@ -380,7 +380,7 @@ export function drawMultiLine(canvas, seriesList, opts = {}) {
   }
   // x origin stays the run-wide first sample so +m:ss labels keep meaning under zoom
   const withData = seriesList.filter((s) => s.ts.length);
-  const x0 = withData.length ? Math.min(...withData.map((s) => s.ts[0])) : 0;
+  const x0 = opts.timeOrigin ?? (withData.length ? Math.min(...withData.map((s) => s.ts[0])) : 0);
   const [xMin, xMax] = zoom?.x ?? [x0, alive.length ? Math.max(...alive.map((s) => s.ts.at(-1))) : x0 + 1];
   let yMin, yMax;
   if (zoom?.y) {

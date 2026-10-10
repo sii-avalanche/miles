@@ -18,6 +18,7 @@ rollout engines, pausing producer submissions for the duration of the
 
 import asyncio
 import logging
+import time
 from dataclasses import replace
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
@@ -46,6 +47,7 @@ from miles.rollout.inference_rollout.inference_rollout_common import GenerateSta
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils.function_registry import load_function
+from miles.utils.perf_monitor import get_monitor, workload_of, workload_targets
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,12 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
+        self._monitor = get_monitor(input.args)
+        self._pending_groups: dict[asyncio.Task, tuple[float, str]] = {}
+        self._last_group_completed: float | None = None
+        self._heartbeat: asyncio.Task | None = None
+        self._workload_targets = dict(workload_targets(self.args))
+        self._monitor.register("", self._perf_snapshot)
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -95,13 +103,49 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                 DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
             )
             self._worker = asyncio.create_task(self._worker_loop())
+            if self._monitor.enabled:
+                self._heartbeat = asyncio.create_task(self._monitor_event_loop())
             logger.info("Started fully-async rollout worker")
-        return await self._drain(input)
+        with self._monitor.phase("drain_batch", rollout_id=input.rollout_id):
+            return await self._drain(input)
+
+    def _perf_snapshot(self) -> dict[str, float]:
+        pending = self._pending_groups.copy()
+        live = [started for task, started in pending.items() if not task.done()]
+        metrics = {
+            "in_flight_groups": len(live),
+            "completed_pending_groups": len(pending) - len(live),
+            "oldest_in_flight_seconds": max((time.monotonic() - t for t, _ in live), default=0.0),
+            "group_submission_budget": self._max_in_flight_groups(),
+            "sample_budget": self._max_in_flight_groups() * self.args.n_samples_per_prompt,
+            "paused": int(not self._producer_resumed.is_set()),
+        }
+        if hasattr(self._scheduler, "samples_in_flight"):
+            metrics["in_flight_samples"] = self._scheduler.samples_in_flight
+        if self._last_group_completed is not None:
+            metrics["seconds_since_group_completed"] = time.monotonic() - self._last_group_completed
+        for name, target in (self._workload_targets | {"other": self._workload_targets.get("other", 0)}).items():
+            metrics[f"workload/{name}/target_fraction"] = target
+            metrics[f"workload/{name}/in_flight_group_fraction"] = (
+                sum(workload == name for _, workload in live) / len(live) if live else 0
+            )
+        # Workload gauges live alongside the buffer and recorder, not under producer/.
+        return {key if key.startswith("workload/") else f"producer/{key}": value for key, value in metrics.items()}
+
+    async def _monitor_event_loop(self) -> None:
+        while True:
+            started = time.monotonic()
+            await asyncio.sleep(1)
+            self._monitor.update({"event_loop/lag_seconds": max(0, time.monotonic() - started - 1)})
 
     async def dispose(self) -> None:
         if (worker := self._worker) is None:
             return
         await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_end_worker(worker), worker.get_loop()))
+        if self._heartbeat is not None:
+            await asyncio.wrap_future(
+                asyncio.run_coroutine_threadsafe(_end_worker(self._heartbeat), self._heartbeat.get_loop())
+            )
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnOutput:
         if input.generate_state is not None:
@@ -132,6 +176,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         return asyncio.create_task(self._generate_group(prompt_group)), prompt_group
 
     async def _generate_group(self, prompt_group: list[Sample]) -> DataBufferInput:
+        started = time.monotonic()
         result = await generate_and_rm_group(
             self.state,
             prompt_group,
@@ -139,6 +184,9 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             evaluation=False,
             sample_done_callback=self._scheduler.sample_done_callback,
         )
+        self._last_group_completed = time.monotonic()
+        self._monitor.observe("producer/group_generation", self._last_group_completed - started)
+        self._monitor.increment("producer/groups_completed_total")
         return DataBufferInput(prompt_group=prompt_group, group=result)
 
     async def _worker_loop(self) -> None:
@@ -148,9 +196,13 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             while self._scheduler.has_capacity(pending_groups=len(active), group_budget=self._max_in_flight_groups()):
                 task, prompt_group = self._submit_one_group()
                 active[task] = prompt_group
+                if self._monitor.enabled:
+                    self._pending_groups[task] = (time.monotonic(), workload_of(prompt_group[0], self.args))
+                self._monitor.increment("producer/groups_submitted_total")
             done, _ = await self._scheduler.wait_for_progress(set(active))
             for task in done:
                 entry = self._collect_group_result(task, active.pop(task))
+                self._pending_groups.pop(task, None)
                 await self._output.put(entry)
 
     def _collect_group_result(self, task: asyncio.Task, prompt_group: list[Sample]) -> DataBufferInput:
@@ -200,6 +252,17 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         target_data_size = args.rollout_batch_size
         data: list[Group] = []
         do_print = True
+        workload_counts: dict[str, int] = {}
+        prefix = "drain" if input.trainer_model_id is None else f"drain/{input.trainer_model_id}"
+        self._monitor.update(
+            {
+                f"{prefix}/rollout_id": input.rollout_id,
+                f"{prefix}/target_groups": target_data_size,
+                f"{prefix}/collected_groups": 0,
+                f"{prefix}/progress_fraction": 0,
+            }
+        )
+        self._monitor.update({f"workload/{name}/collection_progress_fraction": 0 for name in self._workload_targets})
 
         while len(data) < target_data_size:
             entry = await self._next_group(
@@ -218,6 +281,21 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                 do_print = False
 
             data.append(entry.group)
+            workload = workload_of(entry.prompt_group[0], args)
+            workload_counts[workload] = workload_counts.get(workload, 0) + 1
+            self._monitor.update(
+                {
+                    f"{prefix}/collected_groups": len(data),
+                    f"{prefix}/progress_fraction": len(data) / target_data_size,
+                }
+            )
+            if (target := self._workload_targets.get(workload)) is not None:
+                self._monitor.update(
+                    {
+                        f"workload/{workload}/collection_progress_fraction": workload_counts[workload]
+                        / (target_data_size * target)
+                    }
+                )
 
         sample = first_sample(data[-1])
         logger.info(
@@ -235,6 +313,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
+        self._monitor.increment("producer/recycled_groups_total")
         for sample in prompt_group:
             sample.reset_for_retry()
         self.data_source.add_samples([prompt_group])

@@ -45,6 +45,7 @@ def make_demo_dir(target: Path) -> Path:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dump-details", default=None, help="the run's --dump-details directory")
+    parser.add_argument("--dashboard-dir", default=None, help="telemetry-only directory from --dashboard-dir")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7788)
     parser.add_argument("--follow", action="store_true", help="tail telemetry streams of a still-running job")
@@ -73,11 +74,15 @@ def main(argv: list[str] | None = None) -> None:
 
         dump_dir = make_demo_dir(Path(tempfile.mkdtemp(prefix="miles_dashboard_demo_")))
     else:
-        assert args.dump_details is not None, "--dump-details is required (or use --demo)"
-        dump_dir = Path(args.dump_details)
+        assert args.dump_details is not None or args.dashboard_dir is not None, (
+            "--dump-details or --dashboard-dir is required (or use --demo)"
+        )
+        dump_dir = Path(args.dump_details) if args.dump_details else Path(args.dashboard_dir).parent
     assert dump_dir.is_dir(), f"--dump-details directory not found: {dump_dir}"
 
-    store = MetricStore.load(dump_dir / "dashboard")
+    dashboard_dir = Path(args.dashboard_dir) if args.dashboard_dir else dump_dir / "dashboard"
+    assert dashboard_dir.is_dir(), f"dashboard directory not found: {dashboard_dir}"
+    store = MetricStore.load(dashboard_dir)
     reader = DumpReader(dump_dir, cache_dir=args.cache_dir, tensor_lru=args.tensor_lru)
     app = make_app(
         store,

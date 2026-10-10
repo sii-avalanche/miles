@@ -70,9 +70,9 @@ def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None
         _handle.start.remote()
         logger.info(
             "miles dashboard: telemetry -> %s | view live: python -m miles.dashboard.serve "
-            "--dump-details %s --follow --port 7788",
+            "--dashboard-dir %s --follow --port 7788",
             config.dashboard_dir,
-            args.dump_details,
+            config.dashboard_dir,
         )
         return
 

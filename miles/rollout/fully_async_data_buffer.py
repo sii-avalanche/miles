@@ -9,10 +9,12 @@ Every group-level decision lives here — what to keep, what to hand to
 
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
+from collections import deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
@@ -24,6 +26,7 @@ from miles.rollout.filter_hub.common_filters import (
     group_weight_version_stats,
 )
 from miles.utils.function_registry import load_function
+from miles.utils.perf_monitor import get_monitor, workload_of
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,7 @@ def first_sample(group: Group) -> Sample:
 class DataBufferConstructorInput:
     args: Namespace
     unused_handler_fn: Callable[[list[Sample]], None]  # --async-unused-samples-handler, applied to unused groups
+    trainer_model_id: str | None = None
 
 
 @dataclass
@@ -151,33 +155,54 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_versioned_tokens = 0
         self._metric_selected_samples = 0
         self._metric_selected_versioned_samples = 0
+        self._monitor = get_monitor(args)
+        self._perf_prefix = "buffer" if input.trainer_model_id is None else f"buffer/{input.trainer_model_id}"
+        self._enqueued_at = deque()
+        self._monitor.register(self._perf_prefix, self._perf_snapshot)
+
+    def _perf_snapshot(self) -> dict[str, float]:
+        return {
+            "queued_groups": len(self._buffer),
+            "capacity_groups": self._capacity,
+            "fill_fraction": len(self._buffer) / self._capacity,
+        }
 
     async def put(self, input: DataBufferInput) -> None:
+        self._monitor.increment(f"{self._perf_prefix}/groups_seen_total")
+        self._monitor.increment(f"workload/{workload_of(input.prompt_group[0], self._args)}/groups_seen_total")
         if not self._preput_filter(input):
             return
 
         async with self._cond:
-            while len(self._buffer) >= self._capacity:
-                await self._cond.wait()
+            if len(self._buffer) >= self._capacity:
+                with self._monitor.wait(f"{self._perf_prefix}/full_wait"):
+                    while len(self._buffer) >= self._capacity:
+                        await self._cond.wait()
             self._buffer.append(input)
+            if self._monitor.enabled:
+                self._enqueued_at.append(time.monotonic())
+            self._monitor.increment(f"{self._perf_prefix}/groups_enqueued_total")
             self._cond.notify_all()
 
     def _preput_filter(self, input: DataBufferInput) -> bool:
         output = apply_aborted_filter(self._args, input.group)
         if not output.keep:
             self._metric_aborted_groups += 1
+            self._monitor.increment(f"{self._perf_prefix}/aborted_groups_total")
             self._unused_handler_fn(input.prompt_group)
             return False
 
         output = apply_missing_reward_filter(self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            self._monitor.increment(f"{self._perf_prefix}/missing_reward_groups_total")
             return False
 
         self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
         output = call_dynamic_filter(self._dynamic_filter, self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            self._monitor.increment(f"{self._perf_prefix}/dynamic_rejected_groups_total")
             return False
         return True
 
@@ -186,9 +211,15 @@ class DefaultDataBuffer(DataBuffer):
             self._current_version = current_version
         async with self._cond:
             while True:
-                while not self._buffer:
-                    await self._cond.wait()
+                if not self._buffer:
+                    with self._monitor.wait(f"{self._perf_prefix}/empty_wait"):
+                        while not self._buffer:
+                            await self._cond.wait()
                 entry = self._buffer.pop(0)
+                if self._monitor.enabled:
+                    self._monitor.observe(
+                        f"{self._perf_prefix}/residence", time.monotonic() - self._enqueued_at.popleft()
+                    )
                 self._cond.notify_all()  # wake producers blocked on a full buffer
 
                 version_stats = group_weight_version_stats(entry.group)
@@ -197,10 +228,15 @@ class DefaultDataBuffer(DataBuffer):
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
                         self._metric_stale_groups += 1
+                        self._monitor.increment(f"{self._perf_prefix}/stale_rejected_groups_total")
                         self._unused_handler_fn(entry.prompt_group)
                         continue
                     self._metric_consumed_staleness.append(staleness)
                 self._record_selected_version_stats(version_stats, current_version)
+                self._monitor.increment(f"{self._perf_prefix}/groups_consumed_total")
+                self._monitor.increment(
+                    f"workload/{workload_of(entry.prompt_group[0], self._args)}/groups_consumed_total"
+                )
                 return entry
 
     def _record_selected_version_stats(
@@ -285,7 +321,10 @@ class DefaultMultiDataBuffer(DataBuffer):
             f"({sorted(model_ids)})"
         )
         self._inners: dict[str, DataBuffer] = {
-            model_id: (load_function(paths.get(model_id)) or DefaultDataBuffer)(input) for model_id in model_ids
+            model_id: (load_function(paths.get(model_id)) or DefaultDataBuffer)(
+                replace(input, trainer_model_id=model_id)
+            )
+            for model_id in model_ids
         }
 
     async def put(self, input: DataBufferInput) -> None:

@@ -54,6 +54,7 @@ class Stream(StrEnum):
     TRAJECTORIES = "trajectories"
     GPU_PROCESSES = "gpu_processes"
     DATA_BUFFER = "data_buffer"
+    RUNTIME_EVENTS = "runtime_events"
 
     @property
     def filename(self) -> str:
@@ -90,6 +91,21 @@ class Role(StrEnum):
     TRAIN = "train"
     ROLLOUT_MANAGER = "rollout_manager"
     DERIVED = "derived"  # synthesized by the read side, not observed
+
+
+@dataclass
+class RuntimeEvent(Record):
+    """Observed phase status. A failure stage does not identify its root cause."""
+
+    stream: ClassVar[Stream] = Stream.RUNTIME_EVENTS
+    ts: float
+    role: str
+    name: str
+    rollout_id: int | None
+    t0: float
+    t1: float | None
+    status: str
+    error_type: str | None = None
 
 
 # phase name synthesized per lane for [meta.start_ts, first observed event)
@@ -242,6 +258,7 @@ _RECORD_TYPE_OF_STREAM: dict[Stream, type[Record]] = {
         TrajectoryEvent,
         GpuProcessSample,
         DataBufferSample,
+        RuntimeEvent,
     )
 }
 

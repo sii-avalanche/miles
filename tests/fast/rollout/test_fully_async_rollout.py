@@ -232,7 +232,7 @@ async def test_missing_reward_group_dropped_without_recycling(monkeypatch):
 
     assert data_source.recycled == []
     assert output.samples[0][0].group_index != 1
-    assert output.metrics["rollout/dynamic_filter/drop_group_has_missing_reward"] == 1
+    assert output.metrics["rollout/dynamic_filter_drop_group_has_missing_reward"] == 1
 
 
 async def test_stale_group_recycled(monkeypatch):
@@ -473,7 +473,7 @@ async def test_dynamic_filter_drops_group_without_recycling(monkeypatch):
     assert output.samples[0][0].group_index != 1
     # Dropped even with handler="retry": filter rejections bypass the unused handler.
     assert data_source.recycled == []
-    assert output.metrics["rollout/dynamic_filter/drop_rejected"] == 1
+    assert output.metrics["rollout/dynamic_filter_drop_rejected"] == 1
 
 
 async def test_sample_filter_marks_samples_without_shrinking_the_batch(monkeypatch):

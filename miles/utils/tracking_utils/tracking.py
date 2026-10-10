@@ -1,9 +1,11 @@
 import logging
+import time
 
 import torch
 
 from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
 from miles.utils.audit_utils.event_logger.models import MetricEvent
+from miles.utils.perf_monitor import start_monitor, stop_monitors
 
 from .base import (
     MilesDashboardBackend,
@@ -34,7 +36,12 @@ _manager = TrackingManager(BACKEND_REGISTRY)
 
 
 def init_tracking(args, primary: bool = True, **kwargs):
+    if primary and getattr(args, "perf_monitor_interval", 0) > 0:
+        # One origin is serialized with args to every worker; wall-clock series
+        # remain aligned even when rollout and trainer start minutes apart.
+        args.perf_monitor_start_ts = time.time()
     _manager.init(args, primary=primary, **kwargs)
+    start_monitor(args, primary=primary, router_addr=kwargs.get("router_addr"))
 
 
 def define_step_key_metric_group(prefix: str, step_key: str) -> None:
@@ -53,4 +60,5 @@ def log(args, metrics, step_key: str):
 
 
 def finish_tracking():
+    stop_monitors()
     _manager.finish()

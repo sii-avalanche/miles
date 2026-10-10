@@ -7,7 +7,7 @@ import { drawChart, drawMultiLine, SERIES_COLORS } from "./charts.js";
 // sidebar idiom); every key of the active category renders as a line chart.
 // "dump" only ever appears for dump-only dirs — the server does not
 // advertise it while a telemetry stream exists.
-const CATEGORY_ORDER = ["rollout", "perf", "train", "eval", "dump"];
+const CATEGORY_ORDER = ["runtime", "rollout", "perf", "moe", "train", "eval", "dump"];
 
 // trainer-side recomputations logged under the rollout/step axis (they share
 // that step key, not because they're rollout-generation metrics) — displayed

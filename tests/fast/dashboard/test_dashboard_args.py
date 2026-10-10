@@ -55,6 +55,18 @@ def test_validate_disabled_checks_nothing():
     validate_dashboard_args(parse([]))  # no dump_details attribute needed
 
 
+def test_telemetry_only_mode_does_not_require_tensor_dumps(caplog):
+    args = full_args(dump_details=None, dashboard_dir="/tmp/telemetry", use_rollout_entropy=False)
+    validate_dashboard_args(args)
+    assert collector_config_from_args(args, start_ts=0).dashboard_dir == "/tmp/telemetry"
+    assert not caplog.records
+
+
+def test_explicit_dashboard_dir_overrides_default_location():
+    args = full_args(dashboard_dir="/tmp/separate-telemetry")
+    assert collector_config_from_args(args, start_ts=0).dashboard_dir == "/tmp/separate-telemetry"
+
+
 def test_collector_config_from_args():
     config = collector_config_from_args(full_args(), start_ts=123.0)
     assert config.dashboard_dir == "/tmp/dump/dashboard"
