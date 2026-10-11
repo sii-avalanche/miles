@@ -188,6 +188,24 @@ class RuntimeMonitor:
                 self._counters["telemetry/events_dropped_total"] += 1
             self._events.append(event)
 
+    def event(self, name: str, *, rollout_id: int | None = None, details: dict | None = None) -> None:
+        """Record an instantaneous telemetry decision using explicit, non-sensitive fields."""
+        if not self.enabled:
+            return
+        stamp = time.time()
+        self._event(
+            dict(
+                kind="phase",
+                role=self.role,
+                name=name,
+                rollout_id=rollout_id,
+                t0=stamp,
+                t1=stamp,
+                status="completed",
+                details=details,
+            )
+        )
+
     def completed_step(self, rollout_id: int, *, started: float) -> None:
         if not self.enabled:
             return

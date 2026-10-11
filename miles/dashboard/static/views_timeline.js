@@ -3,6 +3,7 @@ import { el, fmtNum, setViewCleanup, statBox } from "./app.js";
 import { createCarpet } from "./carpet.js";
 import { createFleet } from "./fleet.js";
 import { extent, hideTooltip, showTooltip } from "./charts.js";
+import { createAsyncFlow, loadAsyncFlow } from "./async_flow.js";
 
 // idle states share a light neutral family (train_wait also gets a hatch
 // texture below — the accessibility channel — so idle doesn't lean on hue
@@ -102,6 +103,9 @@ export async function renderTimeline(view, meta, route) {
   const MAXW = meta.capabilities.max_window_s ?? Infinity;
   let allLanes = []; // full topology lane list (seeds the spaced default selection)
   let fetched = null; // {t0, t1} bounds the loaded phases/gpu/engine data covers
+  const asyncFlow = createAsyncFlow();
+  let flowData = null;
+  let liveMeta = meta;
 
   // T0/T1 come from meta.time_range (an O(1) edge-stamp read server-side),
   // not from scanning fetched data. Keeps the trailing window pinned to the
@@ -157,11 +161,13 @@ export async function renderTimeline(view, meta, route) {
         history.replaceState(null, "", `#/timeline?lanes=${encodeURIComponent(selection)}`);
       }
     }
-    const [phasesRes, gpuRes, processesRes] = await Promise.all([
+    const [phasesRes, gpuRes, processesRes, flowRes] = await Promise.all([
       api("/api/timeline/phases", { t0: f0, t1: f1, lanes: selection }),
       api("/api/timeline/gpu", { t0: f0, t1: f1, max_points: 4000, lanes: selection }),
       api("/api/timeline/gpu_processes", { t0: f0, t1: f1, lanes: selection }),
+      loadAsyncFlow(liveMeta, f0, f1),
     ]);
+    flowData = flowRes;
     engineSeries = overlayMetric
       ? (await api("/api/timeline/engine_series", { metric: overlayMetric, t0: f0, t1: f1, max_points: 4000 }))
           .series
@@ -425,6 +431,7 @@ export async function renderTimeline(view, meta, route) {
   const memMax = () => Math.max(extent(...Object.values(gpu).map((s) => s.mem_mb))[1], 1);
 
   function draw() {
+    if (flowData) asyncFlow.draw(flowData, liveMeta, v0, v1, T0);
     canvas.style.height = `${M_TOP + Math.max(lanes.length, 1) * LANE_H + 8}px`;
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
@@ -631,7 +638,7 @@ export async function renderTimeline(view, meta, route) {
     const t = timeAt(ev.clientX);
     const lines = [`g${lane.index} ${key}  ${showAbsolute ? new Date(t * 1000).toLocaleTimeString() : formatElapsed(t - T0)}`];
     const phase = (phasesByLane.get(key) ?? []).find((p) => p.t0 <= t && t < p.t1);
-    if (phase) lines.push(`phase: ${phase.name}${phase.rank >= 0 ? ` (rank ${phase.rank})` : ""}`);
+    if (phase) lines.push(`phase: ${phase.name === "rollout" ? "collect training batch" : phase.name === "update_weights" ? "train → inference weight sync" : phase.name}${phase.rank >= 0 ? ` (rank ${phase.rank})` : ""}`);
     const series = gpu[key];
     if (series && series.ts.length) {
       let best = 0;
@@ -678,7 +685,8 @@ export async function renderTimeline(view, meta, route) {
             class: "bar",
             style: `width: 12px; background: ${PHASE_COLORS[name] ?? DEFAULT_PHASE_COLOR}`,
           });
-          return el("span", { style: "display: inline-flex; gap: 4px; align-items: center" }, [swatch, name]);
+          return el("span", { style: "display: inline-flex; gap: 4px; align-items: center" }, [swatch,
+            name === "rollout" ? "collect training batch" : name === "update_weights" ? "train → inference weight sync" : name]);
         }),
         ...(overlayMetric
           ? [el("span", { style: `color: ${OVERLAY_COLOR}` }, [`— ${overlayMetric.replace("sglang_", "")}`])]
@@ -746,6 +754,7 @@ export async function renderTimeline(view, meta, route) {
     selRow,
     mfuPanel,
     advisoryPanel,
+    asyncFlow.root,
     carpet.root,
     fleet.root,
     bubbleStrip,
@@ -773,7 +782,8 @@ export async function renderTimeline(view, meta, route) {
       refreshing = true;
       try {
         // fresh global range (cheap edge-stamp read); getMeta() is cached
-        applyRange((await api("/api/meta")).time_range);
+        liveMeta = await api("/api/meta");
+        applyRange(liveMeta.time_range);
         await Promise.all([loadData(), loadAdvisories()]);
         renderAll();
         await refreshOverview();

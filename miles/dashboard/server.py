@@ -98,6 +98,8 @@ def make_app(
             run_name=store.meta.run_name if store.meta else None,
             start_ts=store.meta.start_ts if store.meta else None,
             runtime_interval_s=store.meta.args.get("perf_monitor_interval") if store.meta else None,
+            engine_interval_s=store.meta.args.get("dashboard_sglang_scrape_interval", 5) if store.meta else 5,
+            fully_async=store.meta.args.get("fully_async", False) if store.meta else False,
             wandb_url=_wandb_url(store.meta.args) if store.meta else None,
             data_buffer_length=store.latest_data_buffer_length(),
             time_range=store.time_range(),
@@ -268,8 +270,26 @@ def make_app(
             return _json_safe(series)
 
     @app.get("/api/runtime/events")
-    def runtime_events(limit: int = Query(500, ge=1, le=5000)):
-        return dict(events=[record.to_dict() for record in store.records[Stream.RUNTIME_EVENTS][-limit:]])
+    def runtime_events(limit: int = Query(500, ge=1, le=5000), t0: float | None = None, t1: float | None = None):
+        with _translate_errors():
+            if t0 is not None and t1 is not None and t0 > t1:
+                raise ValueError("t0 must not exceed t1")
+            source = store.records[Stream.RUNTIME_EVENTS]
+            if t0 is not None or t1 is not None:
+                # Resolve twins before filtering: an old open marker must not
+                # reappear as running after its closed twin leaves the window.
+                final = {}
+                for record in source:
+                    key = (record.role, record.rollout_id, record.name, record.t0)
+                    if key not in final or record.t1 is not None:
+                        final[key] = record
+                source = sorted(final.values(), key=lambda record: record.ts)
+            records = [
+                record
+                for record in source
+                if (t1 is None or record.t0 <= t1) and (t0 is None or record.t1 is None or record.t1 >= t0)
+            ]
+            return dict(events=[record.to_dict() for record in records[-limit:]], truncated=len(records) > limit)
 
     @app.get("/api/rollout/{rollout_id}/summary")
     def rollout_summary(rollout_id: int, evaluation: bool = Query(False, alias="eval")):

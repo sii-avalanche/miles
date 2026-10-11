@@ -19,6 +19,7 @@ rollout engines, pausing producer submissions for the duration of the
 import asyncio
 import logging
 import time
+from collections import Counter
 from dataclasses import replace
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
@@ -42,6 +43,7 @@ from miles.rollout.fully_async_data_buffer import (
     add_data_buffer_arguments,
     first_sample,
 )
+from miles.rollout.filter_hub.common_filters import group_weight_version_stats
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
@@ -90,7 +92,13 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._heartbeat: asyncio.Task | None = None
         self._last_heartbeat: float | None = None
         self._workload_targets = dict(workload_targets(self.args))
+        self._published_versions: dict[str | None, int] = {}
         self._monitor.register("", self._perf_snapshot)
+
+    def set_weight_version(self, version: int, trainer_model_id: str | None = None) -> None:
+        self._published_versions[trainer_model_id] = version
+        if self._output is not None:
+            self._output.set_weight_version(version, trainer_model_id=trainer_model_id)
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -103,6 +111,8 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             self._output = buffer_cls(
                 DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
             )
+            for model_id, version in self._published_versions.items():
+                self._output.set_weight_version(version, trainer_model_id=model_id)
             self._worker = asyncio.create_task(self._worker_loop())
             if self._monitor.enabled:
                 self._last_heartbeat = time.monotonic()
@@ -261,6 +271,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         data: list[Group] = []
         do_print = True
         workload_counts: dict[str, int] = {}
+        group_workloads: dict[int, str] = {}
         prefix = "drain" if input.trainer_model_id is None else f"drain/{input.trainer_model_id}"
         self._monitor.update(
             {
@@ -291,6 +302,8 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             data.append(entry.group)
             workload = workload_of(entry.prompt_group[0], args)
             workload_counts[workload] = workload_counts.get(workload, 0) + 1
+            if self._monitor.enabled:
+                group_workloads[id(entry.group)] = workload
             self._monitor.update(
                 {
                     f"{prefix}/collected_groups": len(data),
@@ -317,6 +330,33 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
         if self._sample_filter is not None:
             self._sample_filter(args, data)
+
+        if self._monitor.enabled:
+            versions = Counter()
+            workload_versions: dict[str, Counter] = {}
+            mixed = 0
+            for group in data:
+                stats = group_weight_version_stats(group)
+                version = str(stats.oldest_version) if stats.oldest_version is not None else "unknown"
+                versions[version] += 1
+                workload = group_workloads.get(id(group), workload_of(first_sample(group), args))
+                workload_versions.setdefault(workload, Counter())[version] += 1
+                mixed += int(stats.oldest_version != stats.newest_version)
+            self._monitor.event(
+                "batch_ready",
+                rollout_id=input.rollout_id,
+                details=dict(
+                    current_version=input.weight_version,
+                    trainer_model_id=input.trainer_model_id,
+                    groups=len(data),
+                    versions=dict(versions),
+                    mixed_groups=mixed,
+                    workload_versions={name: dict(counter) for name, counter in workload_versions.items()},
+                    groups_before_batch_filter=sum(workload_counts.values()),
+                    groups_removed_by_batch_filter=max(0, sum(workload_counts.values()) - len(data)),
+                    workload_groups_before_batch_filter=workload_counts,
+                ),
+            )
 
         return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
 

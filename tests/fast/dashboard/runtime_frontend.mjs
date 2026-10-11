@@ -10,9 +10,10 @@ class Element {
     this.attrs = attrs;
     this.children = children;
     this.textContent = "";
+    this.style = {};
     this.context = {
       paths: [], path: [],
-      scale() {}, clearRect() {}, fillText() {}, save() {}, restore() {}, rect() {}, clip() {}, arc() {}, fill() {},
+      scale() {}, clearRect() {}, fillText() {}, fillRect() {}, save() {}, restore() {}, rect() {}, clip() {}, arc() {}, fill() {},
       beginPath() { this.path = []; },
       moveTo(x, y) { this.path.push(["M", x, y]); },
       lineTo(x, y) { this.path.push(["L", x, y]); },
@@ -77,9 +78,15 @@ const mocks = {
 };
 const source = readFileSync(new URL("../../../miles/dashboard/static/views_runtime.js", import.meta.url), "utf8");
 const viewModule = new SourceTextModule(source, { context });
-await viewModule.link(name => new SyntheticModule(Object.keys(mocks[name]), function () {
+const flowModule = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/async_flow.js", import.meta.url), "utf8"), { context });
+mocks["./charts.js"].hideTooltip = () => {};
+mocks["./charts.js"].showTooltip = () => {};
+const linker = name => name === "./async_flow.js" ? flowModule : new SyntheticModule(Object.keys(mocks[name]), function () {
   for (const [key, value] of Object.entries(mocks[name])) this.setExport(key, value);
-}, { context }));
+}, { context });
+await flowModule.link(linker);
+await flowModule.evaluate();
+await viewModule.link(linker);
 await viewModule.evaluate();
 
 const root = new Element("main");

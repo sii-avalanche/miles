@@ -106,6 +106,7 @@ class RuntimeEvent(Record):
     t1: float | None
     status: str
     error_type: str | None = None
+    details: dict | None = None
 
 
 # phase name synthesized per lane for [meta.start_ts, first observed event)

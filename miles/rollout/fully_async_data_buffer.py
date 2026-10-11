@@ -9,10 +9,11 @@ Every group-level decision lives here — what to keep, what to hand to
 
 import asyncio
 import logging
+import threading
 import time
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 
@@ -26,7 +27,7 @@ from miles.rollout.filter_hub.common_filters import (
     group_weight_version_stats,
 )
 from miles.utils.function_registry import load_function
-from miles.utils.perf_monitor import get_monitor, workload_of
+from miles.utils.perf_monitor import get_monitor, workload_of, workload_targets
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,10 @@ class DataBuffer(ABC):
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
         """Report the metrics of one policy since its previous call (its window counters reset here)."""
 
+    def set_weight_version(self, version: int, trainer_model_id: str | None = None) -> None:
+        """Optional telemetry reference; custom buffers need not implement it."""
+        return None
+
 
 # ============================= one policy buffer ==============================
 
@@ -144,6 +149,7 @@ class DefaultDataBuffer(DataBuffer):
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
         self._current_version: int | None = None
+        self._reference_is_published = False
 
         self._metric_gatherer = MetricGatherer()
         self._metric_aborted_groups = 0
@@ -158,14 +164,82 @@ class DefaultDataBuffer(DataBuffer):
         self._monitor = get_monitor(args)
         self._perf_prefix = "buffer" if input.trainer_model_id is None else f"buffer/{input.trainer_model_id}"
         self._enqueued_at = deque()
+        self._queued_version_stats = deque()
+        self._version_counts = Counter()
+        self._mixed_groups = 0
+        self._workload_version_counts = {name: Counter() for name in workload_targets(args)}
+        if getattr(args, "perf_monitor_workload_targets", None) is not None:
+            self._workload_version_counts["other"] = Counter()
+        self._workload_mixed_groups = Counter()
+        self._telemetry_lock = threading.Lock()
+        self._trainer_model_id = input.trainer_model_id
+        for name in ("stale_rejected", "aborted", "missing_reward", "dynamic_rejected", "drop", "retry"):
+            self._monitor.increment(f"{self._perf_prefix}/{name}_groups_total", 0)
         self._monitor.register(self._perf_prefix, self._perf_snapshot)
 
     def _perf_snapshot(self) -> dict[str, float]:
-        return {
-            "queued_groups": len(self._buffer),
+        with self._telemetry_lock:
+            counts = self._version_counts.copy()
+            version = self._current_version
+            mixed = self._mixed_groups
+            workloads = {name: counter.copy() for name, counter in self._workload_version_counts.items()}
+            workload_mixed = self._workload_mixed_groups.copy()
+        metrics = self._version_snapshot(counts, mixed, version)
+        for name, counter in workloads.items():
+            metrics.update(
+                {
+                    f"workload/{name}/{key}": value
+                    for key, value in self._version_snapshot(counter, workload_mixed[name], version).items()
+                }
+            )
+        return metrics
+
+    def _version_snapshot(self, counts: Counter, mixed: int, version: int | None) -> dict[str, float]:
+        queued = sum(counts.values())
+        metrics = {
+            "queued_groups": queued,
             "capacity_groups": self._capacity,
-            "fill_fraction": len(self._buffer) / self._capacity,
+            "fill_fraction": queued / self._capacity,
+            "versions/unknown_groups": counts.get(None, 0),
+            "versions/mixed_groups": mixed,
         }
+        if version is not None:
+            metrics["current_weight_version"] = version
+            metrics.update({f"versions/lag_{lag}_groups": counts.get(version - lag, 0) for lag in range(4)})
+            metrics["versions/older_groups"] = sum(n for v, n in counts.items() if v is not None and v < version - 3)
+            metrics["versions/future_groups"] = sum(n for v, n in counts.items() if v is not None and v > version)
+        return metrics
+
+    def set_weight_version(self, version: int, trainer_model_id: str | None = None) -> None:
+        with self._telemetry_lock:
+            self._current_version = version
+            self._reference_is_published = True
+
+    def _record_rejection(self, entry: DataBufferInput, reason: str, *, reusable: bool) -> None:
+        if not self._monitor.enabled:
+            return
+        stats = group_weight_version_stats(entry.group)
+        action = (
+            "retry" if reusable and getattr(self._args, "async_unused_samples_handler", "drop") == "retry" else "drop"
+        )
+        self._monitor.increment(f"{self._perf_prefix}/{action}_groups_total")
+        workload = workload_of(entry.prompt_group[0], self._args)
+        self._monitor.increment(f"{self._perf_prefix}/workload/{workload}/{reason}_rejected_groups_total")
+        self._monitor.increment(f"{self._perf_prefix}/workload/{workload}/{action}_groups_total")
+        self._monitor.event(
+            "buffer_reject",
+            details=dict(
+                reason=reason,
+                action=action,
+                groups=1,
+                trainer_model_id=self._trainer_model_id,
+                oldest_version=stats.oldest_version,
+                newest_version=stats.newest_version,
+                current_version=self._current_version,
+                queued_groups=len(self._buffer),
+                workload=workload,
+            ),
+        )
 
     async def put(self, input: DataBufferInput) -> None:
         self._monitor.increment(f"{self._perf_prefix}/groups_seen_total")
@@ -181,6 +255,14 @@ class DefaultDataBuffer(DataBuffer):
             self._buffer.append(input)
             if self._monitor.enabled:
                 self._enqueued_at.append(time.monotonic())
+                stats = group_weight_version_stats(input.group)
+                workload = workload_of(input.prompt_group[0], self._args)
+                with self._telemetry_lock:
+                    self._queued_version_stats.append((stats, workload))
+                    self._version_counts[stats.oldest_version] += 1
+                    self._mixed_groups += int(stats.oldest_version != stats.newest_version)
+                    self._workload_version_counts[workload][stats.oldest_version] += 1
+                    self._workload_mixed_groups[workload] += int(stats.oldest_version != stats.newest_version)
             self._monitor.increment(f"{self._perf_prefix}/groups_enqueued_total")
             self._cond.notify_all()
 
@@ -189,6 +271,7 @@ class DefaultDataBuffer(DataBuffer):
         if not output.keep:
             self._metric_aborted_groups += 1
             self._monitor.increment(f"{self._perf_prefix}/aborted_groups_total")
+            self._record_rejection(input, "aborted", reusable=True)
             self._unused_handler_fn(input.prompt_group)
             return False
 
@@ -196,6 +279,7 @@ class DefaultDataBuffer(DataBuffer):
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
             self._monitor.increment(f"{self._perf_prefix}/missing_reward_groups_total")
+            self._record_rejection(input, "missing_reward", reusable=False)
             return False
 
         self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
@@ -203,12 +287,15 @@ class DefaultDataBuffer(DataBuffer):
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
             self._monitor.increment(f"{self._perf_prefix}/dynamic_rejected_groups_total")
+            self._record_rejection(input, "dynamic_filter", reusable=False)
             return False
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
         if current_version is not None:
-            self._current_version = current_version
+            with self._telemetry_lock:
+                if not self._reference_is_published:
+                    self._current_version = current_version
         async with self._cond:
             while True:
                 if not self._buffer:
@@ -220,6 +307,19 @@ class DefaultDataBuffer(DataBuffer):
                     self._monitor.observe(
                         f"{self._perf_prefix}/residence", time.monotonic() - self._enqueued_at.popleft()
                     )
+                    with self._telemetry_lock:
+                        queued_stats, workload = self._queued_version_stats.popleft()
+                        self._version_counts[queued_stats.oldest_version] -= 1
+                        if not self._version_counts[queued_stats.oldest_version]:
+                            del self._version_counts[queued_stats.oldest_version]
+                        self._mixed_groups -= int(queued_stats.oldest_version != queued_stats.newest_version)
+                        counter = self._workload_version_counts[workload]
+                        counter[queued_stats.oldest_version] -= 1
+                        if not counter[queued_stats.oldest_version]:
+                            del counter[queued_stats.oldest_version]
+                        self._workload_mixed_groups[workload] -= int(
+                            queued_stats.oldest_version != queued_stats.newest_version
+                        )
                 self._cond.notify_all()  # wake producers blocked on a full buffer
 
                 version_stats = group_weight_version_stats(entry.group)
@@ -229,6 +329,7 @@ class DefaultDataBuffer(DataBuffer):
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
                         self._metric_stale_groups += 1
                         self._monitor.increment(f"{self._perf_prefix}/stale_rejected_groups_total")
+                        self._record_rejection(entry, "stale", reusable=True)
                         self._unused_handler_fn(entry.prompt_group)
                         continue
                     self._metric_consumed_staleness.append(staleness)
@@ -337,6 +438,9 @@ class DefaultMultiDataBuffer(DataBuffer):
 
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
         return self._inner_of(trainer_model_id).get_metrics(trainer_model_id=trainer_model_id)
+
+    def set_weight_version(self, version: int, trainer_model_id: str | None = None) -> None:
+        self._inner_of(trainer_model_id).set_weight_version(version, trainer_model_id=trainer_model_id)
 
     def _inner_of(self, trainer_model_id: str | None) -> DataBuffer:
         assert trainer_model_id in self._inners, (

@@ -10,7 +10,7 @@ from miles.rollout import fully_async_data_buffer as buffers
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput, DefaultDataBuffer
 from miles.rollout.moe_metrics import expert_load_metrics
 from miles.utils.perf_monitor import RuntimeMonitor
-from miles.utils.types import Sample
+from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
 
 def make_buffer(monkeypatch):
@@ -30,6 +30,86 @@ def make_buffer(monkeypatch):
 def entry(index):
     sample = Sample(index=index, reward=1.0, status=Sample.Status.COMPLETED)
     return DataBufferInput(prompt_group=[sample], group=[sample])
+
+
+def versioned_entry(index, *versions, workload="math"):
+    item = entry(index)
+    item.group[0].weight_versions = [
+        WeightVersionsPerCall(spans=[WeightVersionSpan(version=str(v), abs_start=0, abs_end=1)]) for v in versions
+    ]
+    item.prompt_group[0].metadata = {"source": workload}
+    return item
+
+
+async def test_pool_version_workload_counts_follow_publication_consumption_and_rejection(monkeypatch):
+    buffer, monitor = make_buffer(monkeypatch)
+    buffer._capacity = 10
+    buffer._args.perf_monitor_workload_key = "source"
+    buffer._args.perf_monitor_workload_targets = {"math": 0.5, "code": 0.5}
+    # Configure before constructing the buffer, as a real run does.
+    buffer = DefaultDataBuffer(DataBufferConstructorInput(args=buffer._args, unused_handler_fn=lambda _: None))
+    buffer._capacity = 10
+    buffer.set_weight_version(4)
+    entries = [
+        versioned_entry(0, 4),
+        versioned_entry(1, 3, workload="code"),
+        versioned_entry(2, 2, 4),
+        versioned_entry(3, 1),
+        versioned_entry(4, 0),
+        entry(5),
+    ]
+    for item in entries:
+        await buffer.put(item)
+    values = monitor.snapshot()
+    prefix = "runtime/rollout/buffer/"
+    assert values[prefix + "queued_groups"] == 6
+    assert [values[prefix + f"versions/lag_{lag}_groups"] for lag in range(4)] == [1, 1, 1, 1]
+    assert values[prefix + "versions/older_groups"] == 1
+    assert values[prefix + "versions/unknown_groups"] == 1
+    assert values[prefix + "versions/mixed_groups"] == 1
+    assert values[prefix + "workload/code/versions/lag_1_groups"] == 1
+    assert values[prefix + "workload/other/queued_groups"] == 1
+    assert await buffer.get(current_version=4) is entries[0]
+    buffer.set_weight_version(5)
+    values = monitor.snapshot()
+    assert values[prefix + "current_weight_version"] == 5
+    assert [values[prefix + f"versions/lag_{lag}_groups"] for lag in range(4)] == [0, 0, 1, 1]
+    assert values[prefix + "versions/older_groups"] == 2
+    buffer._args.max_weight_staleness = 1
+    buffer._args.async_unused_samples_handler = "retry"
+    assert await buffer.get(current_version=5) is entries[-1]
+    values = monitor.snapshot()
+    assert values[prefix + "queued_groups"] == 0
+    assert values[prefix + "retry_groups_total"] == 4
+    assert values[prefix + "versions/mixed_groups"] == 0
+    rejects = [e for e in monitor._events if e["name"] == "buffer_reject"]
+    assert len(rejects) == 4
+    assert rejects[0]["details"] == dict(
+        reason="stale",
+        action="retry",
+        groups=1,
+        trainer_model_id=None,
+        oldest_version=3,
+        newest_version=3,
+        current_version=5,
+        queued_groups=4,
+        workload="code",
+    )
+    assert all(e["t0"] == e["t1"] for e in rejects)
+
+
+async def test_rejection_events_distinguish_drop_from_retry(monkeypatch):
+    buffer, monitor = make_buffer(monkeypatch)
+    buffer._args.async_unused_samples_handler = "retry"
+    aborted = entry(0)
+    aborted.group[0].status = Sample.Status.ABORTED
+    missing = entry(1)
+    missing.group[0].reward = None
+    await buffer.put(aborted)
+    await buffer.put(missing)
+    decisions = [e["details"] for e in monitor._events if e["name"] == "buffer_reject"]
+    assert [(d["reason"], d["action"]) for d in decisions] == [("aborted", "retry"), ("missing_reward", "drop")]
+    assert monitor.snapshot()["runtime/rollout/buffer/queued_groups"] == 0
 
 
 async def test_full_buffer_wait_and_cancellation_do_not_change_contents(monkeypatch):
@@ -123,13 +203,20 @@ async def test_fully_async_collection_tracks_workload_targets_without_rescheduli
     monkeypatch.setattr(buffers, "get_monitor", lambda args: monitor)
     fn = make_fn(monkeypatch, args, FakeDataSource(scripted=groups))
     try:
-        output = await fn(RolloutFnTrainInput(rollout_id=0))
+        fn.set_weight_version(3)
+        output = await fn(RolloutFnTrainInput(rollout_id=0, weight_version=3))
         assert len(output.samples) == 2
         values = monitor.snapshot()
         assert values["runtime/rollout/drain/progress_fraction"] == 1
         assert values["runtime/rollout/workload/math/collection_progress_fraction"] == 2
         assert values["runtime/rollout/workload/code/collection_progress_fraction"] == 0
         assert values["runtime/rollout/workload/math/target_fraction"] == 0.5
+        batch = next(e for e in monitor._events if e["name"] == "batch_ready")
+        assert batch["details"]["current_version"] == 3
+        assert batch["details"]["versions"] == {"unknown": 2}
+        assert batch["details"]["workload_versions"] == {"math": {"unknown": 2}}
+        fn.set_weight_version(4)
+        assert monitor.snapshot()["runtime/rollout/buffer/current_weight_version"] == 4
         fn._last_heartbeat = time.monotonic() - 10
         assert monitor.snapshot()["runtime/rollout/event_loop/heartbeat_age_seconds"] >= 10
     finally:

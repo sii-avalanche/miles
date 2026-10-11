@@ -90,6 +90,37 @@ def test_runtime_events_roundtrip_and_api_work_without_sample_dumps(tmp_path):
     assert client.get("/api/runtime/events", params={"limit": 5001}).status_code == 422
 
 
+def test_runtime_event_windows_keep_overlapping_phases_and_decision_details(tmp_path):
+    store = MetricStore(tmp_path / "dashboard")
+    records = [
+        RuntimeEvent(ts=1, role="driver", name="update_weights", rollout_id=1, t0=1, t1=None, status="running"),
+        RuntimeEvent(ts=5, role="driver", name="update_weights", rollout_id=1, t0=1, t1=5, status="completed"),
+        RuntimeEvent(
+            ts=6,
+            role="rollout",
+            name="buffer_reject",
+            rollout_id=None,
+            t0=6,
+            t1=6,
+            status="completed",
+            details={"reason": "stale", "action": "drop", "oldest_version": 2, "current_version": 6},
+        ),
+        RuntimeEvent(ts=9, role="driver", name="train", rollout_id=2, t0=8, t1=9, status="completed"),
+    ]
+    for record in records:
+        store.append(record)
+    store.flush()
+    client = TestClient(make_app(MetricStore.load(tmp_path / "dashboard"), DumpReader(tmp_path)))
+    result = client.get("/api/runtime/events", params={"t0": 4, "t1": 7, "limit": 2}).json()
+    assert result["truncated"] is False
+    assert [e["name"] for e in result["events"]] == ["update_weights", "buffer_reject"]
+    assert result["events"][-1]["details"]["oldest_version"] == 2
+    assert client.get("/api/runtime/events", params={"t0": 4, "t1": 7, "limit": 1}).json()["truncated"] is True
+    later = client.get("/api/runtime/events", params={"t0": 7, "t1": 10}).json()["events"]
+    assert [e["name"] for e in later] == ["train"]
+    assert client.get("/api/runtime/events", params={"t0": 7, "t1": 4}).status_code == 400
+
+
 def test_runtime_monitor_to_tracking_collector_files_and_http(tmp_path, monkeypatch):
     # Real tracking/backend/store/API, with only the Ray transport replaced.
     # No cluster, CUDA, W&B service or database is started for this check.

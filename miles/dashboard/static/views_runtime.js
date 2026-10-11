@@ -1,6 +1,7 @@
 import { api } from "./api.js";
 import { el, setViewCleanup, fmtNum } from "./app.js";
 import { drawMultiLine, drawChart, SERIES_COLORS } from "./charts.js";
+import { createAsyncFlow, loadAsyncFlow, finalEvents } from "./async_flow.js";
 
 const R = "runtime/rollout/";
 const D = "runtime/driver/";
@@ -21,6 +22,8 @@ const PANELS = [
   ["KV usage (fraction)", [[D + "fleet/inference/kv_usage_mean", "Mean"], [D + "fleet/inference/kv_usage_max", "Max"]]],
   ["Mamba state usage (fraction)", [[D + "fleet/inference/mamba_usage_mean", "Mean"], [D + "fleet/inference/mamba_usage_max", "Max"]]],
   ["GPU telemetry coverage (fraction)", [[D + "fleet/train/coverage_fraction", "Trainer"], [D + "fleet/inference/coverage_fraction", "Inference"]]],
+  ["Rejected groups (/s)", [[R + "buffer/stale_rejected_groups_per_s", "Stale"], [R + "buffer/aborted_groups_per_s", "Aborted"], [R + "buffer/missing_reward_groups_per_s", "Missing reward"], [R + "buffer/dynamic_rejected_groups_per_s", "Dynamic filter"]]],
+  ["Rejected data handling (/s)", [[R + "buffer/drop_groups_per_s", "Dropped"], [R + "buffer/retry_groups_per_s", "Prompts recycled"]]],
 ];
 
 const PHASE_COLORS = { wait_rollout: "#a9a9a9", train: "#287fd0", critic_train: "#437aaa", update_weights: "#e69b35", checkpoint: "#8c6baf", eval_dispatch: "#249d87" };
@@ -32,7 +35,7 @@ function legend(specs) {
 
 function stepRows(events) {
   const final = new Map();
-  for (const event of events) {
+  for (const event of finalEvents(events)) {
     if (event.role === "driver" && event.rollout_id !== null) final.set(`${event.rollout_id}/${event.name}/${event.t0}`, event);
   }
   const byStep = new Map();
@@ -61,6 +64,8 @@ function stepRows(events) {
 }
 
 export async function renderRuntime(view, meta) {
+  const asyncFlow = createAsyncFlow();
+  let flowData, flowMeta, flowRange;
   const status = el("p", { class: "muted" });
   const grid = el("div", { style: "display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:12px" });
   const tableBody = el("tbody");
@@ -77,7 +82,7 @@ export async function renderRuntime(view, meta) {
   view.replaceChildren(
     el("h2", {}, ["RL bottlenecks"]), status,
     el("p", { class: "muted" }, ["Runtime charts show the last four hours in elapsed seconds. GPU utilization measures device activity; it is not kernel occupancy or MFU. A failure identifies a stage, not its root cause. Missing telemetry is shown as missing."]),
-    grid,
+    asyncFlow.root, grid,
     el("h3", {}, ["Workload collection and in-flight share"]),
     el("p", { class: "muted" }, ["Collection progress = valid groups / (batch group target × workload target fraction). In-flight group share is a scheduling proxy; it does not measure GPU allocation. Targets describe the desired mix and do not change the scheduler."]),
     workloadGrid,
@@ -115,12 +120,16 @@ export async function renderRuntime(view, meta) {
       const allPanels = [...panels, ...workloadPanels];
       const requested = [...new Set(allPanels.flatMap(p => p.specs.map(([key]) => key)))];
       const t1 = liveMeta.time_range?.[1];
-      const t0 = t1 === undefined ? undefined : t1 - 4 * 3600;
-      const [series, { events }] = await Promise.all([
+      const t0 = t1 === undefined ? undefined : Math.max(liveMeta.start_ts ?? -Infinity, t1 - 4 * 3600);
+      const [series, flow] = await Promise.all([
         api("/api/metrics", { keys: requested.join(","), x: "runtime/time_s", t0, t1 }),
-        api("/api/runtime/events"),
+        loadAsyncFlow(liveMeta, t0, t1),
       ]);
       if (cancelled) return;
+      const events = flow.events;
+      flowData = flow; flowMeta = liveMeta;
+      flowRange = [t0 ?? liveMeta.start_ts ?? 0, t1 ?? 1];
+      asyncFlow.draw(flowData, flowMeta, ...flowRange);
       const withData = Object.values(series).filter(s => s.x?.length);
       const xDomain = withData.length ? [Math.min(...withData.map(s => s.x[0])), Math.max(...withData.map(s => s.x.at(-1)))] : undefined;
       const maxGapSeconds = Math.max(30, 3 * (liveMeta.runtime_interval_s || 10));
@@ -152,5 +161,7 @@ export async function renderRuntime(view, meta) {
   }
   await refresh();
   const interval = meta.mode === "follow" ? setInterval(refresh, 5000) : null;
-  setViewCleanup(() => { cancelled = true; if (interval) clearInterval(interval); });
+  const onResize = () => { if (flowData) asyncFlow.draw(flowData, flowMeta, ...flowRange); };
+  window.addEventListener("resize", onResize);
+  setViewCleanup(() => { cancelled = true; if (interval) clearInterval(interval); window.removeEventListener("resize", onResize); });
 }
