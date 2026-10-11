@@ -73,7 +73,7 @@ function formatElapsed(seconds) {
   return `+${mins}:${pad(secs)}`;
 }
 
-export async function renderTimeline(view, meta, route) {
+export async function renderTimeline(view, meta, route, { embedded = false, registerCleanup = setViewCleanup } = {}) {
   // mutable data state, reloaded on every follow-mode refresh
   let selection = route?.lanes || null; // lane-selection grammar string
   let autoDefault = !selection; // seed the spaced default once topology is known
@@ -103,9 +103,13 @@ export async function renderTimeline(view, meta, route) {
   const MAXW = meta.capabilities.max_window_s ?? Infinity;
   let allLanes = []; // full topology lane list (seeds the spaced default selection)
   let fetched = null; // {t0, t1} bounds the loaded phases/gpu/engine data covers
-  const asyncFlow = createAsyncFlow();
+  const asyncFlow = embedded ? null : createAsyncFlow();
   let flowData = null;
   let liveMeta = meta;
+  const updateSelectionUrl = () => {
+    if (embedded) return;
+    history.replaceState(null, "", selection ? `#/timeline?lanes=${encodeURIComponent(selection)}` : "#/timeline");
+  };
 
   // T0/T1 come from meta.time_range (an O(1) edge-stamp read server-side),
   // not from scanning fetched data. Keeps the trailing window pinned to the
@@ -158,14 +162,14 @@ export async function renderTimeline(view, meta, route) {
           { length: DEFAULT_LANES },
           (_, i) => `g:${allLanes[Math.floor((i * allLanes.length) / DEFAULT_LANES)].index}`,
         ).join(", ");
-        history.replaceState(null, "", `#/timeline?lanes=${encodeURIComponent(selection)}`);
+        updateSelectionUrl();
       }
     }
     const [phasesRes, gpuRes, processesRes, flowRes] = await Promise.all([
       api("/api/timeline/phases", { t0: f0, t1: f1, lanes: selection }),
       api("/api/timeline/gpu", { t0: f0, t1: f1, max_points: 4000, lanes: selection }),
       api("/api/timeline/gpu_processes", { t0: f0, t1: f1, lanes: selection }),
-      loadAsyncFlow(liveMeta, f0, f1),
+      embedded ? null : loadAsyncFlow(liveMeta, f0, f1),
     ]);
     flowData = flowRes;
     engineSeries = overlayMetric
@@ -297,7 +301,7 @@ export async function renderTimeline(view, meta, route) {
 
   async function setSelection(grammar) {
     selection = grammar || null;
-    history.replaceState(null, "", selection ? `#/timeline?lanes=${encodeURIComponent(selection)}` : "#/timeline");
+    updateSelectionUrl();
     selError.textContent = "";
     renderSelection();
     try {
@@ -382,7 +386,7 @@ export async function renderTimeline(view, meta, route) {
   // the overview (carpet or fleet panels) tracks the lane view's zoom window;
   // before any data exists it asks for the (empty) server default
   const carpetRange = () => (haveData ? { t0: v0, t1: v1 } : {});
-  const manyLanes = () => meta.capabilities.use_utilization_overview || allLanes.length > CARPET_MAX_LANES;
+  const manyLanes = () => embedded || meta.capabilities.use_utilization_overview || allLanes.length > CARPET_MAX_LANES;
   async function refreshOverview() {
     carpet.root.style.display = manyLanes() ? "none" : "";
     fleet.root.style.display = manyLanes() ? "" : "none";
@@ -752,10 +756,7 @@ export async function renderTimeline(view, meta, route) {
   view.replaceChildren(
     toolbar,
     selRow,
-    mfuPanel,
-    advisoryPanel,
-    asyncFlow.root,
-    carpet.root,
+    ...(embedded ? [] : [mfuPanel, advisoryPanel, asyncFlow.root, carpet.root]),
     fleet.root,
     bubbleStrip,
     el("div", { class: "panel" }, [canvas]),
@@ -763,7 +764,7 @@ export async function renderTimeline(view, meta, route) {
   );
   renderToolbar();
   applyRange(meta.time_range);
-  await Promise.all([loadData(), loadAdvisories()]);
+  await Promise.all([loadData(), ...(embedded ? [] : [loadAdvisories()])]);
   await refreshOverview(); // topology decides carpet vs fleet panels
   renderAll();
   if (!manyLanes()) carpet.redraw(); // selection markers need the loaded lane list
@@ -784,7 +785,7 @@ export async function renderTimeline(view, meta, route) {
         // fresh global range (cheap edge-stamp read); getMeta() is cached
         liveMeta = await api("/api/meta");
         applyRange(liveMeta.time_range);
-        await Promise.all([loadData(), loadAdvisories()]);
+        await Promise.all([loadData(), ...(embedded ? [] : [loadAdvisories()])]);
         renderAll();
         await refreshOverview();
       } catch {
@@ -794,7 +795,7 @@ export async function renderTimeline(view, meta, route) {
       }
     }, FOLLOW_REDRAW_MS);
   }
-  setViewCleanup(() => {
+  registerCleanup(() => {
     if (intervalId !== null) clearInterval(intervalId);
     clearTimeout(carpetTimer);
     clearTimeout(reloadTimer);

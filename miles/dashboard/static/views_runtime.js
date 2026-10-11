@@ -79,10 +79,10 @@ export async function renderRuntime(view, meta) {
   const workloadGrid = el("div", { style: "display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:12px" });
   const workloadPanels = [];
   let moePanels = [];
-  view.replaceChildren(
-    el("h2", {}, ["RL bottlenecks"]), status,
-    el("p", { class: "muted" }, ["Runtime charts show the last four hours in elapsed seconds. GPU utilization measures device activity; it is not kernel occupancy or MFU. A failure identifies a stage, not its root cause. Missing telemetry is shown as missing."]),
-    asyncFlow.root, grid,
+  const utilizationView = el("div");
+  const extraCharts = el("details", {}, [
+    el("summary", { class: "btn", style: "display:inline-block;margin-bottom:14px" }, ["更多图表"]),
+    grid,
     el("h3", {}, ["Workload collection and in-flight share"]),
     el("p", { class: "muted" }, ["Collection progress = valid groups / (batch group target × workload target fraction). In-flight group share is a scheduling proxy; it does not measure GPU allocation. Targets describe the desired mix and do not change the scheduler."]),
     workloadGrid,
@@ -92,7 +92,14 @@ export async function renderRuntime(view, meta) {
     el("h3", {}, ["Driver step timeline"]),
     el("p", { class: "muted" }, ["Gray: wait for rollout; blue: train; orange: weight sync; purple: checkpoint; green: eval dispatch; red: observed failure. Open intervals do not prove the worker is alive. Async phases in different processes may overlap."]),
     el("table", {}, [el("thead", {}, [el("tr", {}, ["Rollout ID", "Status / observed error", "Wall seconds", "Phases (hover)"].map(x => el("th", {}, [x])))]), tableBody]),
+  ]);
+  extraCharts.ontoggle = () => { if (extraCharts.open) refresh(); };
+  view.replaceChildren(
+    el("h2", {}, ["RL bottlenecks"]), status,
+    el("p", { class: "muted" }, ["Runtime charts show the last four hours in elapsed seconds. GPU utilization measures device activity; it is not kernel occupancy or MFU. A failure identifies a stage, not its root cause. Missing telemetry is shown as missing."]),
+    asyncFlow.root, utilizationView, extraCharts,
   );
+  let utilizationCleanup = null;
   let cancelled = false;
   let refreshing = false;
   async function refresh() {
@@ -160,8 +167,23 @@ export async function renderRuntime(view, meta) {
     }
   }
   await refresh();
+  if (meta.capabilities?.has_timeline) {
+    try {
+      const { renderTimeline } = await import("./views_timeline.js");
+      await renderTimeline(utilizationView, meta, null, {
+        embedded: true, registerCleanup: cleanup => { utilizationCleanup = cleanup; },
+      });
+    } catch (error) {
+      utilizationView.replaceChildren(el("p", { class: "error" }, [String(error)]));
+    }
+  }
   const interval = meta.mode === "follow" ? setInterval(refresh, 5000) : null;
   const onResize = () => { if (flowData) asyncFlow.draw(flowData, flowMeta, ...flowRange); };
   window.addEventListener("resize", onResize);
-  setViewCleanup(() => { cancelled = true; if (interval) clearInterval(interval); window.removeEventListener("resize", onResize); });
+  setViewCleanup(() => {
+    cancelled = true;
+    if (interval) clearInterval(interval);
+    utilizationCleanup?.();
+    window.removeEventListener("resize", onResize);
+  });
 }
