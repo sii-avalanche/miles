@@ -2,6 +2,7 @@ import { api } from "./api.js";
 import { el, setViewCleanup, fmtNum } from "./app.js";
 import { drawMultiLine, drawChart, SERIES_COLORS } from "./charts.js";
 import { createAsyncFlow, loadAsyncFlow, finalEvents } from "./async_flow.js";
+import { createTimeWindow, createTimeBar } from "./time_window.js";
 
 const R = "runtime/rollout/";
 const D = "runtime/driver/";
@@ -33,7 +34,7 @@ function legend(specs) {
     el("span", { style: `margin-right:12px;color:${SERIES_COLORS[i % SERIES_COLORS.length]}` }, [label])));
 }
 
-function stepRows(events) {
+function stepRows(events, range) {
   const final = new Map();
   for (const event of finalEvents(events)) {
     if (event.role === "driver" && event.rollout_id !== null) final.set(`${event.rollout_id}/${event.name}/${event.t0}`, event);
@@ -46,6 +47,7 @@ function stepRows(events) {
   return [...byStep.entries()].sort((a, b) => b[0] - a[0]).map(([step, phases]) => {
     const start = Math.min(...phases.map(p => p.t0));
     const end = Math.max(...phases.map(p => p.t1 ?? Date.now() / 1000));
+    if (end < range.t0 || start > range.t1) return null;
     const failed = phases.find(p => p.status === "failed");
     const cancelledPhase = phases.find(p => p.status === "cancelled");
     const completed = phases.some(p => p.name === "step" && p.status === "completed");
@@ -54,25 +56,31 @@ function stepRows(events) {
     for (const phase of phases) {
       if (!(phase.name in PHASE_COLORS)) continue;
       const duration = (phase.t1 ?? end) - phase.t0;
+      const left = Math.max(phase.t0, range.t0), right = Math.min(phase.t1 ?? end, range.t1);
+      if (right < left) continue;
       bar.append(el("span", {
         title: `${phase.name}: ${duration.toFixed(2)} s; ${phase.status}`,
-        style: `position:absolute;left:${100 * (phase.t0 - start) / Math.max(end - start, 0.01)}%;width:${100 * duration / Math.max(end - start, 0.01)}%;height:100%;background:${phase.status === "failed" ? "#bb3030" : PHASE_COLORS[phase.name]}`,
+        style: `position:absolute;left:${100 * (left - range.t0) / (range.t1 - range.t0)}%;width:${100 * (right - left) / (range.t1 - range.t0)}%;height:100%;background:${phase.status === "failed" ? "#bb3030" : PHASE_COLORS[phase.name]}`,
       }));
     }
     return el("tr", {}, [el("td", {}, [String(step)]), el("td", {}, [state]), el("td", {}, [fmtNum(end - start)]), el("td", {}, [bar])]);
-  });
+  }).filter(Boolean);
 }
 
 export async function renderRuntime(view, meta) {
-  const asyncFlow = createAsyncFlow();
-  let flowData, flowMeta, flowRange;
+  const timeWindow = createTimeWindow({ bounds: meta.time_range, origin: meta.start_ts,
+    maxSpan: Math.min(meta.capabilities?.max_window_s ?? 14400, 14400) });
+  const timeBars = [];
+  const timeBar = label => { const bar = createTimeBar(timeWindow, label); timeBars.push(bar); return bar.root; };
+  const asyncFlow = createAsyncFlow({ timeBar });
+  let flowData, flowMeta, metricSeries = {};
   const status = el("p", { class: "muted" });
   const grid = el("div", { style: "display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:12px" });
   const tableBody = el("tbody");
   const panels = PANELS.map(([title, specs]) => {
     const canvas = el("canvas", { class: "chart" });
     const note = el("p", { class: "muted" }, ["No samples yet"]);
-    grid.append(el("div", { class: "panel" }, [el("h3", {}, [title]), legend(specs), note, canvas]));
+    grid.append(el("div", { class: "panel" }, [el("h3", {}, [title]), legend(specs), note, canvas, timeBar(title)]));
     return { canvas, note, specs };
   });
   const moeGrid = el("div", { style: "display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px" });
@@ -90,30 +98,77 @@ export async function renderRuntime(view, meta) {
     el("p", { class: "muted" }, ["Optional routing replay statistics for the selected training batch, including prompt positions. These are inference-side assignments, not trainer measurements."]),
     moeGrid,
     el("h3", {}, ["Driver step timeline"]),
+    timeBar("Driver step timeline"),
     el("p", { class: "muted" }, ["Gray: wait for rollout; blue: train; orange: weight sync; purple: checkpoint; green: eval dispatch; red: observed failure. Open intervals do not prove the worker is alive. Async phases in different processes may overlap."]),
-    el("table", {}, [el("thead", {}, [el("tr", {}, ["Rollout ID", "Status / observed error", "Wall seconds", "Phases (hover)"].map(x => el("th", {}, [x])))]), tableBody]),
+    el("table", {}, [el("thead", {}, [el("tr", {}, ["Rollout ID", "Status / observed error", "Wall seconds", "Phases (shared time window; hover)"].map(x => el("th", {}, [x])))]), tableBody]),
   ]);
-  extraCharts.ontoggle = () => { if (extraCharts.open) refresh(); };
+  extraCharts.ontoggle = () => { if (extraCharts.open) { drawRuntime(); refresh(); } };
   view.replaceChildren(
-    el("h2", {}, ["RL bottlenecks"]), status,
-    el("p", { class: "muted" }, ["Runtime charts show the last four hours in elapsed seconds. GPU utilization measures device activity; it is not kernel occupancy or MFU. A failure identifies a stage, not its root cause. Missing telemetry is shown as missing."]),
+    el("h2", {}, ["RL Compute"]), status,
+    el("p", { class: "muted" }, ["Drag any time bar to move all time charts together. + / − changes the shared window; the latest four hours are shown initially. GPU utilization measures device activity; it is not kernel occupancy or MFU. Missing telemetry is shown as missing."]),
     asyncFlow.root, utilizationView, extraCharts,
   );
   let utilizationCleanup = null;
   let cancelled = false;
   let refreshing = false;
+  let pendingRefresh = false, refreshTimer = null;
+  function drawRuntime() {
+    if (cancelled || !flowData) return;
+    const range = timeWindow.get();
+    const events = flowData.events.filter(e => e.t0 <= range.t1 && (e.t1 ?? range.t1) >= range.t0);
+    asyncFlow.draw({ ...flowData, events,
+      history: { ...flowData.history, rows: (flowData.history?.rows ?? []).filter(r => r.ts >= range.t0 && r.ts <= range.t1) },
+    }, flowMeta, range.t0, range.t1, range.origin);
+    const maxGapSeconds = Math.max(30, 3 * (flowMeta.runtime_interval_s || 10));
+    for (const { canvas, specs, note } of [...panels, ...workloadPanels]) {
+      const available = specs.filter(([key]) => metricSeries[key]?.x?.length);
+      const stale = available.filter(([key]) => Date.now() / 1000 - (metricSeries[key].ts?.at(-1) ?? 0) > maxGapSeconds);
+      note.textContent = !available.length ? "No samples available for this panel" : stale.length ? `Last samples older than ${maxGapSeconds} s: ${stale.map(([, label]) => label).join(", ")}` : "";
+      canvas._zoom = null;
+      drawMultiLine(canvas, available.map(([key, label]) => ({ label,
+        ts: metricSeries[key].ts ?? metricSeries[key].x.map(t => t + range.origin), value: metricSeries[key].y })), {
+        timeOrigin: range.origin, xDomain: [range.t0, range.t1], maxGapSeconds,
+        colorIndex: label => specs.findIndex(([, name]) => name === label),
+        onXZoom: window => window ? timeWindow.setWindow(...window) : timeWindow.latest(),
+      });
+    }
+    tableBody.replaceChildren(...stepRows(events, range));
+  }
+  function scheduleRefresh() {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refresh, 300);
+  }
+  const unsubscribe = timeWindow.subscribe(() => { drawRuntime(); scheduleRefresh(); });
+  let interval = null;
+  const onResize = drawRuntime;
+  window.addEventListener("resize", onResize);
+  setViewCleanup(() => {
+    cancelled = true;
+    if (interval) clearInterval(interval);
+    clearTimeout(refreshTimer);
+    unsubscribe();
+    for (const bar of timeBars) bar.destroy();
+    utilizationCleanup?.();
+    window.removeEventListener("resize", onResize);
+  });
   async function refresh() {
-    if (cancelled || refreshing) return;
+    if (cancelled) return;
+    if (refreshing) { pendingRefresh = true; return; }
     refreshing = true;
+    let requestedVersion;
     try {
       const liveMeta = await api("/api/meta");
+      if (cancelled) return;
+      timeWindow.updateBounds(liveMeta.time_range);
+      const range = timeWindow.get();
+      requestedVersion = range.version;
       for (const suffix of ["collection_progress_fraction", "in_flight_group_fraction"]) {
         if (workloadPanels.some(p => p.suffix === suffix)) continue;
         const specs = liveMeta.metric_keys.filter(k => k.startsWith(R + "workload/") && k.endsWith("/" + suffix)).map(k => [k, k.split("/").at(-2)]);
         if (!specs.length) continue;
         const canvas = el("canvas", { class: "chart" });
         const note = el("p", { class: "muted" });
-        workloadGrid.append(el("div", { class: "panel" }, [el("h3", {}, [suffix]), legend(specs), note, canvas]));
+        workloadGrid.append(el("div", { class: "panel" }, [el("h3", {}, [suffix]), legend(specs), note, canvas, timeBar(suffix)]));
         workloadPanels.push({ canvas, note, specs, suffix });
       }
       if (!moePanels.length) {
@@ -126,33 +181,18 @@ export async function renderRuntime(view, meta) {
       }
       const allPanels = [...panels, ...workloadPanels];
       const requested = [...new Set(allPanels.flatMap(p => p.specs.map(([key]) => key)))];
-      const t1 = liveMeta.time_range?.[1];
-      const t0 = t1 === undefined ? undefined : Math.max(liveMeta.start_ts ?? -Infinity, t1 - 4 * 3600);
+      const { t0, t1 } = range;
       const [series, flow] = await Promise.all([
         api("/api/metrics", { keys: requested.join(","), x: "runtime/time_s", t0, t1 }),
         loadAsyncFlow(liveMeta, t0, t1),
       ]);
-      if (cancelled) return;
-      const events = flow.events;
+      if (cancelled || requestedVersion !== timeWindow.get().version) return;
       flowData = flow; flowMeta = liveMeta;
-      flowRange = [t0 ?? liveMeta.start_ts ?? 0, t1 ?? 1];
-      asyncFlow.draw(flowData, flowMeta, ...flowRange);
-      const withData = Object.values(series).filter(s => s.x?.length);
-      const xDomain = withData.length ? [Math.min(...withData.map(s => s.x[0])), Math.max(...withData.map(s => s.x.at(-1)))] : undefined;
-      const maxGapSeconds = Math.max(30, 3 * (liveMeta.runtime_interval_s || 10));
-      for (const { canvas, specs, note } of allPanels) {
-        const available = specs.filter(([key]) => series[key]?.x?.length);
-        const stale = available.filter(([key]) => Date.now() / 1000 - (series[key].ts?.at(-1) ?? 0) > maxGapSeconds);
-        note.textContent = !available.length ? "No samples available for this panel" : stale.length ? `Last samples older than ${maxGapSeconds} s: ${stale.map(([, label]) => label).join(", ")}` : "";
-        drawMultiLine(canvas, available.map(([key, label]) => ({ label, ts: series[key].x, value: series[key].y })), {
-          timeOrigin: 0, xDomain, maxGapSeconds,
-          colorIndex: label => specs.findIndex(([, name]) => name === label),
-        });
-      }
+      metricSeries = series;
+      drawRuntime();
       const stamps = Object.values(series).flatMap(s => s.ts ?? []);
       const latest = stamps.reduce((a, b) => Math.max(a, b), 0);
       status.textContent = latest ? `Latest runtime sample: ${Math.max(0, Date.now() / 1000 - latest).toFixed(1)} s ago · ${liveMeta.mode}` : "Runtime monitoring has no samples yet. Enable perf_monitor_interval for the next run.";
-      tableBody.replaceChildren(...stepRows(events));
       if (moePanels.length) {
         const values = await api("/api/metrics", { keys: moePanels.map(p => p.key).join(","), x: "rollout/step" });
         if (!cancelled) for (const { key, canvas } of moePanels) {
@@ -164,26 +204,22 @@ export async function renderRuntime(view, meta) {
       if (!cancelled) status.textContent = String(error);
     } finally {
       refreshing = false;
+      if (!cancelled && (pendingRefresh || (requestedVersion !== undefined && requestedVersion !== timeWindow.get().version))) {
+        pendingRefresh = false; scheduleRefresh();
+      }
     }
   }
   await refresh();
+  if (cancelled) return;
   if (meta.capabilities?.has_timeline) {
     try {
       const { renderTimeline } = await import("./views_timeline.js");
       await renderTimeline(utilizationView, meta, null, {
-        embedded: true, registerCleanup: cleanup => { utilizationCleanup = cleanup; },
+        embedded: true, timeWindow, registerCleanup: cleanup => { utilizationCleanup = cleanup; },
       });
     } catch (error) {
       utilizationView.replaceChildren(el("p", { class: "error" }, [String(error)]));
     }
   }
-  const interval = meta.mode === "follow" ? setInterval(refresh, 5000) : null;
-  const onResize = () => { if (flowData) asyncFlow.draw(flowData, flowMeta, ...flowRange); };
-  window.addEventListener("resize", onResize);
-  setViewCleanup(() => {
-    cancelled = true;
-    if (interval) clearInterval(interval);
-    utilizationCleanup?.();
-    window.removeEventListener("resize", onResize);
-  });
+  if (!cancelled && meta.mode === "follow") interval = setInterval(refresh, 5000);
 }

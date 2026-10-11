@@ -1,6 +1,7 @@
 import { api } from "./api.js";
 import { el, setViewCleanup } from "./app.js";
 import { drawChart, drawMultiLine, SERIES_COLORS } from "./charts.js";
+import { createTimeWindow, createTimeBar } from "./time_window.js";
 
 // wandb-shaped L0: metric names come verbatim from the tracking fan-out, so
 // categories are simply the key prefixes. One category at a time (wandb
@@ -81,6 +82,16 @@ function orderedCategories(meta) {
 }
 
 export async function renderMetrics(view, meta) {
+  const timeWindow = createTimeWindow({ bounds: meta.time_range, origin: meta.start_ts,
+    maxSpan: meta.capabilities?.max_window_s ?? 14400 });
+  const timeBars = [];
+  let refreshTimer = null, intervalId = null;
+  const isTimeAxis = axis => axis === "runtime/time_s" || axis === "time_s";
+  const timeOpts = () => {
+    const { t0, t1, origin } = timeWindow.get();
+    return { timeOrigin: origin, xDomain: [t0, t1],
+      onXZoom: range => range ? timeWindow.setWindow(...range) : timeWindow.latest() };
+  };
   const cats = orderedCategories(meta);
   let active = sessionStorage.getItem("metricsCategory");
   if (!cats.includes(active)) active = cats[0] ?? null;
@@ -139,7 +150,7 @@ export async function renderMetrics(view, meta) {
   // aggregated series carry no dp_rank label; split mode keys by addr+rank
   const seriesLabel = (s) => (s.labels && s.labels.dp_rank !== undefined ? `${s.addr} dp${s.labels.dp_rank}` : s.addr);
   const legendPanel = el("div", { class: "panel", style: "flex: 0 0 240px; min-width: 240px; display: none" });
-  const engineOpts = () => ({ hidden: hiddenEngines, colorIndex: (label) => engines.indexOf(label) });
+  const engineOpts = () => ({ ...timeOpts(), hidden: hiddenEngines, colorIndex: (label) => engines.indexOf(label) });
   const redrawEngineCharts = () => {
     for (const slot of slots.values()) {
       if (slot.lastSeries) drawMultiLine(slot.canvas, slot.lastSeries, engineOpts());
@@ -191,6 +202,8 @@ export async function renderMetrics(view, meta) {
   };
 
   function buildPanels() {
+    for (const bar of timeBars) bar.destroy();
+    timeBars.length = 0;
     slots.clear();
     legendPanel.style.display = active === "sglang" ? "" : "none";
     if (active === "sglang") renderLegend(); // toggle must exist before data arrives
@@ -205,7 +218,10 @@ export async function renderMetrics(view, meta) {
         const status = el("p", { class: "muted" }, ["loading…"]);
         slots.set(key, { canvas, status, signature: null });
         const title = el("p", { class: "chart-title", title: describeMetric(key) }, [key]);
-        return el("div", { class: "panel" }, [title, status, canvas]);
+        const timed = active === "sglang" || isTimeAxis(axisOf(key, meta));
+        const bar = timed ? createTimeBar(timeWindow, key) : null;
+        if (bar) timeBars.push(bar);
+        return el("div", { class: "panel" }, [title, status, canvas, ...(bar ? [bar.root] : [])]);
       }),
     );
     refresh();
@@ -213,11 +229,12 @@ export async function renderMetrics(view, meta) {
 
   function refresh() {
     const current = ++epoch;
+    const { t0, t1, version } = timeWindow.get();
     if (active === "sglang") {
       for (const [key, slot] of slots.entries()) {
-        api("/api/timeline/engine_series", { metric: key, max_points: 1000, per_dp_rank: perDpRank })
+        api("/api/timeline/engine_series", { metric: key, t0, t1, max_points: 1000, per_dp_rank: perDpRank })
           .then(({ series }) => {
-            if (current !== epoch) return;
+            if (current !== epoch || version !== timeWindow.get().version) return;
             const signature = series.map((s) => `${seriesLabel(s)}:${s.ts.length}:${s.ts.at(-1)}`).join("|");
             if (signature === slot.signature) return;
             slot.signature = signature;
@@ -251,10 +268,12 @@ export async function renderMetrics(view, meta) {
       byAxis.get(axis).push(key);
     }
     for (const [axis, keys] of byAxis.entries()) {
-      api("/api/metrics", { keys: keys.join(","), x: axis === "dump" ? "rollout/step" : axis })
+      api("/api/metrics", { keys: keys.join(","), x: axis === "dump" ? "rollout/step" : axis,
+        ...(isTimeAxis(axis) ? { t0, t1 } : {}) })
         .then((series) => {
           if (current !== epoch) return; // category/filter changed meanwhile
           for (const key of keys) {
+            if (isTimeAxis(axis) && version !== timeWindow.get().version) return;
             const slot = slots.get(key);
             if (!slot) continue;
             const s = series[key] ?? { x: [], y: [] };
@@ -262,6 +281,12 @@ export async function renderMetrics(view, meta) {
             if (signature === slot.signature) continue; // unchanged: no repaint
             slot.signature = signature;
             slot.status.remove();
+            if (isTimeAxis(axis)) {
+              slot.lastSeries = [{ label: key, ts: s.ts ?? s.x.map(x => x + timeWindow.get().origin), value: s.y }];
+              slot.canvas._zoom = null;
+              drawMultiLine(slot.canvas, slot.lastSeries, timeOpts());
+              continue;
+            }
             drawChart(
               slot.canvas,
               s.x.map((x, i) => ({ x, y: s.y[i], label: `step ${x}\n${key} = ${s.y[i]}` })),
@@ -297,10 +322,28 @@ export async function renderMetrics(view, meta) {
   renderCategories();
   buildPanels();
 
+  const unsubscribe = timeWindow.subscribe(() => {
+    for (const slot of slots.values()) {
+      if (!slot.lastSeries) continue;
+      slot.canvas._zoom = null;
+      drawMultiLine(slot.canvas, slot.lastSeries, active === "sglang" ? engineOpts() : timeOpts());
+    }
+    for (const slot of slots.values()) slot.signature = null;
+    clearTimeout(refreshTimer); refreshTimer = setTimeout(refresh, 300);
+  });
+
   if (meta.mode === "follow") {
     // refresh is fire-and-forget and idempotent: unchanged charts skip the
     // repaint entirely, so the live page sits still between real updates
-    const intervalId = setInterval(refresh, 5000);
-    setViewCleanup(() => clearInterval(intervalId));
+    intervalId = setInterval(async () => {
+      if (timeBars.length) {
+        try { timeWindow.updateBounds((await api("/api/meta")).time_range); } catch { /* retry next poll */ }
+      }
+      refresh();
+    }, 5000);
   }
+  setViewCleanup(() => {
+    epoch++; clearInterval(intervalId); clearTimeout(refreshTimer);
+    unsubscribe(); for (const bar of timeBars) bar.destroy();
+  });
 }

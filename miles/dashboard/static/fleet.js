@@ -3,7 +3,7 @@ import { el, fmtNum } from "./app.js";
 import { hideTooltip, showTooltip } from "./charts.js";
 
 // margins match views_timeline/carpet so all overview panes share an x domain
-const M_LEFT = 96;
+const M_LEFT = 156;
 const M_RIGHT = 14;
 const X_BUCKETS = 600;
 const PANE_H = 96;
@@ -18,13 +18,20 @@ const ACCENT = "#2f6feb";
 // distribution band (p10-p90 + median + min) across the whole fleet.
 export function createFleet(opts) {
   let data = null;
+  let request = 0;
   const composition = el("canvas", { style: `width: 100%; height: ${PANE_H}px; display: block` });
   const band = el("canvas", { style: `width: 100%; height: ${PANE_H}px; display: block` });
   const header = el("div", { class: "controls" }, [el("span", { class: "muted" }, ["fleet overview"])]);
-  const root = el("div", { class: "panel" }, [header, composition, band]);
+  const root = el("div", { class: "panel" }, [header, composition,
+    ...(opts.timeBar ? [opts.timeBar("Fleet phases")] : []), band,
+    ...(opts.timeBar ? [opts.timeBar("Fleet utilization")] : []),
+  ]);
 
   async function refresh(range = {}) {
-    data = await api("/api/timeline/fleet", { x_buckets: X_BUCKETS, t0: range.t0, t1: range.t1 });
+    const current = ++request;
+    const response = await api("/api/timeline/fleet", { x_buckets: X_BUCKETS, t0: range.t0, t1: range.t1 });
+    if (current !== request) return;
+    data = response;
     header.replaceChildren(
       el("span", { class: "muted" }, [`fleet overview · ${data.lanes} lanes`]),
       el("span", { class: "muted", style: "margin-left: auto" }, [
@@ -46,6 +53,11 @@ export function createFleet(opts) {
 
   function redraw() {
     if (!data) return;
+    const range = opts.viewRange?.() ?? data;
+    for (const canvas of [composition, band]) {
+      canvas.setAttribute("data-time-start", range.t0);
+      canvas.setAttribute("data-time-end", range.t1);
+    }
     drawComposition();
     drawBand();
   }
@@ -61,7 +73,10 @@ export function createFleet(opts) {
       return;
     }
     const plotW = width - M_LEFT - M_RIGHT;
-    const colW = plotW / data.x_buckets;
+    const range = opts.viewRange?.() ?? data;
+    const colW = plotW / data.x_buckets * (data.t1 - data.t0) / Math.max(range.t1 - range.t0, 1e-9);
+    const offset = M_LEFT + (data.t0 - range.t0) / Math.max(range.t1 - range.t0, 1e-9) * plotW;
+    ctx.save(); ctx.beginPath(); ctx.rect(M_LEFT, 0, plotW, height); ctx.clip();
     for (let x = 0; x < data.x_buckets; x++) {
       let y = height;
       for (const name of names) {
@@ -69,10 +84,11 @@ export function createFleet(opts) {
         if (!frac) continue;
         const h = frac * height;
         ctx.fillStyle = opts.phaseColors[name] ?? "#98a1b0";
-        ctx.fillRect(M_LEFT + x * colW, y - h, Math.max(colW, 1), h);
+        ctx.fillRect(offset + x * colW, y - h, Math.max(colW, 1), h);
         y -= h;
       }
     }
+    ctx.restore();
     ctx.fillStyle = MUTED;
     ctx.fillText("phase %", 8, height / 2);
   }
@@ -82,7 +98,9 @@ export function createFleet(opts) {
     ctx.clearRect(0, 0, width, height);
     ctx.font = "11px ui-monospace, monospace";
     const plotW = width - M_LEFT - M_RIGHT;
-    const X = (x) => M_LEFT + ((x + 0.5) / data.x_buckets) * plotW;
+    const range = opts.viewRange?.() ?? data;
+    const scale = plotW / Math.max(range.t1 - range.t0, 1e-9);
+    const X = x => M_LEFT + (data.t0 + (x + 0.5) / data.x_buckets * (data.t1 - data.t0) - range.t0) * scale;
     const Y = (util) => height - (util / 100) * (height - 8) - 2;
 
     ctx.fillStyle = MUTED;
@@ -93,11 +111,12 @@ export function createFleet(opts) {
 
     // p10-p90 band as per-column strips (null-safe without path bookkeeping)
     const { p10, p50, p90, min } = data.band;
-    const colW = plotW / data.x_buckets;
+    const colW = (data.t1 - data.t0) / data.x_buckets * scale;
+    ctx.save(); ctx.beginPath(); ctx.rect(M_LEFT, 0, plotW, height); ctx.clip();
     ctx.fillStyle = BAND_FILL;
     for (let x = 0; x < data.x_buckets; x++) {
       if (p10[x] === null || p90[x] === null) continue;
-      ctx.fillRect(M_LEFT + x * colW, Y(p90[x]), Math.max(colW, 1), Y(p10[x]) - Y(p90[x]) + 1);
+      ctx.fillRect(X(x) - colW / 2, Y(p90[x]), Math.max(colW, 1), Y(p10[x]) - Y(p90[x]) + 1);
     }
     const line = (values, color, dash) => {
       ctx.strokeStyle = color;
@@ -116,11 +135,16 @@ export function createFleet(opts) {
     };
     line(p50, ACCENT, []);
     line(min, BAD, [3, 3]);
+    ctx.restore();
   }
 
   const bucketAt = (canvas, clientX) => {
     const rect = canvas.getBoundingClientRect();
-    const x = Math.floor(((clientX - rect.left - M_LEFT) / (rect.width - M_LEFT - M_RIGHT)) * data.x_buckets);
+    const ratio = (clientX - rect.left - M_LEFT) / (rect.width - M_LEFT - M_RIGHT);
+    if (ratio < 0 || ratio > 1) return null;
+    const range = opts.viewRange?.() ?? data;
+    const time = range.t0 + ratio * (range.t1 - range.t0);
+    const x = Math.floor((time - data.t0) / Math.max(data.t1 - data.t0, 1e-9) * data.x_buckets);
     return x >= 0 && x < data.x_buckets ? x : null;
   };
   composition.onmousemove = (ev) => {
@@ -154,5 +178,5 @@ export function createFleet(opts) {
   composition.onmouseleave = hideTooltip;
   band.onmouseleave = hideTooltip;
 
-  return { root, refresh, redraw };
+  return { root, refresh, redraw, destroy: () => { request++; } };
 }

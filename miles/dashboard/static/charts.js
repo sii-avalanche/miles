@@ -229,7 +229,7 @@ const AXIS_MIN_DRAG = 10;
 // listen on window: a real drag routes events to whatever element is under
 // the pointer, so canvas-local handlers would lose any drag that strays
 // outside the canvas band and never complete the zoom.
-function installDragZoom(canvas, { plotLeft, plotRight, plotTop, plotBottom, invX, invY, redraw, hover, onClick }) {
+function installDragZoom(canvas, { plotLeft, plotRight, plotTop, plotBottom, invX, invY, redraw, hover, onClick, onXZoom }) {
   const pos = (ev) => {
     const rect = canvas.getBoundingClientRect();
     return {
@@ -282,6 +282,7 @@ function installDragZoom(canvas, { plotLeft, plotRight, plotTop, plotBottom, inv
               ? null // x-only sweep: let y re-fit the new window
               : prev.y,
       };
+      if (onXZoom && dx >= AXIS_MIN_DRAG && onXZoom(canvas._zoom.x) !== false) return;
       redraw();
     };
     window.addEventListener("mousemove", onMove);
@@ -290,6 +291,7 @@ function installDragZoom(canvas, { plotLeft, plotRight, plotTop, plotBottom, inv
   canvas.onmouseleave = hideTooltip;
   canvas.ondblclick = () => {
     canvas._zoom = null;
+    if (onXZoom && onXZoom(null) !== false) return;
     redraw();
   };
 }
@@ -346,16 +348,21 @@ export const SERIES_COLORS = [
 // seriesList: [{label, ts: [], value: []}] — one thin line per engine on a
 // shared scale, one color per engine; hover names the engine
 export function drawMultiLine(canvas, seriesList, opts = {}) {
+  if (opts.xDomain) {
+    canvas.setAttribute?.("data-time-start", opts.xDomain[0]);
+    canvas.setAttribute?.("data-time-end", opts.xDomain[1]);
+  }
   const zoom = canvas._zoom ?? null;
   // opts.hidden: legend-unchecked engines render as empty (drop out of the
   // y-scale too); opts.colorIndex(label) pins colors to a page-wide order
   const shown = opts.hidden ? seriesList.map((s) => (opts.hidden.has(s.label) ? { ...s, ts: [], value: [] } : s)) : seriesList;
-  const visible = zoom?.x
+  const visibleRange = zoom?.x ?? opts.xDomain;
+  const visible = visibleRange
     ? shown.map((s) => {
         const ts = [];
         const value = [];
         s.ts.forEach((t, i) => {
-          if (t >= zoom.x[0] && t <= zoom.x[1]) {
+          if (t >= visibleRange[0] && t <= visibleRange[1]) {
             ts.push(t);
             value.push(s.value[i]);
           }
@@ -373,7 +380,7 @@ export function drawMultiLine(canvas, seriesList, opts = {}) {
   ctx.font = "11px ui-monospace, monospace";
 
   const alive = visible.filter((s) => s.ts.length);
-  if (!alive.length && !zoom) {
+  if (!alive.length && !zoom && !opts.xDomain) {
     ctx.fillStyle = colText;
     ctx.fillText("no data", MARGIN.left + plotW / 2 - 20, MARGIN.top + plotH / 2);
     return;
@@ -449,6 +456,7 @@ export function drawMultiLine(canvas, seriesList, opts = {}) {
     invX: (px) => xMin + ((px - MARGIN.left) / plotW) * Math.max(xMax - xMin, 1e-9),
     invY: (py) => yMax - ((py - MARGIN.top) / plotH) * (yMax - yMin),
     redraw: () => drawMultiLine(canvas, seriesList, opts),
+    onXZoom: opts.onXZoom,
     hover,
   });
 }

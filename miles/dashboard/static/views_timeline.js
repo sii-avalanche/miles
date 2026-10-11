@@ -4,6 +4,7 @@ import { createCarpet } from "./carpet.js";
 import { createFleet } from "./fleet.js";
 import { extent, hideTooltip, showTooltip } from "./charts.js";
 import { createAsyncFlow, loadAsyncFlow } from "./async_flow.js";
+import { createTimeBar } from "./time_window.js";
 
 // idle states share a light neutral family (train_wait also gets a hatch
 // texture below — the accessibility channel — so idle doesn't lean on hue
@@ -54,7 +55,7 @@ const QUICK_PICK_K = 8;
 const LANE_H = 66;
 const PHASE_H = 14;
 const UTIL_H = 40;
-const M_LEFT = 96;
+const M_LEFT = 156;
 const M_TOP = 24;
 const M_RIGHT = 14;
 
@@ -73,7 +74,13 @@ function formatElapsed(seconds) {
   return `+${mins}:${pad(secs)}`;
 }
 
-export async function renderTimeline(view, meta, route, { embedded = false, registerCleanup = setViewCleanup } = {}) {
+export async function renderTimeline(view, meta, route, { embedded = false, timeWindow = null, registerCleanup = setViewCleanup } = {}) {
+  let cancelled = false, loadSequence = 0;
+  const timeBars = [];
+  const timeBar = label => {
+    if (!timeWindow) return null;
+    const bar = createTimeBar(timeWindow, label); timeBars.push(bar); return bar.root;
+  };
   // mutable data state, reloaded on every follow-mode refresh
   let selection = route?.lanes || null; // lane-selection grammar string
   let autoDefault = !selection; // seed the spaced default once topology is known
@@ -115,6 +122,12 @@ export async function renderTimeline(view, meta, route, { embedded = false, regi
   // not from scanning fetched data. Keeps the trailing window pinned to the
   // growing run unless the user has panned away.
   function applyRange(range) {
+    if (timeWindow) {
+      timeWindow.updateBounds(range);
+      const state = timeWindow.get();
+      [T0, T1, v0, v1, haveData] = [state.start, state.end, state.t0, state.t1, state.ready];
+      return;
+    }
     if (!range) {
       haveData = false;
       return;
@@ -131,10 +144,12 @@ export async function renderTimeline(view, meta, route, { embedded = false, regi
   }
 
   async function loadData() {
+    const sequence = ++loadSequence;
     const [topology, bubblesRes] = await Promise.all([
       api("/api/timeline/topology"),
       api("/api/timeline/bubbles"),
     ]);
+    if (cancelled || sequence !== loadSequence) return;
     allLanes = topology.lanes;
     windows = topology.windows;
     bubbles = bubblesRes.bubbles;
@@ -151,6 +166,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, regi
     const margin = Math.max(0, Math.min(span / 4, (MAXW - span) / 2));
     const f0 = Math.max(T0, v0 - margin);
     const f1 = Math.min(T1, v1 + margin);
+    const requestedWindow = [v0, v1];
     // first sight of the topology: DEFAULT_LANES evenly spaced across the
     // global index range (8 gpus -> all, 64 -> g0,g8,...,g56) becomes a REAL
     // selection — visible chips the user removes/extends/overwrites, no
@@ -171,11 +187,13 @@ export async function renderTimeline(view, meta, route, { embedded = false, regi
       api("/api/timeline/gpu_processes", { t0: f0, t1: f1, lanes: selection }),
       embedded ? null : loadAsyncFlow(liveMeta, f0, f1),
     ]);
-    flowData = flowRes;
-    engineSeries = overlayMetric
+    const engines = overlayMetric
       ? (await api("/api/timeline/engine_series", { metric: overlayMetric, t0: f0, t1: f1, max_points: 4000 }))
           .series
       : [];
+    if (cancelled || sequence !== loadSequence || requestedWindow[0] !== v0 || requestedWindow[1] !== v1) return;
+    flowData = flowRes;
+    engineSeries = engines;
     fetched = { t0: f0, t1: f1 };
     lanes = allLanes;
     resolvedKeys = null;
@@ -213,7 +231,10 @@ export async function renderTimeline(view, meta, route, { embedded = false, regi
   // pan/zoom past the fetched bounds: debounced windowed reload
   let reloadTimer = null;
   function afterViewChange() {
+    if (cancelled) return;
+    if (timeWindow?.setWindow(v0, v1)) return;
     draw();
+    if (manyLanes()) fleet.redraw();
     syncCarpet();
     if (!fetched || v0 < fetched.t0 - 1e-6 || v1 > fetched.t1 + 1e-6) {
       clearTimeout(reloadTimer);
@@ -377,7 +398,9 @@ export async function renderTimeline(view, meta, route, { embedded = false, regi
       }
     },
   });
-  const fleet = createFleet({ phaseColors: PHASE_COLORS, runStart: () => T0 });
+  const fleet = createFleet({ phaseColors: PHASE_COLORS, runStart: () => T0,
+    ...(timeWindow ? { timeBar, viewRange: () => ({ t0: v0, t1: v1 }) } : {}),
+  });
 
   // above this many lanes the per-rank carpet stops scaling (payload and
   // pixels are both O(lanes)); serve --dashboard-use-utilization-overview forces it
@@ -435,6 +458,8 @@ export async function renderTimeline(view, meta, route, { embedded = false, regi
   const memMax = () => Math.max(extent(...Object.values(gpu).map((s) => s.mem_mb))[1], 1);
 
   function draw() {
+    canvas.setAttribute("data-time-start", v0);
+    canvas.setAttribute("data-time-end", v1);
     if (flowData) asyncFlow.draw(flowData, liveMeta, v0, v1, T0);
     canvas.style.height = `${M_TOP + Math.max(lanes.length, 1) * LANE_H + 8}px`;
     const dpr = window.devicePixelRatio || 1;
@@ -759,24 +784,42 @@ export async function renderTimeline(view, meta, route, { embedded = false, regi
     ...(embedded ? [] : [mfuPanel, advisoryPanel, asyncFlow.root, carpet.root]),
     fleet.root,
     bubbleStrip,
-    el("div", { class: "panel" }, [canvas]),
+    el("div", { class: "panel" }, [canvas, ...(timeWindow ? [timeBar("GPU utilization")] : [])]),
     legendPanel,
   );
   renderToolbar();
   applyRange(meta.time_range);
-  await Promise.all([loadData(), ...(embedded ? [] : [loadAdvisories()])]);
-  await refreshOverview(); // topology decides carpet vs fleet panels
-  renderAll();
-  if (!manyLanes()) carpet.redraw(); // selection markers need the loaded lane list
+  const unsubscribe = timeWindow?.subscribe(state => {
+    [T0, T1, v0, v1, haveData] = [state.start, state.end, state.t0, state.t1, state.ready];
+    afterViewChange();
+  });
+  let intervalId = null;
   const onResize = () => {
+    if (cancelled) return;
     draw();
     manyLanes() ? fleet.redraw() : carpet.redraw();
   };
   window.addEventListener("resize", onResize);
+  registerCleanup(() => {
+    cancelled = true;
+    if (intervalId !== null) clearInterval(intervalId);
+    clearTimeout(carpetTimer);
+    clearTimeout(reloadTimer);
+    unsubscribe?.();
+    for (const bar of timeBars) bar.destroy();
+    carpet.destroy(); fleet.destroy();
+    window.removeEventListener("resize", onResize);
+    window.removeEventListener("mouseup", onMouseUp);
+  });
+  await Promise.all([loadData(), ...(embedded ? [] : [loadAdvisories()])]);
+  if (cancelled) return;
+  await refreshOverview(); // topology decides carpet vs fleet panels
+  if (cancelled) return;
+  renderAll();
+  if (!manyLanes()) carpet.redraw(); // selection markers need the loaded lane list
 
   // ------------------------- follow-mode auto refresh -----------------------
   let refreshing = false;
-  let intervalId = null;
   if (meta.mode === "follow") {
     intervalId = setInterval(async () => {
       if (refreshing) return;
@@ -795,12 +838,4 @@ export async function renderTimeline(view, meta, route, { embedded = false, regi
       }
     }, FOLLOW_REDRAW_MS);
   }
-  registerCleanup(() => {
-    if (intervalId !== null) clearInterval(intervalId);
-    clearTimeout(carpetTimer);
-    clearTimeout(reloadTimer);
-    carpet.destroy();
-    window.removeEventListener("resize", onResize);
-    window.removeEventListener("mouseup", onMouseUp);
-  });
 }

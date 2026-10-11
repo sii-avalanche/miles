@@ -21,6 +21,7 @@ class Element {
     };
   }
   append(...children) { this.children.push(...children); }
+  setAttribute(name, value) { this.attrs[name] = String(value); }
   replaceChildren(...children) { this.children = children; }
   getBoundingClientRect() { return { width: 420, height: 220, left: 0, top: 0 }; }
   getContext() { return this.context; }
@@ -32,7 +33,7 @@ const inference = "runtime/driver/fleet/inference/gpu_util_mean_pct";
 let refresh, cleanup, frame = 0;
 const draws = [], requests = [];
 const context = createContext({
-  Date, URL, console,
+  Date, URL, console, setTimeout, clearTimeout,
   window: { devicePixelRatio: 1, addEventListener() {}, removeEventListener() {} },
   document: { documentElement: {} },
   getComputedStyle: () => ({ getPropertyValue: () => "#888" }),
@@ -80,13 +81,16 @@ const mocks = {
 const source = readFileSync(new URL("../../../miles/dashboard/static/views_runtime.js", import.meta.url), "utf8");
 const viewModule = new SourceTextModule(source, { context });
 const flowModule = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/async_flow.js", import.meta.url), "utf8"), { context });
+const timeModule = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/time_window.js", import.meta.url), "utf8"), { context });
 mocks["./charts.js"].hideTooltip = () => {};
 mocks["./charts.js"].showTooltip = () => {};
-const linker = name => name === "./async_flow.js" ? flowModule : new SyntheticModule(Object.keys(mocks[name]), function () {
+const linker = name => name === "./async_flow.js" ? flowModule : name === "./time_window.js" ? timeModule : new SyntheticModule(Object.keys(mocks[name]), function () {
   for (const [key, value] of Object.entries(mocks[name])) this.setExport(key, value);
 }, { context });
 await flowModule.link(linker);
 await flowModule.evaluate();
+await timeModule.link(linker);
+await timeModule.evaluate();
 await viewModule.link(linker);
 await viewModule.evaluate();
 
@@ -94,7 +98,8 @@ const root = new Element("main");
 await viewModule.namespace.renderRuntime(root, { mode: "follow" });
 const gpu = draws.find(draw => draw.series.some(series => series.label === "Inference"));
 assert.equal(gpu.options.colorIndex("Inference"), 1, "a missing trainer series must not change inference's color");
-assert.equal(gpu.canvas.context.paths.find(path => path.color === charts.namespace.SERIES_COLORS[1]).points[0][1], 52);
+const lastSampleX = gpu.canvas.context.paths.find(path => path.color === charts.namespace.SERIES_COLORS[1]).points[0][1];
+assert.ok(lastSampleX > 400 && lastSampleX < 406, "recent samples keep their wall-time position in the four-hour window");
 assert.equal(requests.find(request => request.path === "/api/metrics").params.t0, now - 14400);
 
 frame = 1;

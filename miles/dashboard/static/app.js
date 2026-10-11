@@ -1,7 +1,6 @@
 import { APP_BASE, getMeta } from "./api.js";
 import { renderMetrics } from "./views_metrics.js";
 import { renderRollout } from "./views_rollout.js";
-import { renderTimeline } from "./views_timeline.js";
 import { renderTokens } from "./views_tokens.js";
 import { renderRuntime } from "./views_runtime.js";
 
@@ -46,7 +45,8 @@ function parseRoute() {
   const params = new URLSearchParams(query || "");
   if (segments[0] === "runtime") return { view: "runtime" };
   if (segments[0] === "timeline") {
-    return { view: "timeline", lanes: params.get("lanes") };
+    history.replaceState(null, "", "#/runtime");
+    return { view: "runtime" };
   }
   if (segments[0] === "rollout" && segments.length >= 2) {
     const evaluation = params.get("eval") === "1";
@@ -79,10 +79,7 @@ function crumbs(route, meta) {
     parts.push(nav("All runs", new URL("../../", APP_BASE).href, false));
   }
   parts.push(nav("Metrics", "#/", route.view === "metrics"));
-  parts.push(nav("RL Bottlenecks", "#/runtime", route.view === "runtime"));
-  if (meta.capabilities.has_timeline) {
-    parts.push(nav("Compute Utilization", "#/timeline", route.view === "timeline"));
-  }
+  parts.push(nav("RL Compute", "#/runtime", route.view === "runtime"));
   // the per-step data view is a top-level destination, not a hidden
   // click-through from chart points; land on the newest usable train step
   if (meta.rollout_ids.train.length) {
@@ -134,7 +131,6 @@ async function render() {
     document.getElementById("runinfo").replaceChildren(...runinfo);
     if (route.view === "metrics") await renderMetrics(view, meta);
     else if (route.view === "runtime") await renderRuntime(view, meta);
-    else if (route.view === "timeline") await renderTimeline(view, meta, route);
     else if (route.view === "rollout") await renderRollout(view, meta, route);
     else await renderTokens(view, meta, route);
   } catch (err) {

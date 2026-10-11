@@ -39,7 +39,7 @@ export function finalEvents(events) {
   return [...latest.values()];
 }
 
-export function createAsyncFlow() {
+export function createAsyncFlow({ timeBar } = {}) {
   const canvas = el("canvas", { class: "timeline" });
   const note = el("p", { class: "muted" });
   const table = el("tbody");
@@ -57,6 +57,7 @@ export function createAsyncFlow() {
   const groupSection = el("div", { class: "group-history" }, [
     el("h3", {}, ["逐组处理记录：过期、过滤与后续训练"]), coverage,
     el("div", { class: "controls" }, [reason, search, identityFilter]),
+    ...(timeBar ? [timeBar("Group history")] : []),
     el("div", { class: "tablewrap" }, [el("table", { class: "data" }, [
       el("thead", {}, [el("tr", {}, ["时间 / 依据", "处理", "Prompt / group / 轮次", "过期累计", "版本", "后续训练", "详情"].map(label => el("th", {}, [label])))]), groupRows,
     ])]),
@@ -105,12 +106,16 @@ export function createAsyncFlow() {
       "V is the last published inference weight version. Hover for wall time, version counts and rejection details.",
     ]), el("div", { class: "legend" }, BUCKETS.map(([, label, color]) =>
       el("span", { style: `color:${color};margin-right:12px` }, [`■ ${label}`]))), note, canvas,
+    ...(timeBar ? [timeBar("Async flow")] : []),
     poolTable, groupSection,
     el("details", {}, [el("summary", {}, ["Batch versions, weight publications and rejected data (latest 100 events)"]),
+      ...(timeBar ? [timeBar("Batch events")] : []),
       el("table", {}, [el("thead", {}, [el("tr", {}, ["Time", "Event / batch", "Details"].map(x => el("th", {}, [x])))]), table])]),
   ]);
 
   function draw(data, meta, t0, t1, origin = meta.start_ts ?? t0) {
+    canvas.setAttribute?.("data-time-start", t0);
+    canvas.setAttribute?.("data-time-end", t1);
     history = data.history ?? { rows: [], counts: {} };
     drawGroups();
     const decisions = new Map(history.rows.filter(row => row.timestamp_kind === "decision" && row.event === "buffer_reject").map(row => [row.ts, row]));
