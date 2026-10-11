@@ -55,7 +55,9 @@ class AvaCoreRollout:
 
     def _init_recording(self) -> None:
         if not hasattr(PostgresRun, "create_rollout_from_data"):
-            raise RuntimeError("Update AvaCore before enabling durable recording: create_rollout_from_data is required")
+            raise RuntimeError(
+                "Update AvaCore before enabling durable recording: create_rollout_from_data is required"
+            )
         recording = self.recording
         self._pool_min = int(recording.get("pool_min_size", 8))
         self._pool_max = int(recording.get("pool_max_size", 64))
