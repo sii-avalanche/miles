@@ -32,7 +32,7 @@ const inference = "runtime/driver/fleet/inference/gpu_util_mean_pct";
 let refresh, cleanup, frame = 0;
 const draws = [], requests = [];
 const context = createContext({
-  Date, console,
+  Date, URL, console,
   window: { devicePixelRatio: 1, addEventListener() {}, removeEventListener() {} },
   document: { documentElement: {} },
   getComputedStyle: () => ({ getPropertyValue: () => "#888" }),
@@ -53,6 +53,7 @@ const api = async (path, params = {}) => {
   if (path === "/api/runtime/events") return { events: [
     { role: "driver", rollout_id: 1, name: "wait_rollout", t0: now - 10, t1: now, status: "cancelled" },
   ] };
+  if (path === "/api/runtime/group_history") return { rows: [], counts: {} };
   assert.equal(path, "/api/metrics");
   return Object.fromEntries(params.keys.split(",").map(key => [key,
     key === inference || key.startsWith(workload)
@@ -61,7 +62,7 @@ const api = async (path, params = {}) => {
   ]));
 };
 const mocks = {
-  "./api.js": { api },
+  "./api.js": { api, APP_BASE: new URL("https://host/runs/abc/") },
   "./app.js": {
     el: (tag, attrs, children) => new Element(tag, attrs, children),
     fmtNum: value => String(value),

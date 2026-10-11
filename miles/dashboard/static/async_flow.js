@@ -1,4 +1,4 @@
-import { api } from "./api.js";
+import { api, APP_BASE } from "./api.js";
 import { el, fmtNum } from "./app.js";
 import { hideTooltip, showTooltip } from "./charts.js";
 
@@ -18,14 +18,15 @@ const LEFT = 156, RIGHT = 14, TOP = 28, ROW = 28;
 
 export async function loadAsyncFlow(meta, t0, t1) {
   const keys = (meta.metric_keys ?? []).filter(k => /^runtime\/rollout\/buffer\//.test(k) || k === "runtime/rollout/telemetry/events_dropped_total");
-  const [eventData, metrics, engineData, phaseData] = await Promise.all([
+  const [eventData, metrics, engineData, phaseData, history] = await Promise.all([
     api("/api/runtime/events", { t0, t1, limit: 5000 }),
     keys.length ? api("/api/metrics", { keys: keys.join(","), x: "runtime/time_s", t0, t1 }) : {},
     meta.capabilities?.has_engine_series
       ? api("/api/timeline/engine_series", { metric: "sglang_num_running_reqs", t0, t1, max_points: 4000 }) : { series: [] },
     meta.capabilities?.has_timeline ? api("/api/timeline/phases", { t0, t1 }) : { phases: [] },
+    api("/api/runtime/group_history", { t0, t1, limit: 5000 }),
   ]);
-  return { ...eventData, metrics, engines: engineData.series, phases: phaseData.phases };
+  return { ...eventData, metrics, engines: engineData.series, phases: phaseData.phases, history };
 }
 
 export function finalEvents(events) {
@@ -43,6 +44,53 @@ export function createAsyncFlow() {
   const note = el("p", { class: "muted" });
   const table = el("tbody");
   const poolSummary = el("tbody");
+  const groupRows = el("tbody");
+  const coverage = el("p", { class: "muted" });
+  const search = el("input", { type: "text", placeholder: "搜索 prompt / query ID / group", oninput: drawGroups });
+  const reason = el("select", { onchange: drawGroups }, [
+    ["stale", "过期重跑"], ["dynamic_filter", "动态过滤"], ["selected", "已选入训练"], ["", "全部事件"],
+  ].map(([value, label]) => el("option", { value }, [label])));
+  const identityFilter = el("select", { onchange: drawGroups }, [
+    el("option", { value: "known" }, ["已识别 prompt"]), el("option", { value: "all" }, ["全部（含身份缺失）"]),
+  ]);
+  let history = { rows: [], counts: {} }, selectedTs = null;
+  const groupSection = el("div", { class: "group-history" }, [
+    el("h3", {}, ["逐组处理记录：过期、过滤与后续训练"]), coverage,
+    el("div", { class: "controls" }, [reason, search, identityFilter]),
+    el("div", { class: "tablewrap" }, [el("table", { class: "data" }, [
+      el("thead", {}, [el("tr", {}, ["时间 / 依据", "处理", "Prompt / group / 轮次", "过期累计", "版本", "后续训练", "详情"].map(label => el("th", {}, [label])))]), groupRows,
+    ])]),
+  ]);
+  const artifactUrl = path => new URL(`analysis/${path}`, APP_BASE).href;
+  function drawGroups() {
+    const query = (search.value || "").toLowerCase();
+    const filter = reason.value ?? "stale";
+    const rows = history.rows.filter(row => (!filter || (filter === "selected" ? row.event === "training_batch_selected" : row.reason === filter)) &&
+      (identityFilter.value === "all" || row.group_index != null) &&
+      `${row.query_id ?? ""} ${row.group_index ?? ""} ${row.prompt_preview ?? ""}`.toLowerCase().includes(query));
+    const counts = history.counts || {};
+    coverage.textContent = `全日志：过期 ${counts.stale ?? 0} 次（已识别 ${counts.identified_stale ?? 0}），动态过滤 ${counts.dynamic_filter ?? 0} 次（已识别 ${counts.identified_dynamic ?? 0} 组）。` +
+      `确认选入 batch ${counts.selected_groups ?? 0} 组。当前时间窗口匹配 ${rows.length} 条，显示最新 ${Math.min(200, rows.length)} 条。过期累计以 group 为单位，统计全日志。` +
+      (history.truncated ? "记录超过返回上限，请缩小时间窗口。" : "") +
+      ` ${history.coverage_note || "旧日志可能缺少身份。"} “后续未记录”不代表没有训练。`;
+    groupRows.replaceChildren(...rows.slice(0, 200).map(row => {
+      const training = row.training || { status: "unknown" };
+      const status = { unknown: "后续未记录", selected: "已选入 batch", training_completed: "训练已完成", training_failed: "训练失败", training_running: "训练开始，完成未记录" }[training.status];
+      const trainingText = status + (training.batch_id != null ? ` · batch ${training.batch_id} · 第 ${training.generation_attempt ?? "?"} 轮` : "") +
+        (training.completed_at ? ` · ${new Date(training.completed_at * 1000).toLocaleString()}` : "");
+      const identity = row.group_index == null ? "身份未记录" : `prompt ${row.query_id ?? "?"} · group ${row.group_index} · 第 ${row.generation_attempt ?? "?"} 轮`;
+      const versions = row.current_version == null ? "未记录" : `${row.oldest_version ?? "?"}…${row.newest_version ?? "?"} / V=${row.current_version}`;
+      return el("tr", { style: row.ts === selectedTs ? "background:#fff3db" : "" }, [
+        el("td", {}, [new Date(row.ts * 1000).toLocaleString(), row.timestamp_kind === "group_completed" ? "（生成完成；过滤时刻未记录）" : ""]),
+        el("td", {}, [row.reason === "stale" ? (row.action === "drop" ? "过期 → 丢弃" : "过期 → 重跑") : row.reason === "dynamic_filter" ? "动态过滤 → 丢弃" : row.event === "training_batch_selected" ? "选入训练" : `${row.reason} → ${row.action}`]),
+        el("td", { title: row.prompt_preview || "", style: "white-space:normal;text-align:left;min-width:230px" }, [identity, el("div", { class: "muted" }, [row.prompt_preview || ""])]),
+        el("td", {}, [row.stale_count_total == null ? "未知" : `${row.stale_count_at_event} → 总计 ${row.stale_count_total} 次`]),
+        el("td", {}, [versions]), el("td", { style: "white-space:normal;min-width:170px" }, [trainingText]),
+        el("td", {}, [row.artifact ? el("a", { href: artifactUrl(row.artifact), target: "_blank", rel: "noopener" }, ["打开 HTML / Trace"]) : "未恢复详情"]),
+      ]);
+    }));
+    if (!rows.length) groupRows.replaceChildren(el("tr", {}, [el("td", { colspan: 7 }, ["当前筛选下没有已记录事件。"])]));
+  }
   const poolTable = el("table", {}, [
     el("thead", {}, [el("tr", {}, ["Pool / workload", "Sample time", "Reference V", "Queued", ...BUCKETS.map(([, label]) => label), "Mixed (subset)"].map(label => el("th", {}, [label])))]),
     poolSummary,
@@ -57,12 +105,15 @@ export function createAsyncFlow() {
       "V is the last published inference weight version. Hover for wall time, version counts and rejection details.",
     ]), el("div", { class: "legend" }, BUCKETS.map(([, label, color]) =>
       el("span", { style: `color:${color};margin-right:12px` }, [`■ ${label}`]))), note, canvas,
-    poolTable,
+    poolTable, groupSection,
     el("details", {}, [el("summary", {}, ["Batch versions, weight publications and rejected data (latest 100 events)"]),
       el("table", {}, [el("thead", {}, [el("tr", {}, ["Time", "Event / batch", "Details"].map(x => el("th", {}, [x])))]), table])]),
   ]);
 
   function draw(data, meta, t0, t1, origin = meta.start_ts ?? t0) {
+    history = data.history ?? { rows: [], counts: {} };
+    drawGroups();
+    const decisions = new Map(history.rows.filter(row => row.timestamp_kind === "decision" && row.event === "buffer_reject").map(row => [row.ts, row]));
     const events = finalEvents(data.events ?? []);
     const phaseEvents = events.filter(e => e.name in PHASES);
     // Old runs with Timer telemetry still expose train / sync intervals, without invented batch IDs.
@@ -95,13 +146,13 @@ export function createAsyncFlow() {
     const X = t => LEFT + (t - t0) / Math.max(t1 - t0, 1) * (rect.width - LEFT - RIGHT);
     const hits = [];
     const summaries = [];
-    const box = (a, b, row, color, text, height = 16, offset = 0) => {
+    const box = (a, b, row, color, text, height = 16, offset = 0, decision = null) => {
       if (b < t0 || a > t1) return;
       const x = X(Math.max(a, t0)), end = X(Math.min(b, t1));
       ctx.fillStyle = color;
       const y = TOP + row * ROW + offset;
       ctx.fillRect(x, y, Math.max(2, end - x), height);
-      hits.push({ x, end: Math.max(x + 3, end), y, height, text });
+      hits.push({ x, end: Math.max(x + 3, end), y, height, text, decision });
     };
     for (let i = 0; i <= 6; i++) {
       const t = t0 + (t1 - t0) * i / 6;
@@ -133,7 +184,9 @@ export function createAsyncFlow() {
         if ((row.label === "Batch ready" && e.name === "batch_ready") ||
             (row.label === "Rejected data" && (e.name === "buffer_reject" ||
               (e.name === "batch_ready" && e.details?.groups_removed_by_batch_filter > 0)))) {
-          box(e.t0, e.t0, index, row.label === "Batch ready" ? "#eda100" : "#e34948", eventText(e));
+          const decision = decisions.get(e.t0);
+          const identityText = decision?.group_index != null ? `\nprompt ${decision.query_id} · group ${decision.group_index} · 第 ${decision.generation_attempt} 轮 · 累计过期 ${decision.stale_count_total} 次\n点击打开 HTML 详情` : "";
+          box(e.t0, e.t0, index, row.label === "Batch ready" ? "#eda100" : "#e34948", eventText(e) + identityText, 16, 0, decision);
         }
       }
     });
@@ -182,6 +235,16 @@ export function createAsyncFlow() {
       hit ? showTooltip(ev.clientX, ev.clientY, hit.text) : hideTooltip();
     };
     canvas.onmouseleave = hideTooltip;
+    canvas.onclick = ev => {
+      const r = canvas.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top;
+      const hit = hits.findLast(h => x >= h.x && x <= h.end && y >= h.y && y <= h.y + h.height);
+      if (!hit?.decision) return;
+      if (hit.decision.artifact) window.open(artifactUrl(hit.decision.artifact), "_blank", "noopener");
+      else {
+        selectedTs = hit.decision.ts; reason.value = hit.decision.reason; search.value = "";
+        drawGroups(); groupSection.scrollIntoView?.({ behavior: "smooth", block: "start" });
+      }
+    };
     poolSummary.replaceChildren(...summaries);
     poolTable.style.display = summaries.length ? "" : "none";
     note.textContent = `${BUCKETS.map(([, label]) => label).join(" · ")} pool buckets. ` +

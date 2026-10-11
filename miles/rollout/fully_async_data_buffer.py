@@ -26,6 +26,7 @@ from miles.rollout.filter_hub.common_filters import (
     group_staleness,
     group_weight_version_stats,
 )
+from miles.rollout.group_identity import group_identity
 from miles.utils.function_registry import load_function
 from miles.utils.perf_monitor import get_monitor, workload_of, workload_targets
 from miles.utils.types import Sample
@@ -229,6 +230,7 @@ class DefaultDataBuffer(DataBuffer):
         self._monitor.event(
             "buffer_reject",
             details=dict(
+                **group_identity(entry.prompt_group),
                 reason=reason,
                 action=action,
                 groups=1,

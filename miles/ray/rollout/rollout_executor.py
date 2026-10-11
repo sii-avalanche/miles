@@ -24,6 +24,7 @@ from miles.rollout.base_types import (
 )
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
+from miles.rollout.group_identity import batch_group_identities
 from miles.rollout.moe_metrics import expert_load_metrics
 from miles.utils import object_store
 from miles.utils.async_utils import maybe_await
@@ -302,6 +303,16 @@ class RolloutExecutor:
                     self.args, generated=generated_data, injected=data, rollout_id=rollout_id
                 )
                 metrics = None
+
+            if self._monitor.enabled:
+                self._monitor.event(
+                    "training_batch_selected",
+                    rollout_id=rollout_id,
+                    details={
+                        "trainer_model_id": trainer_model_id,
+                        "groups": batch_group_identities(data),
+                    },
+                )
 
         return data, metadata, metrics
 

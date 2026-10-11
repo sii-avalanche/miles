@@ -30,6 +30,7 @@ from starlette.routing import get_route_path
 
 from miles.dashboard.advisory import DEFAULT_LOW_MFU, compute_advisories, mfu_summary
 from miles.dashboard.dump_reader import STEP_AGGREGATE_METRICS, DumpReader, DumpStillWriting
+from miles.dashboard.group_history import GroupHistory
 from miles.dashboard.store import MetricStore, Stream
 
 DUMP_METRIC_PREFIX = "dump/"
@@ -83,6 +84,7 @@ def make_app(
     low_mfu: float = DEFAULT_LOW_MFU,
 ) -> FastAPI:
     app = FastAPI(title="miles dashboard", docs_url=None, redoc_url=None)
+    group_history = GroupHistory(reader.dump_dir.parent / "analysis" / "rollout_history")
 
     @app.get("/api/meta")
     def meta():
@@ -290,6 +292,18 @@ def make_app(
                 if (t1 is None or record.t0 <= t1) and (t0 is None or record.t1 is None or record.t1 >= t0)
             ]
             return dict(events=[record.to_dict() for record in records[-limit:]], truncated=len(records) > limit)
+
+    @app.get("/api/runtime/group_history")
+    def runtime_group_history(limit: int = Query(1000, ge=1, le=5000), t0: float | None = None, t1: float | None = None):
+        with _translate_errors():
+            if t0 is not None and t1 is not None and t0 > t1:
+                raise ValueError("t0 must not exceed t1")
+            return group_history.window(store.records[Stream.RUNTIME_EVENTS], t0=t0, t1=t1, limit=limit)
+
+    @app.get("/analysis/{artifact:path}")
+    def analysis_artifact(artifact: str):
+        with _translate_errors():
+            return FileResponse(group_history.artifact_path(artifact), headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/rollout/{rollout_id}/summary")
     def rollout_summary(rollout_id: int, evaluation: bool = Query(False, alias="eval")):

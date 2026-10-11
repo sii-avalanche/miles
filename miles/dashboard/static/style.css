@@ -79,6 +79,7 @@ table.data th.sorted { color: var(--accent); }
 table.data tbody tr:hover { background: var(--bg); cursor: pointer; }
 table.data tr.flagged td { color: var(--bad); }
 .tablewrap { max-height: 480px; overflow: auto; }
+.group-history { margin-top: 18px; }
 
 .tabs { display: flex; gap: 4px; margin-bottom: 10px; }
 /* position: relative makes the box the offsetParent of its tokens, so a token's

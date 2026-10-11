@@ -18,11 +18,12 @@ class Element {
 }
 let tooltip;
 const mocks = {
-  "./api.js": { api: async () => { throw new Error("unexpected API call"); } },
+  "./api.js": { api: async () => { throw new Error("unexpected API call"); }, APP_BASE: new URL("https://host/proxy/runs/abc/") },
   "./app.js": { el: (tag, attrs, children) => new Element(tag, attrs, children), fmtNum: String },
   "./charts.js": { hideTooltip: () => { tooltip = null; }, showTooltip: (x, y, text) => { tooltip = text; } },
 };
-const context = createContext({ Date, window: { devicePixelRatio: 1 } });
+let opened;
+const context = createContext({ Date, URL, window: { devicePixelRatio: 1, open: url => { opened = url; } } });
 const mod = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/async_flow.js", import.meta.url), "utf8"), { context });
 await mod.link(name => new SyntheticModule(Object.keys(mocks[name]), function () {
   for (const [key, value] of Object.entries(mocks[name])) this.setExport(key, value);
@@ -40,6 +41,11 @@ const metrics = Object.fromEntries([
 ].map(([key, values]) => [prefix + "/" + key, metric(values)]));
 const flow = mod.namespace.createAsyncFlow();
 flow.draw({
+  history: { counts: { stale: 2, identified_stale: 2, dynamic_filter: 1, identified_dynamic: 0 },
+    coverage_note: "历史训练仅部分恢复", rows: [{ ts: 62, timestamp_kind: "decision", event: "buffer_reject", reason: "stale", group_index: 7, query_id: "1677", generation_attempt: 1,
+      prompt_preview: "Find the smallest", stale_count_at_event: 1, stale_count_total: 2, artifact: "prompts/group_7_attempt_1.html",
+      training: { status: "training_completed", batch_id: 3, generation_attempt: 3, completed_at: 90 } },
+    { ts: 63, timestamp_kind: "decision", event: "buffer_reject", reason: "dynamic_filter", training: { status: "unknown" } }] },
   metrics, phases: [], truncated: true,
   engines: [{ addr: "http://engine", ts: [10, 20, 80], value: [4, 0, 3] }],
   events: [closed, open, event("collect_batch", 5, 20, { role: "rollout" }), event("update_weights", 50, 60),
@@ -67,7 +73,20 @@ canvas.onmousemove({ clientX: X(15), clientY: rowY("Pool/workload/math") + 12 })
 assert.ok(tooltip.includes("V = 4") && tooltip.includes("V−1: 1") && tooltip.includes("subset): 1"));
 canvas.onmousemove({ clientX: X(62), clientY: rowY("Rejected data") + 5 });
 assert.ok(tooltip.includes("stale → retry") && tooltip.includes("workload math"));
+assert.ok(tooltip.includes("prompt 1677") && tooltip.includes("累计过期 2 次"));
+canvas.onclick({ clientX: X(62), clientY: rowY("Rejected data") + 5 });
+assert.equal(opened, "https://host/proxy/runs/abc/analysis/prompts/group_7_attempt_1.html");
 const text = node => typeof node === "string" ? node : node.textContent + node.children.map(text).join(" ");
 assert.ok(text(flow.root).includes("Event limit reached"));
 assert.ok(text(flow.root).includes('"math":{"3":1,"4":1}'));
+assert.ok(text(flow.root).includes("总计 2 次") && text(flow.root).includes("训练已完成"));
+const section = flow.root.children.find(e => e.attrs?.class === "group-history");
+const controls = section.children.find(e => e.attrs?.class === "controls");
+const select = controls.children[0], search = controls.children[1], identityFilter = controls.children[2];
+identityFilter.value = "all";
+select.value = "dynamic_filter"; select.attrs.onchange();
+assert.ok(text(section).includes("身份未记录") && text(section).includes("后续未记录"));
+assert.ok(!text(section).includes("prompt 1677"));
+select.value = "stale"; search.value = "no matching query"; search.attrs.oninput();
+assert.ok(text(section).includes("当前筛选下没有已记录事件"));
 console.log("Async flow smoke passed: overlapping phases, weight publications, workload versions, rejections and telemetry gaps.");
