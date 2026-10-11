@@ -350,7 +350,7 @@ async def generate_and_rm(
 
             generate_fn = load_generate_function(custom_func_path) if custom_func_path else None
             if state.avacore is not None:
-                generated = await state.avacore.generate(sample, sampling_params)
+                generated = await state.avacore.generate(sample, sampling_params, evaluation=evaluation)
             elif generate_fn is not None:
                 output = await generate_fn(
                     GenerateFnInput(state=state, sample=sample, sampling_params=sampling_params, evaluation=evaluation)

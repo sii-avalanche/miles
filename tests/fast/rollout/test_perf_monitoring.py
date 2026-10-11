@@ -85,6 +85,11 @@ async def test_pool_version_workload_counts_follow_publication_consumption_and_r
     rejects = [e for e in monitor._events if e["name"] == "buffer_reject"]
     assert len(rejects) == 4
     assert rejects[0]["details"] == dict(
+        group_index=None,
+        query_id=None,
+        generation_attempt=1,
+        sample_indices=[1],
+        prompt_preview="",
         reason="stale",
         action="retry",
         groups=1,
@@ -161,28 +166,64 @@ def test_no_expert_assignments_does_not_fabricate_balance():
     assert values["moe/rollout_layer_1/sample_coverage"] == 0
 
 
-async def test_record_timeout_is_counted_and_does_not_fail_rollout(monkeypatch):
+async def test_record_timeout_is_counted_and_retained_until_retry_succeeds(monkeypatch, tmp_path):
     from psycopg_pool import PoolTimeout
 
-    from miles.rollout.avacore_rollout import AvaCoreRollout
+    from miles.rollout import avacore_rollout
+
+    attempted = asyncio.Event()
+    healthy = asyncio.Event()
+    saved = []
 
     class Run:
-        async def create_rollout(self, **kwargs):
-            raise PoolTimeout("pool has no connections")
+        async def create_rollout_from_data(self, **kwargs):
+            attempted.set()
+            if not healthy.is_set():
+                raise PoolTimeout("pool has no connections")
+            saved.append(kwargs)
 
-    adapter = object.__new__(AvaCoreRollout)
-    adapter.args = Namespace(n_samples_per_prompt=16)
+    adapter = object.__new__(avacore_rollout.AvaCoreRollout)
+    adapter.args = Namespace(n_samples_per_prompt=16, prompt_data="toy.jsonl")
+    adapter.recording = {"model": "test", "run": "test", "resume": False, "spool_dir": tmp_path}
     adapter.failed_writes = 0
     adapter._monitor = RuntimeMonitor(args=Namespace(perf_monitor_interval=10), role="rollout", sink=lambda _: None)
+    adapter._record_pool = None
+    adapter._recording_ready = None
+    adapter._init_recording()
+    adapter._outbox._retry_initial = 0.001
+    adapter._outbox._retry_max = 0.005
     adapter.run = asyncio.get_running_loop().create_future()
     adapter.run.set_result(Run())
     sample = Sample(epoch=0, index=0, metadata={"_index": 0})
-    trace = SimpleNamespace(last_assistant=lambda: SimpleNamespace(metadata={"weight_version": 1}))
-    await adapter.record({}, sample, trace, None, {})
-    metrics = adapter._monitor.snapshot()
-    assert adapter.failed_writes == metrics["runtime/rollout/record/pool_timeout_total"] == 1
-    assert metrics["runtime/rollout/record/end_to_end/count_total"] == 1
-    assert "runtime/rollout/record/success_total" not in metrics
+    trace = SimpleNamespace(last_assistant=lambda: SimpleNamespace(metadata={"weight_version": 1}), subtraces=[])
+    monkeypatch.setattr(
+        avacore_rollout,
+        "STORED",
+        SimpleNamespace(unstructure=lambda value: {"messages": []} if value is trace else value),
+    )
+    try:
+        await adapter.record({}, sample, trace, None, {})
+        await asyncio.wait_for(attempted.wait(), timeout=1)
+        metrics = adapter._monitor.snapshot()
+        assert adapter.failed_writes == metrics["runtime/rollout/record/pool_timeout_total"] >= 1
+        assert metrics["runtime/rollout/record/end_to_end/count_total"] == 1
+        assert adapter._outbox.stats()["pending_writes"] == 1
+        assert "runtime/rollout/record/success_total" not in metrics
+        healthy.set()
+        assert await adapter._outbox.flush(timeout=1)
+        assert adapter._monitor.snapshot()["runtime/rollout/record/success_total"] == 1
+        assert len(saved) == 1
+        assert saved[0]["query_id"] == "0"
+        assert saved[0]["trial_id"] == 0
+        sample.reset_for_retry()
+        await adapter.record({}, sample, trace, None, {})
+        assert await adapter._outbox.flush(timeout=1)
+        assert [value["trial_id"] for value in saved] == [0, 16]
+        assert [value["metadata"]["generation_round"] for value in saved] == [0, 1]
+        assert [value["metadata"]["epoch"] for value in saved] == [0, 0]
+    finally:
+        healthy.set()
+        await adapter._outbox.close(timeout=1)
 
 
 async def test_fully_async_collection_tracks_workload_targets_without_rescheduling(monkeypatch):
