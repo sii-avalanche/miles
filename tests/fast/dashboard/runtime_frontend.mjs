@@ -94,6 +94,7 @@ const timeModule = new SourceTextModule(readFileSync(new URL("../../../miles/das
 const statusModule = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/runtime_status.js", import.meta.url), "utf8"), { context });
 mocks["./charts.js"].hideTooltip = () => {};
 mocks["./charts.js"].showTooltip = () => {};
+mocks["./observability.js"] = { grafanaUrl: () => null };
 const linker = name => name === "./runtime_status.js" ? statusModule : name === "./async_flow.js" ? flowModule : name === "./time_window.js" ? timeModule : new SyntheticModule(Object.keys(mocks[name]), function () {
   for (const [key, value] of Object.entries(mocks[name])) this.setExport(key, value);
 }, { context });

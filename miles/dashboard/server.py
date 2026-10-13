@@ -84,6 +84,7 @@ def make_app(
     follow: bool = False,
     use_utilization_overview: bool = False,
     low_mfu: float = DEFAULT_LOW_MFU,
+    observability: dict | None = None,
 ) -> FastAPI:
     app = FastAPI(title="miles dashboard", docs_url=None, redoc_url=None)
     group_history = GroupHistory(reader.dump_dir.parent / "analysis" / "rollout_history")
@@ -118,6 +119,7 @@ def make_app(
             reward_info=judge,
             training_strategy=strategy,
             wandb_url=_wandb_url(store.meta.args) if store.meta else None,
+            observability=observability,
             data_buffer_length=store.latest_data_buffer_length(),
             time_range=store.time_range(),
             rollout_ids=dict(train=ids.train, eval=ids.eval),

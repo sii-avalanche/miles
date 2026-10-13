@@ -4,6 +4,7 @@ import { drawMultiLine, drawChart, SERIES_COLORS } from "./charts.js";
 import { createAsyncFlow, loadAsyncFlow, finalEvents } from "./async_flow.js";
 import { createTimeWindow, createTimeBar } from "./time_window.js";
 import { createRuntimeStatus } from "./runtime_status.js";
+import { grafanaUrl } from "./observability.js";
 
 const R = "runtime/rollout/";
 const D = "runtime/driver/";
@@ -76,6 +77,13 @@ export async function renderRuntime(view, meta) {
   const timeBars = [];
   const timeBar = label => { const bar = createTimeBar(timeWindow, label); timeBars.push(bar); return bar.root; };
   const asyncFlow = createAsyncFlow({ timeBar });
+  asyncFlow.root.id = "execution";
+  const flowHelp = asyncFlow.root.querySelector?.(":scope > p.muted");
+  if (flowHelp) {
+    const help = el("details", { class: "flow-help" }, [el("summary", {}, ["时间线图例与计数口径"])]);
+    flowHelp.before(help);
+    help.append(flowHelp);
+  }
   const runtimeStatus = createRuntimeStatus();
   let flowData, flowMeta, metricSeries = {};
   const status = el("p", { class: "muted" });
@@ -92,8 +100,10 @@ export async function renderRuntime(view, meta) {
   const workloadPanels = [];
   let moePanels = [];
   const utilizationView = el("div");
+  utilizationView.id = "gpu";
+  const grafana = grafanaUrl(meta) ? el("a", { class: "btn grafana-link", href: grafanaUrl(meta, timeWindow.get()), target: "_blank", rel: "noopener" }, ["Grafana · 指标与告警 ↗"]) : null;
   const extraCharts = el("details", {}, [
-    el("summary", { class: "btn", style: "display:inline-block;margin-bottom:14px" }, ["更多图表"]),
+    el("summary", { class: "btn", style: "display:inline-block;margin-bottom:14px" }, ["本地诊断图表"]),
     grid,
     el("h3", {}, ["Workload collection and in-flight share"]),
     el("p", { class: "muted" }, ["Collection progress = valid groups / (batch group target × workload target fraction). In-flight group share is a scheduling proxy; it does not measure GPU allocation. Targets describe the desired mix and do not change the scheduler."]),
@@ -108,8 +118,14 @@ export async function renderRuntime(view, meta) {
   ]);
   extraCharts.ontoggle = () => { if (extraCharts.open) { drawRuntime(); refresh(); } };
   view.replaceChildren(
-    el("h2", {}, ["RL Compute"]), status,
-    el("p", { class: "muted" }, ["Drag any time bar to move all time charts together. + / − changes the shared window; the latest four hours are shown initially. GPU utilization measures device activity; it is not kernel occupancy or MFU. Missing telemetry is shown as missing."]),
+    el("div", { class: "compute-heading" }, [el("div", {}, [el("h2", {}, ["RL Compute"]),
+      el("p", { class: "muted" }, ["生成与训练的时间线、数据去向和权重版本，集中在一个页面。"])]), ...(grafana ? [grafana] : [])]),
+    el("nav", { class: "compute-sections", "aria-label": "RL Compute sections" }, [
+      el("a", { href: "#execution", onclick: event => { event.preventDefault(); asyncFlow.root.scrollIntoView({ behavior: "smooth" }); } }, ["执行时间线 · Batch / Wait / Weight"]),
+      el("a", { href: "#gpu", onclick: event => { event.preventDefault(); utilizationView.scrollIntoView({ behavior: "smooth" }); } }, ["GPU · 利用率与阶段"]),
+      el("a", { href: "#groups", onclick: event => { event.preventDefault(); asyncFlow.root.querySelector(".group-history")?.scrollIntoView({ behavior: "smooth" }); } }, ["数据追踪 · Prompt / Group / Attempt"]),
+    ]), status,
+    el("p", { class: "muted" }, ["所有时间图共享窗口，拖动或缩放会同步更新；点击拒绝事件可追踪 Prompt、重试轮次与后续训练。GPU 利用率表示设备活动，缺失采样保留为空白。"]),
     runtimeStatus.root, asyncFlow.root, utilizationView, extraCharts,
   );
   let utilizationCleanup = null;
@@ -119,6 +135,7 @@ export async function renderRuntime(view, meta) {
   function drawRuntime() {
     if (cancelled || !flowData) return;
     const range = timeWindow.get();
+    if (grafana) grafana.href = grafanaUrl(flowMeta || meta, range);
     const events = flowData.events.filter(e => e.t0 <= range.t1 && (e.t1 ?? range.t1) >= range.t0);
     asyncFlow.draw({ ...flowData, events,
       history: { ...flowData.history, rows: (flowData.history?.rows ?? []).filter(r => r.ts >= range.t0 && r.ts <= range.t1) },

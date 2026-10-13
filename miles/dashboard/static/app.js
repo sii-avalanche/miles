@@ -3,6 +3,7 @@ import { renderMetrics } from "./views_metrics.js";
 import { renderRollout } from "./views_rollout.js";
 import { renderTokens } from "./views_tokens.js";
 import { renderRuntime } from "./views_runtime.js";
+import { grafanaUrl } from "./observability.js";
 
 // tiny DOM builder: el("div", {class: "x", onclick: fn}, [children|strings])
 export function el(tag, attrs = {}, children = []) {
@@ -43,7 +44,7 @@ function parseRoute() {
   const [path, query] = (location.hash.slice(1) || "/").split("?");
   const segments = path.split("/").filter(Boolean);
   const params = new URLSearchParams(query || "");
-  if (segments[0] === "runtime") return { view: "runtime" };
+  if (!segments.length || segments[0] === "runtime") return { view: "runtime" };
   if (segments[0] === "timeline") {
     history.replaceState(null, "", "#/runtime");
     return { view: "runtime" };
@@ -78,8 +79,9 @@ function crumbs(route, meta) {
   if (/\/runs\/[a-f0-9]+\/$/.test(APP_BASE.pathname)) {
     parts.push(nav("All runs", new URL("../../", APP_BASE).href, false));
   }
-  parts.push(nav("Metrics", "#/", route.view === "metrics"));
-  parts.push(nav("RL Compute", "#/runtime", route.view === "runtime"));
+  parts.push(nav("RL Compute", "#/", route.view === "runtime"));
+  if (!grafanaUrl(meta)) parts.push(nav("Metrics", "#/metrics", route.view === "metrics"));
+  else parts.push(el("a", { class: "nav", href: grafanaUrl(meta), target: "_blank", rel: "noopener" }, ["Grafana ↗"]));
   // the per-step data view is a top-level destination, not a hidden
   // click-through from chart points; land on the newest usable train step
   if (meta.rollout_ids.train.length) {

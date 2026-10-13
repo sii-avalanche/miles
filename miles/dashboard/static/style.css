@@ -25,6 +25,13 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--
 a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--accent-light); }
 .muted { color: var(--muted); }
+.compute-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+.compute-heading h2 { margin: 8px 0; }
+.compute-heading p { margin: 0 0 14px; }
+.grafana-link { background: var(--panel); padding: 9px 14px; }
+.compute-sections { display: flex; gap: 16px; flex-wrap: wrap; padding: 10px 0; margin-bottom: 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+#execution, #gpu, .group-history { scroll-margin-top: 65px; }
+@media (max-width: 800px) { #topbar { flex-wrap: wrap; gap: 6px; } #crumbs a.nav { padding: 0 10px; } #runinfo { width: 100%; padding-bottom: 8px; } }
 
 #topbar {
   display: flex; align-items: stretch; gap: 22px; padding: 0 18px;
