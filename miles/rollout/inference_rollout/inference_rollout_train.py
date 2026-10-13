@@ -29,25 +29,40 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
     assert not state.aborted
     state.aborted = True
 
-    urls = await get_worker_urls(args)
-    logger.info(f"Abort request for {urls}")
-    results = await asyncio.gather(
-        *[post(f"{url}/abort_request", {"abort_all": True}) for url in urls], return_exceptions=True
-    )
-    for url, result in zip(urls, results, strict=True):
-        if isinstance(result, Exception):
-            logger.warning(f"Failed to abort worker at {url}: {result}")
+    if not args.partial_rollout:
+        # Discarded groups must stop their generation, reward queues, HTTP waits and retries.
+        # Do this before contacting SGLang so a slow abort endpoint cannot keep judges running.
+        logger.info("Cancelling %d unused rollout groups, including pending reward requests", len(pendings))
+        for task in pendings:
+            if not task.done() and not task.cancelling():
+                task.cancel()
 
-    # Let the agent integration tear down its in-flight trials so they stop hitting
-    # SGLang, instead of running on until their own max_seq_len / timeout.
-    await call_agent_abort_hook(args)
+    try:
+        urls = await get_worker_urls(args)
+        logger.info(f"Abort request for {urls}")
+        results = await asyncio.gather(
+            *[post(f"{url}/abort_request", {"abort_all": True}) for url in urls], return_exceptions=True
+        )
+        for url, result in zip(urls, results, strict=True):
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to abort worker at {url}: {result}")
 
-    # make sure all the pending tasks are finished
+        # Let the agent integration tear down its own backend requests as well.
+        await call_agent_abort_hook(args)
+    finally:
+        if not args.partial_rollout:
+            # Join cancellation cleanup, including shielded disk captures, even if discovery fails.
+            results = await asyncio.gather(*pendings, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("Unused rollout group failed during abort cleanup: %r", result)
+
+    if not args.partial_rollout:
+        return []
+
+    # Partial rollout needs the groups' returned samples for continuation.
     aborted_samples = []
     async for group in as_completed_async(pendings):
-        if not args.partial_rollout:
-            continue
-
         # for partial rollout, collect the partial samples into the data buffer
         for sample in group:
             if sample.response and "start_rollout_id" not in sample.metadata:
