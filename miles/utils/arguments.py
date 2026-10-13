@@ -579,6 +579,14 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--chunked-lm-head-size",
+                type=int,
+                default=0,
+                help="Experimental FP32 LM-head projection chunks; 0 keeps the logits path. "
+                "Requires Megatron output_processor, untied bias-free FP32 head, PP=CP=1, "
+                "packed THD, no entropy/MTP/LoRA or sampling support replay.",
+            )
+            parser.add_argument(
                 "--indep-dp",
                 action="store_true",
                 default=False,
@@ -4069,6 +4077,11 @@ def miles_validate_args(args):
         raise ValueError("--mini-ft-controller-enable requires --api-server-port to be set (non-zero)")
 
     _validate_deploy_component(args)
+
+    if getattr(args, "chunked_lm_head_size", 0):
+        from miles.backends.megatron_utils.chunked_lm_head import chunked_head_kwargs
+
+        chunked_head_kwargs(args)
 
 
 def validate_skip_actor_forward_only(args) -> None:

@@ -231,6 +231,25 @@ def get_log_probs_and_entropy(
         a list of `[R]` tensors.
     """
     assert non_loss_data
+    if getattr(args, "chunked_lm_head_size", 0):
+        if with_entropy or rollout_sampling_mask is not None:
+            raise ValueError("Chunked LM head does not support entropy or sampling support replay")
+        if logits.ndim != 3 or logits.shape[0] != 1 or logits.shape[-1] != 1:
+            raise ValueError("Chunked LM head requires precomputed sampled logprobs [1, T, 1]")
+        # Projection already applied temperature and normalization; retain response slicing.
+        return {
+            "log_probs": [
+                part.squeeze(-1)
+                for part, _ in get_responses(
+                    logits,
+                    args=args,
+                    unconcat_tokens=unconcat_tokens,
+                    total_lengths=total_lengths,
+                    response_lengths=response_lengths,
+                    max_seq_lens=max_seq_lens,
+                )
+            ]
+        }
     if rollout_sampling_mask is not None:
         for sample_index, (sampling_mask, response_length) in enumerate(
             zip(rollout_sampling_mask, response_lengths, strict=True)

@@ -25,6 +25,7 @@ from megatron.core.utils import get_model_config
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
+from miles.backends.megatron_utils.chunked_lm_head import chunked_head_kwargs
 from miles.backends.megatron_utils.ft.indep_dp import allreduce_grads_and_losses_across_replicas
 from miles.backends.megatron_utils.local_weight_checksum import dump_local_weight_checksums
 from miles.backends.megatron_utils.optimizer_state_reset import reset_optimizer_states
@@ -367,6 +368,7 @@ def forward_only(
             loss_mask=batch["input_loss_masks"],
             **(filter_keys(batch, ["witness_ids"]) if args.enable_witness else {}),
             **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
+            **chunked_head_kwargs(args),
             fp32_output=fp32_output,
         )
 
@@ -506,6 +508,8 @@ def run_forward_backward_pass(
             m.stage = "replay_forward"
 
         if return_schedule_plan:
+            if getattr(args, "chunked_lm_head_size", 0):
+                raise ValueError("Chunked LM head does not support combined pipeline schedules")
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             assert not args.enable_witness, "Witness is not supported with combined 1f1b (build_schedule_plan)"
             output_tensor = model.build_schedule_plan(
@@ -532,6 +536,7 @@ def run_forward_backward_pass(
             if (x := batch["multimodal_train_inputs"]) is not None:
                 forward_kwargs.update(x)
 
+            forward_kwargs.update(chunked_head_kwargs(args))
             output_tensor = model(
                 **forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
             )
