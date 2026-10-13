@@ -3,6 +3,7 @@ import { el, setViewCleanup, fmtNum } from "./app.js";
 import { drawMultiLine, drawChart, SERIES_COLORS } from "./charts.js";
 import { createAsyncFlow, loadAsyncFlow, finalEvents } from "./async_flow.js";
 import { createTimeWindow, createTimeBar } from "./time_window.js";
+import { createRuntimeStatus } from "./runtime_status.js";
 
 const R = "runtime/rollout/";
 const D = "runtime/driver/";
@@ -12,6 +13,8 @@ const PANELS = [
   ["Waiting seconds per wall second", [[D + "phase/wait_rollout/seconds_per_s", "Driver waiting for rollout"], [R + "buffer/full_wait/seconds_per_s", "Producer blocked on full buffer"], [R + "buffer/empty_wait/seconds_per_s", "Consumer waiting for a group"]]],
   ["Group rates (/s)", [[R + "producer/groups_completed_per_s", "Generated"], [R + "buffer/groups_consumed_per_s", "Selected"], [R + "buffer/dynamic_rejected_groups_per_s", "Dynamic rejects"], [R + "buffer/stale_rejected_groups_per_s", "Stale rejects"]]],
   ["Production and long tail", [[R + "producer/in_flight_groups", "Active groups"], [R + "producer/completed_pending_groups", "Completed tasks awaiting collection"]]],
+  ["Generation / reward stages (samples)", [[R + "sample/generate/waiting", "Generating"], [R + "sample/reward/waiting", "Reward (includes queue and retries)"]]],
+  ["Generation / reward longest wait (s)", [[R + "sample/generate/oldest_wait_seconds", "Generating"], [R + "sample/reward/oldest_wait_seconds", "Reward (includes queue and retries)"]]],
   ["Oldest group / event loop delay (s)", [[R + "producer/oldest_in_flight_seconds", "Oldest in-flight group"], [R + "event_loop/lag_seconds", "Event loop lag"], [R + "event_loop/heartbeat_age_seconds", "Seconds since loop heartbeat"]]],
   ["Database backlog", [[R + "record/pending_writes", "Pending writes"], [R + "record/pool/requests_waiting", "Waiting for connection"], [R + "record/pool/pool_available", "Available connections"]]],
   ["Database results (/s)", [[R + "record/success_per_s", "Success"], [R + "record/pool_timeout_per_s", "PoolTimeout"], [R + "record/other_errors_per_s", "Other errors"], [R + "record/pool/connections_errors_per_s", "Connection establishment errors"]]],
@@ -73,6 +76,7 @@ export async function renderRuntime(view, meta) {
   const timeBars = [];
   const timeBar = label => { const bar = createTimeBar(timeWindow, label); timeBars.push(bar); return bar.root; };
   const asyncFlow = createAsyncFlow({ timeBar });
+  const runtimeStatus = createRuntimeStatus();
   let flowData, flowMeta, metricSeries = {};
   const status = el("p", { class: "muted" });
   const grid = el("div", { style: "display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:12px" });
@@ -106,7 +110,7 @@ export async function renderRuntime(view, meta) {
   view.replaceChildren(
     el("h2", {}, ["RL Compute"]), status,
     el("p", { class: "muted" }, ["Drag any time bar to move all time charts together. + / − changes the shared window; the latest four hours are shown initially. GPU utilization measures device activity; it is not kernel occupancy or MFU. Missing telemetry is shown as missing."]),
-    asyncFlow.root, utilizationView, extraCharts,
+    runtimeStatus.root, asyncFlow.root, utilizationView, extraCharts,
   );
   let utilizationCleanup = null;
   let cancelled = false;
@@ -182,12 +186,14 @@ export async function renderRuntime(view, meta) {
       const allPanels = [...panels, ...workloadPanels];
       const requested = [...new Set(allPanels.flatMap(p => p.specs.map(([key]) => key)))];
       const { t0, t1 } = range;
-      const [series, flow] = await Promise.all([
+      const [series, flow, currentStatus] = await Promise.all([
         api("/api/metrics", { keys: requested.join(","), x: "runtime/time_s", t0, t1 }),
         loadAsyncFlow(liveMeta, t0, t1),
+        api("/api/runtime/status").catch(() => null),
       ]);
       if (cancelled || requestedVersion !== timeWindow.get().version) return;
       flowData = flow; flowMeta = liveMeta;
+      runtimeStatus.update(currentStatus);
       metricSeries = series;
       drawRuntime();
       const stamps = Object.values(series).flatMap(s => s.ts ?? []);
@@ -201,7 +207,7 @@ export async function renderRuntime(view, meta) {
         }
       }
     } catch (error) {
-      if (!cancelled) status.textContent = String(error);
+      if (!cancelled) { status.textContent = String(error); runtimeStatus.update(null); }
     } finally {
       refreshing = false;
       if (!cancelled && (pendingRefresh || (requestedVersion !== undefined && requestedVersion !== timeWindow.get().version))) {

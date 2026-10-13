@@ -25,9 +25,13 @@ const mocks = {
 let opened;
 const context = createContext({ Date, URL, window: { devicePixelRatio: 1, open: url => { opened = url; } } });
 const mod = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/async_flow.js", import.meta.url), "utf8"), { context });
-await mod.link(name => new SyntheticModule(Object.keys(mocks[name]), function () {
+const stages = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/runtime_status.js", import.meta.url), "utf8"), { context });
+const linker = name => name === "./runtime_status.js" ? stages : new SyntheticModule(Object.keys(mocks[name]), function () {
   for (const [key, value] of Object.entries(mocks[name])) this.setExport(key, value);
-}, { context }));
+}, { context });
+await stages.link(linker);
+await stages.evaluate();
+await mod.link(linker);
 await mod.evaluate();
 const event = (name, t0, t1, extra = {}) => ({ role: "driver", rollout_id: 2, name, t0, t1, status: t1 === null ? "running" : "completed", ...extra });
 const closed = event("train", 10, 50), open = event("train", 10, null);
@@ -40,6 +44,8 @@ const metrics = Object.fromEntries([
   ["versions/unknown_groups", [0, 0, 0]], ["versions/mixed_groups", [1, 0, 0]],
 ].map(([key, values]) => [prefix + "/" + key, metric(values)]));
 const flow = mod.namespace.createAsyncFlow();
+metrics["runtime/rollout/sample/reward/waiting"] = metric([4, 0, 3]);
+metrics["runtime/rollout/sample/reward/oldest_wait_seconds"] = metric([60, 0, 100]);
 flow.draw({
   history: { counts: { stale: 2, identified_stale: 2, dynamic_filter: 1, identified_dynamic: 0 },
     coverage_note: "历史训练仅部分恢复", rows: [{ ts: 62, timestamp_kind: "decision", event: "buffer_reject", reason: "stale", group_index: 7, query_id: "1677", generation_attempt: 1,
@@ -53,7 +59,7 @@ flow.draw({
     event("batch_ready", 20, 20, { role: "rollout", details: { current_version: 4, groups: 2, versions: { 3: 1, 4: 1 }, workload_versions: { math: { 3: 1, 4: 1 } }, mixed_groups: 1 } }),
     event("buffer_reject", 62, 62, { role: "rollout", rollout_id: null, details: { reason: "stale", action: "retry", workload: "math", groups: 1, oldest_version: 1, newest_version: 1, current_version: 5, queued_groups: 2 } }),
   ],
-}, { start_ts: 0, time_range: [0, 100], engine_interval_s: 5, runtime_interval_s: 10 }, 0, 100);
+}, { start_ts: 0, time_range: [0, 100], engine_interval_s: 5, runtime_interval_s: 10, reward_info: { kind: "lmaaj" } }, 0, 100);
 const canvas = flow.root.children.find(e => e.tag === "canvas");
 const X = t => 156 + t / 100 * 830;
 const engineBoxes = canvas.context.boxes.filter(b => b.y === 28);
@@ -65,6 +71,16 @@ const labels = canvas.context.labels.map(l => l.text);
 assert.ok(labels.includes("Pool/workload/math"));
 assert.ok(labels.includes("Train → inference"));
 const rowY = label => canvas.context.labels.find(l => l.text === label).y - 12;
+assert.ok(labels.includes("LMaaJ 评分"));
+const rewardBoxes = canvas.context.boxes.filter(b => b.y === rowY("LMaaJ 评分"));
+assert.equal(rewardBoxes[0].color, "#8b5cc7");
+assert.equal(rewardBoxes[1].color, "#ded6ca");
+assert.equal(rewardBoxes[1].x + rewardBoxes[1].width, X(50), "reward telemetry gaps stay blank");
+canvas.onmousemove({ clientX: X(15), clientY: rowY("LMaaJ 评分") + 5 });
+assert.ok(tooltip.includes("4 samples") && tooltip.includes("60 s") && tooltip.includes("not HTTP concurrency"));
+const segments = stages.namespace.stageSegments({ ts: [10, 20, 30, 100], y: [4, NaN, 0, 5] }, 0, 120, 30, 120);
+assert.equal(JSON.stringify(segments.map(s => [s.start, s.end, s.value])), JSON.stringify([[10, 20, 4], [30, 60, 0]]));
+assert.equal(stages.namespace.stageLabel(stages.namespace.ROLLOUT_STAGES[1]), "Reward 评分", "unknown judges must not be labelled LMaaJ");
 canvas.onmousemove({ clientX: X(55), clientY: rowY("Train → inference") + 5 });
 assert.ok(tooltip.includes("50") && tooltip.includes("10s"));
 canvas.onmousemove({ clientX: X(60), clientY: rowY("Train → inference") + 5 });

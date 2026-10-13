@@ -31,7 +31,9 @@ from starlette.routing import get_route_path
 from miles.dashboard.advisory import DEFAULT_LOW_MFU, compute_advisories, mfu_summary
 from miles.dashboard.dump_reader import STEP_AGGREGATE_METRICS, DumpReader, DumpStillWriting
 from miles.dashboard.group_history import GroupHistory
+from miles.dashboard.runtime_status import reward_info, runtime_status
 from miles.dashboard.store import MetricStore, Stream
+from miles.dashboard.training_strategy import training_strategy
 
 DUMP_METRIC_PREFIX = "dump/"
 
@@ -85,6 +87,17 @@ def make_app(
 ) -> FastAPI:
     app = FastAPI(title="miles dashboard", docs_url=None, redoc_url=None)
     group_history = GroupHistory(reader.dump_dir.parent / "analysis" / "rollout_history")
+    judge = reward_info(reader.dump_dir.parent / "config.toml")
+    strategy = training_strategy(reader.dump_dir.parent, store.meta.args if store.meta else {})
+
+    @app.get("/api/runtime/status")
+    def current_runtime_status():
+        interval = store.meta.args.get("perf_monitor_interval", 10) if store.meta else 10
+        return {
+            **runtime_status(list(store.records[Stream.METRICS]), interval_s=interval),
+            "reward_info": judge,
+            "training_strategy": strategy,
+        }
 
     @app.get("/api/meta")
     def meta():
@@ -101,7 +114,9 @@ def make_app(
             start_ts=store.meta.start_ts if store.meta else None,
             runtime_interval_s=store.meta.args.get("perf_monitor_interval") if store.meta else None,
             engine_interval_s=store.meta.args.get("dashboard_sglang_scrape_interval", 5) if store.meta else 5,
-            fully_async=store.meta.args.get("fully_async", False) if store.meta else False,
+            fully_async=strategy["kind"] == "fully_async",
+            reward_info=judge,
+            training_strategy=strategy,
             wandb_url=_wandb_url(store.meta.args) if store.meta else None,
             data_buffer_length=store.latest_data_buffer_length(),
             time_range=store.time_range(),

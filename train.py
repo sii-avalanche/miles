@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 async def train(args, *, disposer: Disposer):
+    args.dashboard_training_entrypoint = "train"
     assert not args.fully_async, "--fully-async requires the async driver: run train_async.py"
     _worker_manager = init_orchestration_script(args, disposer=disposer)
 

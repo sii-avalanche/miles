@@ -55,6 +55,15 @@ const api = async (path, params = {}) => {
     { role: "driver", rollout_id: 1, name: "wait_rollout", t0: now - 10, t1: now, status: "cancelled" },
   ] };
   if (path === "/api/runtime/group_history") return { rows: [], counts: {} };
+  if (path === "/api/runtime/status") return {
+    training_strategy: { kind: frame < 2 ? "one_step_off_policy" : "fully_async", settings: { num_steps_per_rollout: 1, use_tis: true } },
+    reward_info: { kind: "lmaaj", model_name: "Kimi-K3", timeout: 600, max_retries: 3 },
+    rollout: { observed_at: now - 1, age_seconds: 1, fresh: frame < 2, stages: [
+      { id: "generate", active: 0, oldest_seconds: 0, finished_total: 1024 },
+      { id: "reward", active: 1, oldest_seconds: 3500, finished_total: 896 },
+      { id: "database", active: 0, pending: 0, oldest_seconds: 0, finished_total: 893 },
+    ] }, driver: { fresh: true, active_phases: [{ name: "wait_rollout", oldest_seconds: 4300 }] },
+  };
   assert.equal(path, "/api/metrics");
   return Object.fromEntries(params.keys.split(",").map(key => [key,
     key === inference || key.startsWith(workload)
@@ -82,11 +91,14 @@ const source = readFileSync(new URL("../../../miles/dashboard/static/views_runti
 const viewModule = new SourceTextModule(source, { context });
 const flowModule = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/async_flow.js", import.meta.url), "utf8"), { context });
 const timeModule = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/time_window.js", import.meta.url), "utf8"), { context });
+const statusModule = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/runtime_status.js", import.meta.url), "utf8"), { context });
 mocks["./charts.js"].hideTooltip = () => {};
 mocks["./charts.js"].showTooltip = () => {};
-const linker = name => name === "./async_flow.js" ? flowModule : name === "./time_window.js" ? timeModule : new SyntheticModule(Object.keys(mocks[name]), function () {
+const linker = name => name === "./runtime_status.js" ? statusModule : name === "./async_flow.js" ? flowModule : name === "./time_window.js" ? timeModule : new SyntheticModule(Object.keys(mocks[name]), function () {
   for (const [key, value] of Object.entries(mocks[name])) this.setExport(key, value);
 }, { context });
+await statusModule.link(linker);
+await statusModule.evaluate();
 await flowModule.link(linker);
 await flowModule.evaluate();
 await timeModule.link(linker);
@@ -107,9 +119,19 @@ await refresh();
 assert.ok(requests.filter(request => request.path === "/api/metrics").at(-1).params.keys.includes(workload + "collection_progress_fraction"));
 const text = node => typeof node === "string" ? node : node.textContent + node.children.map(text).join(" ");
 assert.ok(text(root).includes("wait_rollout: cancelled"));
+assert.ok(text(root).includes("LMaaJ 评分") && text(root).includes("Kimi-K3"));
+assert.ok(text(root).includes("One-step off-policy") && text(root).includes("TIS=开启"));
+assert.ok(text(root).includes("58.3 分钟") && text(root).includes("阶段内 1 条"));
+assert.ok(text(root).includes("未记录") && text(root).includes("阶段内 未知 条"));
+assert.ok(text(root).includes("包含失败和取消") && text(root).includes("最多 4 次尝试"));
 assert.equal(text(root).split("collection_progress_fraction").length - 1, 1);
 await refresh();
 assert.equal(text(root).split("collection_progress_fraction").length - 1, 1, "refresh must not duplicate workload panels");
+frame = 2;
+await refresh();
+assert.ok(text(root).includes("采样已过期，当前状态未知"));
+assert.ok(!text(root).includes("进行中"), "stale counts must not claim ongoing scoring");
+assert.ok(text(root).includes("Fully async") && text(root).includes("持续后台生成"));
 
 const gapCanvas = new Element("canvas");
 charts.namespace.drawMultiLine(gapCanvas, [{ label: "gap", ts: [0, 10, 100], value: [1, 2, 3] }], {

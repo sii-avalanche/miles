@@ -1,6 +1,7 @@
 import { api, APP_BASE } from "./api.js";
 import { el, fmtNum } from "./app.js";
 import { hideTooltip, showTooltip } from "./charts.js";
+import { ROLLOUT_STAGES, STAGE_METRICS, stageLabel, stageSegments } from "./runtime_status.js";
 
 const BUCKETS = [
   ["lag_0_groups", "V", "#2a78d6"], ["lag_1_groups", "V−1", "#1baf7a"],
@@ -17,7 +18,7 @@ const PHASES = {
 const LEFT = 156, RIGHT = 14, TOP = 28, ROW = 28;
 
 export async function loadAsyncFlow(meta, t0, t1) {
-  const keys = (meta.metric_keys ?? []).filter(k => /^runtime\/rollout\/buffer\//.test(k) || k === "runtime/rollout/telemetry/events_dropped_total");
+  const keys = (meta.metric_keys ?? []).filter(k => /^runtime\/rollout\/buffer\//.test(k) || STAGE_METRICS.includes(k) || k === "runtime/rollout/telemetry/events_dropped_total");
   const [eventData, metrics, engineData, phaseData, history] = await Promise.all([
     api("/api/runtime/events", { t0, t1, limit: 5000 }),
     keys.length ? api("/api/metrics", { keys: keys.join(","), x: "runtime/time_s", t0, t1 }) : {},
@@ -101,6 +102,7 @@ export function createAsyncFlow({ timeBar } = {}) {
     el("p", { class: "muted" }, [
       "Shared time axis: green = engine requests running; gray = observed zero requests; gaps = no samples. ",
       "Yellow = collect this batch; blue = train; pink = train → inference weight sync. ",
+      "Stage rows show generating, reward/LMaaJ (including queue and retries), Trace persistence and database backlog. Colored = active; gray = observed zero; gaps = missing samples. ",
       "Fully async keeps a background producer; full buffers, evaluation and weight updates can interrupt generation. ",
       "Pool counts are groups, classified by their oldest token weight version. Mixed-version groups are also reported in hover. ",
       "V is the last published inference weight version. Hover for wall time, version counts and rejection details.",
@@ -136,6 +138,7 @@ export function createAsyncFlow({ timeBar } = {}) {
     const rows = [
       ...engines.map((s, i) => ({ label: `Engine ${i + 1}`, engine: s })),
       ...(!engines.length ? [{ label: "Engine requests", missing: true }] : []),
+      ...ROLLOUT_STAGES.map(stage => ({ label: stageLabel(stage, meta.reward_info), stage })),
       ...["Collect batch", "Trainer wait", "Train", "Train → inference"].map(label => ({ label })),
       ...prefixes.map(prefix => ({ label: `Pool${prefix.slice("runtime/rollout/buffer".length)}`, prefix })),
       ...(!prefixes.length ? [{ label: "Data pool", missing: true }] : []),
@@ -178,6 +181,17 @@ export function createAsyncFlow({ timeBar } = {}) {
         }
       }
       if (row.prefix) drawPool(row.prefix, index);
+      if (row.stage) {
+        const stage = row.stage;
+        const key = stage.prefix + (stage.id === "database" ? "/pending_writes" : "/waiting");
+        const ageKey = stage.prefix + (stage.id === "database" ? "/oldest_pending_seconds" : "/oldest_wait_seconds");
+        const ages = data.metrics[ageKey];
+        const ageLookup = new Map((ages?.ts ?? []).map((t, i) => [t, ages.y[i]]));
+        const segments = stageSegments(data.metrics[key], t0, t1, poolGap);
+        if (!segments.length) { ctx.fillStyle = "#7a7168"; ctx.fillText("No telemetry in window", LEFT, TOP + index * ROW + 12); }
+        for (const s of segments) box(s.start, s.end, index, s.value > 0 ? stage.color : "#ded6ca",
+          `${row.label}\n${s.value} ${stage.id === "database" ? "pending writes (including active)" : "samples in stage"}\nLongest wait: ${fmtNum(ageLookup.get(s.ts))} s\nSample: ${new Date(s.ts * 1000).toLocaleString()}\n${stage.id === "reward" ? "Includes limiter queue, judge request and retries; not HTTP concurrency." : "Sampled stage activity."}`);
+      }
       for (const e of phaseEvents) {
         if (PHASES[e.name][0] !== row.label) continue;
         if (e.name === "drain_batch" && phaseEvents.some(p => p.name === "collect_batch" && p.rollout_id === e.rollout_id)) continue;

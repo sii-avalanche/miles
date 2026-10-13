@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 async def train(args, *, disposer: Disposer):
     assert not args.colocate, "Colocation is not supported for async training."
     validate_async_off_policy_correction(args)
+    args.dashboard_training_entrypoint = "train_async"
     _worker_manager = init_orchestration_script(args, disposer=disposer)
     monitor = get_monitor(args, "driver")
 

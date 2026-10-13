@@ -83,3 +83,23 @@ def test_collector_config_whitelist_override_and_run_name_fallback():
     config = collector_config_from_args(args, start_ts=0.0)
     assert config.metric_whitelist == ("sglang_gen_throughput", "sglang_token_usage")
     assert config.run_name == "miles-run"
+
+
+def test_strategy_snapshot_keeps_effective_values_and_excludes_credentials():
+    args = full_args(
+        dashboard_training_entrypoint="train_async",
+        fully_async=False,
+        rollout_function_path="miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn",
+        update_weights_interval=1,
+        num_steps_per_rollout=1,
+        use_tis=True,
+        api_key="secret",
+    )
+    snapshot = collector_config_from_args(args, start_ts=0).args_snapshot
+    assert snapshot["dashboard_training_entrypoint"] == "train_async"
+    assert snapshot["fully_async"] is False
+    assert snapshot["rollout_function_path"].endswith("InferenceRolloutFn")
+    assert snapshot["update_weights_interval"] == 1
+    assert snapshot["num_steps_per_rollout"] == 1
+    assert snapshot["use_tis"] is True
+    assert "secret" not in str(snapshot)
