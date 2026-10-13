@@ -104,6 +104,9 @@ async def generate_and_rm(
             )
             sample = output.samples
             logger.debug(f"{log_prefix} generate_function returned")
+    except asyncio.CancelledError:
+        sample.status = Sample.Status.ABORTED
+        raise
     finally:
         if sink is not None:
             sink.attempt_end(sample)
@@ -171,7 +174,10 @@ async def generate_and_rm_group(
         # cancel siblings and let them settle: the group returns only after every
         # sample task is done, so no orphan generation or in-flight credit outlives it
         for task in tasks:
-            task.cancel()
+            # Cancelling gather already cancelled its children. A second cancel could
+            # interrupt a child's shielded Trace persistence cleanup.
+            if not task.done() and not task.cancelling():
+                task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     logger.debug(f"{log_prefix} [group] All {len(group)} samples completed")
