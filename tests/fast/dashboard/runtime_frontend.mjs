@@ -49,7 +49,7 @@ const api = async (path, params = {}) => {
   requests.push({ path, params });
   if (path === "/api/meta") return {
     mode: "follow", runtime_interval_s: 10, time_range: [now - 20000, now],
-    metric_keys: [workload + "in_flight_group_fraction", ...(frame ? [workload + "collection_progress_fraction"] : [])],
+    metric_keys: ["runtime/rollout/batch/collected_groups", "runtime/rollout/batch/target_groups"],
   };
   if (path === "/api/runtime/events") return { events: [
     { role: "driver", rollout_id: 1, name: "wait_rollout", t0: now - 10, t1: now, status: "cancelled" },
@@ -62,7 +62,7 @@ const api = async (path, params = {}) => {
       { id: "generate", active: 0, oldest_seconds: 0, finished_total: 1024 },
       { id: "reward", active: 1, oldest_seconds: 3500, finished_total: 896 },
       { id: "database", active: 0, pending: 0, oldest_seconds: 0, finished_total: 893 },
-    ] }, driver: { fresh: true, active_phases: [{ name: "wait_rollout", oldest_seconds: 4300 }] },
+    ] }, driver: { fresh: frame < 2, active_phases: [{ name: "wait_rollout", oldest_seconds: 4300 }] },
   };
   assert.equal(path, "/api/metrics");
   return Object.fromEntries(params.keys.split(",").map(key => [key,
@@ -109,30 +109,22 @@ await viewModule.evaluate();
 
 const root = new Element("main");
 await viewModule.namespace.renderRuntime(root, { mode: "follow" });
-const gpu = draws.find(draw => draw.series.some(series => series.label === "Inference"));
-assert.equal(gpu.options.colorIndex("Inference"), 1, "a missing trainer series must not change inference's color");
-const lastSampleX = gpu.canvas.context.paths.find(path => path.color === charts.namespace.SERIES_COLORS[1]).points[0][1];
-assert.ok(lastSampleX > 400 && lastSampleX < 406, "recent samples keep their wall-time position in the four-hour window");
+const text = node => typeof node === "string" ? node : node.textContent + node.children.map(text).join(" ");
 assert.equal(requests.find(request => request.path === "/api/metrics").params.t0, now - 14400);
-
+assert.ok(text(root).includes("One-step off-policy") && text(root).includes("TIS=on"));
+assert.ok(text(root).includes("Waiting for rollout") && text(root).includes("Kimi-K3"));
+assert.ok(!/[\p{Script=Han}]/u.test(text(root)), "RL Compute interface must be English");
+assert.ok(!text(root).includes("Database backlog") && !text(root).includes("GPU utilization (%)"));
+assert.equal(draws.length, 0, "generic Grafana charts must not render in RL Compute");
+assert.ok(requests.filter(r => r.path === "/api/metrics").every(r => !r.params.keys.includes("fleet/")), "do not fetch removed charts");
 frame = 1;
 await refresh();
-assert.ok(requests.filter(request => request.path === "/api/metrics").at(-1).params.keys.includes(workload + "collection_progress_fraction"));
-const text = node => typeof node === "string" ? node : node.textContent + node.children.map(text).join(" ");
-assert.ok(text(root).includes("wait_rollout: cancelled"));
-assert.ok(text(root).includes("LMaaJ 评分") && text(root).includes("Kimi-K3"));
-assert.ok(text(root).includes("One-step off-policy") && text(root).includes("TIS=开启"));
-assert.ok(text(root).includes("58.3 分钟") && text(root).includes("阶段内 1 条"));
-assert.ok(text(root).includes("未记录") && text(root).includes("阶段内 未知 条"));
-assert.ok(text(root).includes("包含失败和取消") && text(root).includes("最多 4 次尝试"));
-assert.equal(text(root).split("collection_progress_fraction").length - 1, 1);
-await refresh();
-assert.equal(text(root).split("collection_progress_fraction").length - 1, 1, "refresh must not duplicate workload panels");
+assert.ok(text(root).includes("One-step off-policy"));
 frame = 2;
 await refresh();
-assert.ok(text(root).includes("采样已过期，当前状态未知"));
-assert.ok(!text(root).includes("进行中"), "stale counts must not claim ongoing scoring");
-assert.ok(text(root).includes("Fully async") && text(root).includes("持续后台生成"));
+assert.ok(text(root).includes("Driver sample is stale; current phase unknown"));
+assert.ok(!text(root).includes("Waiting for rollout"), "stale driver samples must not claim an active phase");
+assert.ok(text(root).includes("Fully async") && text(root).includes("Generate continuously"));
 
 const gapCanvas = new Element("canvas");
 charts.namespace.drawMultiLine(gapCanvas, [{ label: "gap", ts: [0, 10, 100], value: [1, 2, 3] }], {
@@ -141,4 +133,4 @@ charts.namespace.drawMultiLine(gapCanvas, [{ label: "gap", ts: [0, 10, 100], val
 const curve = gapCanvas.context.paths.find(path => path.color === charts.namespace.SERIES_COLORS[0]);
 assert.equal(curve.points.map(point => point[0]).join(""), "MLM", "stale intervals must not be drawn as observed activity");
 cleanup();
-console.log("Runtime frontend smoke passed: dynamic metrics, stable colors, viewport, cancellation and missing-data gaps.");
+console.log("Runtime frontend smoke passed: English UI, focused metrics, viewport, strategy and stale phases.");

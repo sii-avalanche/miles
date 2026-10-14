@@ -37,7 +37,7 @@ const elapsed = seconds => {
 export function createTimeBar(controller, label) {
   const thumb = el("span", { class: "time-thumb" }, ["⋮⋮"]);
   const track = el("div", { class: "time-track", role: "scrollbar", tabindex: "0",
-    "aria-label": `${label} 时间范围`, "aria-orientation": "horizontal" }, [thumb]);
+    "aria-label": `${label} time range`, "aria-orientation": "horizontal" }, [thumb]);
   const rangeLabel = el("span", { class: "time-range" });
   function zoom(factor) {
     const { t0, t1, start, end, maxSpan } = controller.get(), center = (t0 + t1) / 2;
@@ -46,8 +46,8 @@ export function createTimeBar(controller, label) {
   }
   const root = el("div", { class: "time-navigation", "data-time-bar": label }, [
     track, el("div", { class: "time-controls" }, [rangeLabel,
-      el("button", { onclick: () => zoom(2), "aria-label": `${label} 缩小时间图` }, ["−"]),
-      el("button", { onclick: () => zoom(0.5), "aria-label": `${label} 放大时间图` }, ["+"]),
+      el("button", { onclick: () => zoom(2), "aria-label": `${label} zoom out` }, ["−"]),
+      el("button", { onclick: () => zoom(0.5), "aria-label": `${label} zoom in` }, ["+"]),
     ]),
   ]);
   function update({ start, end, t0, t1, origin, ready }) {
@@ -61,7 +61,7 @@ export function createTimeBar(controller, label) {
     track.setAttribute("aria-disabled", String(!ready || t1 - t0 >= full));
     root.setAttribute("data-time-start", t0);
     root.setAttribute("data-time-end", t1);
-    rangeLabel.textContent = ready ? `${elapsed(t0 - origin)} — ${elapsed(t1 - origin)} · 拖动同步时间` : "暂无时间数据";
+    rangeLabel.textContent = ready ? `${elapsed(t0 - origin)} — ${elapsed(t1 - origin)} · drag to sync time` : "No time data";
   }
   let drag = null;
   track.onpointerdown = ev => {

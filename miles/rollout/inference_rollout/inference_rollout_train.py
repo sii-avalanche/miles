@@ -12,12 +12,14 @@ from miles.rollout.filter_hub.base_types import MetricGatherer
 from miles.rollout.filter_hub.common_filters import apply_preput_filters
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
+from miles.rollout.inference_rollout.batch_pool import BatchPoolTelemetry
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
 from miles.utils.http_utils import get, post, router_worker_base_urls
 from miles.utils.misc import as_completed_async, call_agent_abort_hook
+from miles.utils.perf_monitor import get_monitor
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -29,25 +31,54 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
     assert not state.aborted
     state.aborted = True
 
-    urls = await get_worker_urls(args)
-    logger.info(f"Abort request for {urls}")
-    results = await asyncio.gather(
-        *[post(f"{url}/abort_request", {"abort_all": True}) for url in urls], return_exceptions=True
-    )
-    for url, result in zip(urls, results, strict=True):
-        if isinstance(result, Exception):
-            logger.warning(f"Failed to abort worker at {url}: {result}")
+    monitor = get_monitor(args)
+    if monitor.enabled:
+        groups = sum(not task.done() for task in pendings)
+        monitor.increment("batch/abort_requested_groups_total", groups)
+        monitor.event(
+            "batch_abort",
+            rollout_id=rollout_id,
+            details={
+                "groups": groups,
+                "samples_upper_bound": groups * args.n_samples_per_prompt,
+                "action": "retain_partial" if args.partial_rollout else "discard",
+            },
+        )
 
-    # Let the agent integration tear down its in-flight trials so they stop hitting
-    # SGLang, instead of running on until their own max_seq_len / timeout.
-    await call_agent_abort_hook(args)
+    if not args.partial_rollout:
+        # Discarded groups must stop their generation, reward queues, HTTP waits and retries.
+        # Do this before contacting SGLang so a slow abort endpoint cannot keep judges running.
+        logger.info("Cancelling %d unused rollout groups, including pending reward requests", len(pendings))
+        for task in pendings:
+            if not task.done() and not task.cancelling():
+                task.cancel()
 
-    # make sure all the pending tasks are finished
+    try:
+        urls = await get_worker_urls(args)
+        logger.info(f"Abort request for {urls}")
+        results = await asyncio.gather(
+            *[post(f"{url}/abort_request", {"abort_all": True}) for url in urls], return_exceptions=True
+        )
+        for url, result in zip(urls, results, strict=True):
+            if isinstance(result, Exception):
+                logger.warning(f"Failed to abort worker at {url}: {result}")
+
+        # Let the agent integration tear down its own backend requests as well.
+        await call_agent_abort_hook(args)
+    finally:
+        if not args.partial_rollout:
+            # Join cancellation cleanup, including shielded disk captures, even if discovery fails.
+            results = await asyncio.gather(*pendings, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("Unused rollout group failed during abort cleanup: %r", result)
+
+    if not args.partial_rollout:
+        return []
+
+    # Partial rollout needs the groups' returned samples for continuation.
     aborted_samples = []
     async for group in as_completed_async(pendings):
-        if not args.partial_rollout:
-            continue
-
         # for partial rollout, collect the partial samples into the data buffer
         for sample in group:
             if sample.response and "start_rollout_id" not in sample.metadata:
@@ -92,6 +123,16 @@ def submit_generate_tasks(
 
 async def generate_rollout_async(
     state: GenerateState, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
+) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
+    with BatchPoolTelemetry(state.args, rollout_id) as pool:
+        return await _generate_rollout_async(state, rollout_id, data_source, pool)
+
+
+async def _generate_rollout_async(
+    state: GenerateState,
+    rollout_id: int,
+    data_source: Callable[[int], list[list[Sample]]],
+    pool: BatchPoolTelemetry,
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     args = state.args
     assert args.rollout_global_dataset
@@ -146,6 +187,7 @@ async def generate_rollout_async(
             all_data.append(group)
             metric_gatherer.on_group_before_dynamic_filter(args, group)
             filter_output = apply_preput_filters(args, dynamic_filter, group)
+            pool.observe_group(keep=filter_output.keep, reason=filter_output.reason)
             if not filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
                 continue
@@ -154,6 +196,7 @@ async def generate_rollout_async(
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
                 data.append(group)
+                pool.accept_group()
                 pbar.update(args.n_samples_per_prompt)
 
     pbar.close()
@@ -190,4 +233,5 @@ async def generate_rollout_async(
         sampling_params=state.sampling_params,
     )
 
+    pool.selected(len(data))
     return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples

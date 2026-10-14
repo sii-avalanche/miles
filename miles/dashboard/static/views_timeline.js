@@ -100,7 +100,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
   let v0 = 0;
   let v1 = 1;
   let haveData = false;
-  let overlayMetric = meta.capabilities.has_engine_series ? OVERLAY_METRICS[0] : null;
+  let overlayMetric = !embedded && meta.capabilities.has_engine_series ? OVERLAY_METRICS[0] : null;
   let showMem = false;
   let showAbsolute = false; // x-axis ticks: relative "+h:mm:ss" (default) vs wall-clock
   let multiNode = false;
@@ -147,7 +147,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
     const sequence = ++loadSequence;
     const [topology, bubblesRes] = await Promise.all([
       api("/api/timeline/topology"),
-      api("/api/timeline/bubbles"),
+      embedded ? { bubbles: [] } : api("/api/timeline/bubbles"),
     ]);
     if (cancelled || sequence !== loadSequence) return;
     allLanes = topology.lanes;
@@ -399,7 +399,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
     },
   });
   const fleet = createFleet({ phaseColors: PHASE_COLORS, runStart: () => T0,
-    ...(timeWindow ? { timeBar, viewRange: () => ({ t0: v0, t1: v1 }) } : {}),
+    ...(!embedded && timeWindow ? { timeBar, viewRange: () => ({ t0: v0, t1: v1 }) } : {}),
   });
 
   // above this many lanes the per-rank carpet stops scaling (payload and
@@ -411,6 +411,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
   const carpetRange = () => (haveData ? { t0: v0, t1: v1 } : {});
   const manyLanes = () => embedded || meta.capabilities.use_utilization_overview || allLanes.length > CARPET_MAX_LANES;
   async function refreshOverview() {
+    if (embedded) return;
     carpet.root.style.display = manyLanes() ? "none" : "";
     fleet.root.style.display = manyLanes() ? "" : "none";
     await (manyLanes() ? fleet.refresh(carpetRange()) : carpet.refresh(carpetRange()));
@@ -724,7 +725,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
       ]),
       el("p", { class: "muted" }, [
         "Rollout phase bars mark batch collection; background generation can overlap training. ",
-        "GPU utilization curves show observed activity. The fleet blue line is the median, not the mean.",
+        embedded ? "GPU utilization curves show observed activity for the displayed GPUs." : "GPU utilization curves show observed activity. The fleet blue line is the median, not the mean.",
       ]),
     );
   };
@@ -779,11 +780,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
   };
 
   view.replaceChildren(
-    toolbar,
-    selRow,
-    ...(embedded ? [] : [mfuPanel, advisoryPanel, asyncFlow.root, carpet.root]),
-    fleet.root,
-    bubbleStrip,
+    ...(embedded ? [el("h3", {}, ["GPU utilization and phases"])] : [toolbar, selRow, mfuPanel, advisoryPanel, asyncFlow.root, carpet.root, fleet.root, bubbleStrip]),
     el("div", { class: "panel" }, [canvas, ...(timeWindow ? [timeBar("GPU utilization")] : [])]),
     legendPanel,
   );
