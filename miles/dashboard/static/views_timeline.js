@@ -3,30 +3,10 @@ import { el, fmtNum, setViewCleanup, statBox } from "./app.js";
 import { createCarpet } from "./carpet.js";
 import { createFleet } from "./fleet.js";
 import { extent, hideTooltip, showTooltip } from "./charts.js";
-import { createAsyncFlow, loadAsyncFlow } from "./async_flow.js";
-import { createTimeBar } from "./time_window.js";
+import { getRunTimeWindow, createTimeBar } from "./time_window.js";
 
-// idle states share a light neutral family (train_wait also gets a hatch
-// texture below — the accessibility channel — so idle doesn't lean on hue
-// alone); the log_probs family shares one hue at three lightness steps;
-// rollout gets the brand orange as the headline phase. Validated against
-// the design system's 8-hue categorical order (scripts/validate_palette.js).
-const PHASE_COLORS = {
-  initialize: "#ded6ca",
-  rollout: "#d55816",
-  eval_rollout: "#e8a683",
-  actor_train: "#2a78d6",
-  train_log_probs: "#c3b8ec",
-  log_probs: "#8b7bd8",
-  ref_log_probs: "#4a3aa7",
-  data_preprocess: "#eda100",
-  train_wait: "#efe8dc",
-  update_weights: "#e87ba4",
-  ref_model_update: "#008300",
-  save_model: "#1baf7a",
-  sleep: "#e5ddd0",
-  wake_up: "#e34948",
-};
+import { PHASE_COLORS } from "./phase_colors.js";
+
 const DEFAULT_PHASE_COLOR = "#9c9488";
 const OVERLAY_METRICS = [
   "sglang_num_running_reqs",
@@ -74,7 +54,7 @@ function formatElapsed(seconds) {
   return `+${mins}:${pad(secs)}`;
 }
 
-export async function renderTimeline(view, meta, route, { embedded = false, timeWindow = null, registerCleanup = setViewCleanup } = {}) {
+async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }) {
   let cancelled = false, loadSequence = 0;
   const timeBars = [];
   const timeBar = label => {
@@ -100,7 +80,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
   let v0 = 0;
   let v1 = 1;
   let haveData = false;
-  let overlayMetric = !embedded && meta.capabilities.has_engine_series ? OVERLAY_METRICS[0] : null;
+  let overlayMetric = meta.capabilities.has_engine_series ? OVERLAY_METRICS[0] : null;
   let showMem = false;
   let showAbsolute = false; // x-axis ticks: relative "+h:mm:ss" (default) vs wall-clock
   let multiNode = false;
@@ -110,12 +90,9 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
   const MAXW = meta.capabilities.max_window_s ?? Infinity;
   let allLanes = []; // full topology lane list (seeds the spaced default selection)
   let fetched = null; // {t0, t1} bounds the loaded phases/gpu/engine data covers
-  const asyncFlow = embedded ? null : createAsyncFlow();
-  let flowData = null;
   let liveMeta = meta;
   const updateSelectionUrl = () => {
-    if (embedded) return;
-    history.replaceState(null, "", selection ? `#/timeline?lanes=${encodeURIComponent(selection)}` : "#/timeline");
+    history.replaceState(null, "", selection ? `#/gpu?lanes=${encodeURIComponent(selection)}` : "#/gpu");
   };
 
   // T0/T1 come from meta.time_range (an O(1) edge-stamp read server-side),
@@ -147,7 +124,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
     const sequence = ++loadSequence;
     const [topology, bubblesRes] = await Promise.all([
       api("/api/timeline/topology"),
-      embedded ? { bubbles: [] } : api("/api/timeline/bubbles"),
+      api("/api/timeline/bubbles"),
     ]);
     if (cancelled || sequence !== loadSequence) return;
     allLanes = topology.lanes;
@@ -181,18 +158,16 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
         updateSelectionUrl();
       }
     }
-    const [phasesRes, gpuRes, processesRes, flowRes] = await Promise.all([
+    const [phasesRes, gpuRes, processesRes] = await Promise.all([
       api("/api/timeline/phases", { t0: f0, t1: f1, lanes: selection }),
       api("/api/timeline/gpu", { t0: f0, t1: f1, max_points: 4000, lanes: selection }),
       api("/api/timeline/gpu_processes", { t0: f0, t1: f1, lanes: selection }),
-      embedded ? null : loadAsyncFlow(liveMeta, f0, f1),
     ]);
     const engines = overlayMetric
       ? (await api("/api/timeline/engine_series", { metric: overlayMetric, t0: f0, t1: f1, max_points: 4000 }))
           .series
       : [];
     if (cancelled || sequence !== loadSequence || requestedWindow[0] !== v0 || requestedWindow[1] !== v1) return;
-    flowData = flowRes;
     engineSeries = engines;
     fetched = { t0: f0, t1: f1 };
     lanes = allLanes;
@@ -399,7 +374,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
     },
   });
   const fleet = createFleet({ phaseColors: PHASE_COLORS, runStart: () => T0,
-    ...(!embedded && timeWindow ? { timeBar, viewRange: () => ({ t0: v0, t1: v1 }) } : {}),
+    ...(timeWindow ? { timeBar, viewRange: () => ({ t0: v0, t1: v1 }) } : {}),
   });
 
   // above this many lanes the per-rank carpet stops scaling (payload and
@@ -409,9 +384,8 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
   // the overview (carpet or fleet panels) tracks the lane view's zoom window;
   // before any data exists it asks for the (empty) server default
   const carpetRange = () => (haveData ? { t0: v0, t1: v1 } : {});
-  const manyLanes = () => embedded || meta.capabilities.use_utilization_overview || allLanes.length > CARPET_MAX_LANES;
+  const manyLanes = () => meta.capabilities.use_utilization_overview || allLanes.length > CARPET_MAX_LANES;
   async function refreshOverview() {
-    if (embedded) return;
     carpet.root.style.display = manyLanes() ? "none" : "";
     fleet.root.style.display = manyLanes() ? "" : "none";
     await (manyLanes() ? fleet.refresh(carpetRange()) : carpet.refresh(carpetRange()));
@@ -461,7 +435,6 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
   function draw() {
     canvas.setAttribute("data-time-start", v0);
     canvas.setAttribute("data-time-end", v1);
-    if (flowData) asyncFlow.draw(flowData, liveMeta, v0, v1, T0);
     canvas.style.height = `${M_TOP + Math.max(lanes.length, 1) * LANE_H + 8}px`;
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
@@ -725,7 +698,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
       ]),
       el("p", { class: "muted" }, [
         "Rollout phase bars mark batch collection; background generation can overlap training. ",
-        embedded ? "GPU utilization curves show observed activity for the displayed GPUs." : "GPU utilization curves show observed activity. The fleet blue line is the median, not the mean.",
+        "GPU utilization curves show observed activity. The fleet blue line is the median, not the mean.",
       ]),
     );
   };
@@ -780,7 +753,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
   };
 
   view.replaceChildren(
-    ...(embedded ? [el("h3", {}, ["GPU utilization and phases"])] : [toolbar, selRow, mfuPanel, advisoryPanel, asyncFlow.root, carpet.root, fleet.root, bubbleStrip]),
+    toolbar, selRow, mfuPanel, advisoryPanel, carpet.root, fleet.root, bubbleStrip,
     el("div", { class: "panel" }, [canvas, ...(timeWindow ? [timeBar("GPU utilization")] : [])]),
     legendPanel,
   );
@@ -808,7 +781,7 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
     window.removeEventListener("resize", onResize);
     window.removeEventListener("mouseup", onMouseUp);
   });
-  await Promise.all([loadData(), ...(embedded ? [] : [loadAdvisories()])]);
+  await Promise.all([loadData(), loadAdvisories()]);
   if (cancelled) return;
   await refreshOverview(); // topology decides carpet vs fleet panels
   if (cancelled) return;
@@ -822,10 +795,10 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
       if (refreshing) return;
       refreshing = true;
       try {
-        // fresh global range (cheap edge-stamp read); getMeta() is cached
+        // Refresh the global range from the current source timestamps.
         liveMeta = await api("/api/meta");
         applyRange(liveMeta.time_range);
-        await Promise.all([loadData(), ...(embedded ? [] : [loadAdvisories()])]);
+        await Promise.all([loadData(), loadAdvisories()]);
         renderAll();
         await refreshOverview();
       } catch {
@@ -835,4 +808,17 @@ export async function renderTimeline(view, meta, route, { embedded = false, time
       }
     }, FOLLOW_REDRAW_MS);
   }
+}
+
+export async function renderGpu(view, meta, route) {
+  const content = el("div");
+  view.replaceChildren(el("h2", {}, ["GPU details"]),
+    el("p", { class: "muted" }, ["Inspect individual GPUs, memory, phases, MFU and engine activity. The selected time window is shared with Overview and Data & samples."]), content);
+  if (!meta.capabilities?.has_timeline) {
+    content.append(el("p", { class: "muted" }, ["GPU telemetry was not recorded for this run."]));
+    return;
+  }
+  await renderTimeline(content, meta, route, {
+    timeWindow: getRunTimeWindow(meta), registerCleanup: setViewCleanup,
+  });
 }

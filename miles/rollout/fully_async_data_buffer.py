@@ -164,14 +164,10 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_versioned_samples = 0
         self._monitor = get_monitor(args)
         self._perf_prefix = "buffer" if input.trainer_model_id is None else f"buffer/{input.trainer_model_id}"
-        self._enqueued_at = deque()
         self._queued_version_stats = deque()
-        self._version_counts = Counter()
-        self._mixed_groups = 0
         self._workload_version_counts = {name: Counter() for name in workload_targets(args)}
         if getattr(args, "perf_monitor_workload_targets", None) is not None:
             self._workload_version_counts["other"] = Counter()
-        self._workload_mixed_groups = Counter()
         self._telemetry_lock = threading.Lock()
         self._trainer_model_id = input.trainer_model_id
         for name in ("stale_rejected", "aborted", "missing_reward", "dynamic_rejected", "drop", "retry"):
@@ -180,36 +176,62 @@ class DefaultDataBuffer(DataBuffer):
 
     def _perf_snapshot(self) -> dict[str, float]:
         with self._telemetry_lock:
-            counts = self._version_counts.copy()
             version = self._current_version
-            mixed = self._mixed_groups
             workloads = {name: counter.copy() for name, counter in self._workload_version_counts.items()}
-            workload_mixed = self._workload_mixed_groups.copy()
-        metrics = self._version_snapshot(counts, mixed, version)
+        total = Counter()
+        for counter in workloads.values():
+            total.update(counter)
+        metrics = self._version_snapshot(total, version)
         for name, counter in workloads.items():
             metrics.update(
-                {
-                    f"workload/{name}/{key}": value
-                    for key, value in self._version_snapshot(counter, workload_mixed[name], version).items()
-                }
+                {f"workload/{name}/{key}": value for key, value in self._version_snapshot(counter, version).items()}
             )
         return metrics
 
-    def _version_snapshot(self, counts: Counter, mixed: int, version: int | None) -> dict[str, float]:
+    def _version_snapshot(self, counts: Counter, version: int | None) -> dict[str, float]:
         queued = sum(counts.values())
         metrics = {
             "queued_groups": queued,
             "capacity_groups": self._capacity,
             "fill_fraction": queued / self._capacity,
-            "versions/unknown_groups": counts.get(None, 0),
-            "versions/mixed_groups": mixed,
+            "versions/unknown_groups": 0,
+            "versions/mixed_groups": sum(n for (_, mixed), n in counts.items() if mixed),
         }
         if version is not None:
             metrics["current_weight_version"] = version
-            metrics.update({f"versions/lag_{lag}_groups": counts.get(version - lag, 0) for lag in range(4)})
-            metrics["versions/older_groups"] = sum(n for v, n in counts.items() if v is not None and v < version - 3)
-            metrics["versions/future_groups"] = sum(n for v, n in counts.items() if v is not None and v > version)
+            buckets = [*(f"lag_{lag}" for lag in range(4)), "older", "future"]
+            metrics.update({f"versions/{bucket}_groups": 0 for bucket in buckets})
+        for (oldest, _), count in counts.items():
+            if oldest is None:
+                bucket = "unknown"
+            elif version is None:
+                continue
+            else:
+                lag = version - oldest
+                bucket = f"lag_{lag}" if 0 <= lag < 4 else "older" if lag >= 4 else "future"
+            metrics[f"versions/{bucket}_groups"] += count
         return metrics
+
+    def _track_queue(self, entry: DataBufferInput | None = None) -> None:
+        if not self._monitor.enabled:
+            return
+        if entry is not None:
+            started = time.monotonic()
+            stats = group_weight_version_stats(entry.group)
+            workload = workload_of(entry.prompt_group[0], self._args)
+            key = (stats.oldest_version, stats.oldest_version != stats.newest_version)
+        with self._telemetry_lock:
+            if entry is not None:
+                self._queued_version_stats.append((started, workload, key))
+                self._workload_version_counts[workload][key] += 1
+            else:
+                started, workload, key = self._queued_version_stats.popleft()
+                counter = self._workload_version_counts[workload]
+                counter[key] -= 1
+                if not counter[key]:
+                    del counter[key]
+        if entry is None:
+            self._monitor.observe(f"{self._perf_prefix}/residence", time.monotonic() - started)
 
     def set_weight_version(self, version: int, trainer_model_id: str | None = None) -> None:
         with self._telemetry_lock:
@@ -219,6 +241,8 @@ class DefaultDataBuffer(DataBuffer):
     def _record_rejection(self, entry: DataBufferInput, reason: str, *, reusable: bool) -> None:
         if not self._monitor.enabled:
             return
+        counter = {"dynamic_filter": "dynamic_rejected", "stale": "stale_rejected"}.get(reason, reason)
+        self._monitor.increment(f"{self._perf_prefix}/{counter}_groups_total")
         stats = group_weight_version_stats(entry.group)
         action = (
             "retry" if reusable and getattr(self._args, "async_unused_samples_handler", "drop") == "retry" else "drop"
@@ -255,16 +279,7 @@ class DefaultDataBuffer(DataBuffer):
                     while len(self._buffer) >= self._capacity:
                         await self._cond.wait()
             self._buffer.append(input)
-            if self._monitor.enabled:
-                self._enqueued_at.append(time.monotonic())
-                stats = group_weight_version_stats(input.group)
-                workload = workload_of(input.prompt_group[0], self._args)
-                with self._telemetry_lock:
-                    self._queued_version_stats.append((stats, workload))
-                    self._version_counts[stats.oldest_version] += 1
-                    self._mixed_groups += int(stats.oldest_version != stats.newest_version)
-                    self._workload_version_counts[workload][stats.oldest_version] += 1
-                    self._workload_mixed_groups[workload] += int(stats.oldest_version != stats.newest_version)
+            self._track_queue(input)
             self._monitor.increment(f"{self._perf_prefix}/groups_enqueued_total")
             self._cond.notify_all()
 
@@ -272,7 +287,6 @@ class DefaultDataBuffer(DataBuffer):
         output = apply_aborted_filter(self._args, input.group)
         if not output.keep:
             self._metric_aborted_groups += 1
-            self._monitor.increment(f"{self._perf_prefix}/aborted_groups_total")
             self._record_rejection(input, "aborted", reusable=True)
             self._unused_handler_fn(input.prompt_group)
             return False
@@ -280,7 +294,6 @@ class DefaultDataBuffer(DataBuffer):
         output = apply_missing_reward_filter(self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
-            self._monitor.increment(f"{self._perf_prefix}/missing_reward_groups_total")
             self._record_rejection(input, "missing_reward", reusable=False)
             return False
 
@@ -288,7 +301,6 @@ class DefaultDataBuffer(DataBuffer):
         output = call_dynamic_filter(self._dynamic_filter, self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
-            self._monitor.increment(f"{self._perf_prefix}/dynamic_rejected_groups_total")
             self._record_rejection(input, "dynamic_filter", reusable=False)
             return False
         return True
@@ -305,23 +317,7 @@ class DefaultDataBuffer(DataBuffer):
                         while not self._buffer:
                             await self._cond.wait()
                 entry = self._buffer.pop(0)
-                if self._monitor.enabled:
-                    self._monitor.observe(
-                        f"{self._perf_prefix}/residence", time.monotonic() - self._enqueued_at.popleft()
-                    )
-                    with self._telemetry_lock:
-                        queued_stats, workload = self._queued_version_stats.popleft()
-                        self._version_counts[queued_stats.oldest_version] -= 1
-                        if not self._version_counts[queued_stats.oldest_version]:
-                            del self._version_counts[queued_stats.oldest_version]
-                        self._mixed_groups -= int(queued_stats.oldest_version != queued_stats.newest_version)
-                        counter = self._workload_version_counts[workload]
-                        counter[queued_stats.oldest_version] -= 1
-                        if not counter[queued_stats.oldest_version]:
-                            del counter[queued_stats.oldest_version]
-                        self._workload_mixed_groups[workload] -= int(
-                            queued_stats.oldest_version != queued_stats.newest_version
-                        )
+                self._track_queue()
                 self._cond.notify_all()  # wake producers blocked on a full buffer
 
                 version_stats = group_weight_version_stats(entry.group)
@@ -330,7 +326,6 @@ class DefaultDataBuffer(DataBuffer):
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
                         self._metric_stale_groups += 1
-                        self._monitor.increment(f"{self._perf_prefix}/stale_rejected_groups_total")
                         self._record_rejection(entry, "stale", reusable=True)
                         self._unused_handler_fn(entry.prompt_group)
                         continue

@@ -94,7 +94,8 @@ const timeModule = new SourceTextModule(readFileSync(new URL("../../../miles/das
 const statusModule = new SourceTextModule(readFileSync(new URL("../../../miles/dashboard/static/runtime_status.js", import.meta.url), "utf8"), { context });
 mocks["./charts.js"].hideTooltip = () => {};
 mocks["./charts.js"].showTooltip = () => {};
-mocks["./observability.js"] = { grafanaUrl: () => null };
+mocks["./fleet.js"] = { createFleet: () => { throw new Error("No GPU telemetry advertised"); } };
+mocks["./phase_colors.js"] = { PHASE_COLORS: {} };
 const linker = name => name === "./runtime_status.js" ? statusModule : name === "./async_flow.js" ? flowModule : name === "./time_window.js" ? timeModule : new SyntheticModule(Object.keys(mocks[name]), function () {
   for (const [key, value] of Object.entries(mocks[name])) this.setExport(key, value);
 }, { context });
@@ -113,7 +114,7 @@ const text = node => typeof node === "string" ? node : node.textContent + node.c
 assert.equal(requests.find(request => request.path === "/api/metrics").params.t0, now - 14400);
 assert.ok(text(root).includes("One-step off-policy") && text(root).includes("TIS=on"));
 assert.ok(text(root).includes("Waiting for rollout") && text(root).includes("Kimi-K3"));
-assert.ok(!/[\p{Script=Han}]/u.test(text(root)), "RL Compute interface must be English");
+assert.ok(!/[\p{Script=Han}]/u.test(text(root)), "Dashboard interface must be English");
 assert.ok(!text(root).includes("Database backlog") && !text(root).includes("GPU utilization (%)"));
 assert.equal(draws.length, 0, "generic Grafana charts must not render in RL Compute");
 assert.ok(requests.filter(r => r.path === "/api/metrics").every(r => !r.params.keys.includes("fleet/")), "do not fetch removed charts");
@@ -132,5 +133,9 @@ charts.namespace.drawMultiLine(gapCanvas, [{ label: "gap", ts: [0, 10, 100], val
 });
 const curve = gapCanvas.context.paths.find(path => path.color === charts.namespace.SERIES_COLORS[0]);
 assert.equal(curve.points.map(point => point[0]).join(""), "MLM", "stale intervals must not be drawn as observed activity");
+cleanup();
+await viewModule.namespace.renderRuntime(root, { mode: "follow" }, { view: "data" });
+assert.ok(text(root).includes("Group history: rejections, retries and training"));
+assert.ok(!text(root).includes("GPU utilization & phase composition"));
 cleanup();
 console.log("Runtime frontend smoke passed: English UI, focused metrics, viewport, strategy and stale phases.");

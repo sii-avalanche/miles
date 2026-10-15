@@ -39,9 +39,6 @@ export async function apiBinary(path, params = {}) {
   return { ...header, values: new Uint8Array(buf, 4 + headerLen) };
 }
 
-let metaCache = null;
-
 export async function getMeta() {
-  if (metaCache === null) metaCache = await api("/api/meta");
-  return metaCache;
+  return api("/api/meta");
 }

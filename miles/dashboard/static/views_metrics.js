@@ -1,14 +1,14 @@
 import { api } from "./api.js";
 import { el, setViewCleanup } from "./app.js";
 import { drawChart, drawMultiLine, SERIES_COLORS } from "./charts.js";
-import { createTimeWindow, createTimeBar } from "./time_window.js";
+import { getRunTimeWindow, createTimeBar } from "./time_window.js";
 
 // wandb-shaped L0: metric names come verbatim from the tracking fan-out, so
 // categories are simply the key prefixes. One category at a time (wandb
 // sidebar idiom); every key of the active category renders as a line chart.
 // "dump" only ever appears for dump-only dirs — the server does not
 // advertise it while a telemetry stream exists.
-const CATEGORY_ORDER = ["runtime", "rollout", "perf", "moe", "train", "eval", "dump"];
+const CATEGORY_ORDER = ["train", "eval", "rollout", "moe", "dump", "perf", "runtime"];
 
 // trainer-side recomputations logged under the rollout/step axis (they share
 // that step key, not because they're rollout-generation metrics) — displayed
@@ -82,8 +82,7 @@ function orderedCategories(meta) {
 }
 
 export async function renderMetrics(view, meta) {
-  const timeWindow = createTimeWindow({ bounds: meta.time_range, origin: meta.start_ts,
-    maxSpan: meta.capabilities?.max_window_s ?? 14400 });
+  const timeWindow = getRunTimeWindow(meta);
   const timeBars = [];
   let refreshTimer = null, intervalId = null;
   const isTimeAxis = axis => axis === "runtime/time_s" || axis === "time_s";
@@ -309,6 +308,10 @@ export async function renderMetrics(view, meta) {
   };
 
   view.replaceChildren(
+    el("h2", {}, ["Training metrics"]),
+    el("p", { class: "muted" }, ["This run: loss, reward, KL, entropy and evaluation by training step. System metric families remain available for detailed inspection. ",
+      ...(meta.wandb_url ? [el("a", { href: meta.wandb_url, target: "_blank", rel: "noopener" }, ["Compare experiments in W&B ↗"])] : ["W&B is not linked for this run."]),
+    ]),
     el("div", { class: "row" }, [
       el("div", { class: "panel", style: "flex: 0 0 200px; min-width: 200px" }, [
         el("h3", {}, ["Metrics"]),

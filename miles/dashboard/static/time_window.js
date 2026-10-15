@@ -93,3 +93,13 @@ export function createTimeBar(controller, label) {
   update(controller.get());
   return { root, destroy: unsubscribe };
 }
+
+// The app serves one run per document. Keep its viewport across view changes.
+let runTimeWindow = null;
+export function getRunTimeWindow(meta) {
+  if (!runTimeWindow) {
+    runTimeWindow = createTimeWindow({ bounds: meta.time_range, origin: meta.start_ts,
+      maxSpan: Math.min(meta.capabilities?.max_window_s ?? 14400, 14400) });
+  } else runTimeWindow.updateBounds(meta.time_range);
+  return runTimeWindow;
+}

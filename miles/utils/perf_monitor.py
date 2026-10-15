@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import re
+import resource
 import socket
 import threading
 import time
@@ -21,8 +22,6 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-
-from miles.utils.perf_monitor_io import append_records, host_memory_metrics
 
 logger = logging.getLogger(__name__)
 _monitors: dict[str, RuntimeMonitor] = {}
@@ -279,7 +278,7 @@ class RuntimeMonitor:
                 events, self._events = list(self._events), deque(maxlen=2048)
             if self._path is not None:
                 try:
-                    append_records(self._path, [*events, dict(kind="metrics", ts=time.time(), metrics=metrics)])
+                    _append_records(self._path, [*events, dict(kind="metrics", ts=time.time(), metrics=metrics)])
                 except Exception:
                     self._warn("performance log write failed; events dropped")
             if events and getattr(self.args, "use_miles_dashboard", False):
@@ -321,6 +320,49 @@ class RuntimeMonitor:
             self.emit()
 
 
+def _append_records(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as stream:
+        for record in records:
+            stream.write(json.dumps(record, allow_nan=False) + "\n")
+
+
+def _host_memory_metrics() -> dict[str, float]:
+    metrics = {}
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    metrics["process_cpu_seconds_total"] = usage.ru_utime + usage.ru_stime
+    try:
+        resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
+        metrics["process_rss_gb"] = resident_pages * os.sysconf("SC_PAGE_SIZE") / 2**30
+        fields = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+        metrics["node_memory_available_gb"] = int(fields["MemAvailable"].split()[0]) / 2**20
+        status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
+        metrics["process_threads"] = int(status["Threads"])
+        metrics["process_virtual_memory_gb"] = int(status["VmSize"].split()[0]) / 2**20
+    except (OSError, ValueError, KeyError, IndexError):
+        pass
+    # Container namespaces usually mount the current cgroup at this root.
+    root = Path("/sys/fs/cgroup")
+    for key, paths in {
+        "container_memory_gb": ("memory.current", "memory/memory.usage_in_bytes"),
+        "container_memory_limit_gb": ("memory.max", "memory/memory.limit_in_bytes"),
+    }.items():
+        for relative in paths:
+            try:
+                value = int((root / relative).read_text())
+                if value < 2**60:  # v1 unlimited sentinel; v2 'max' fails int()
+                    metrics[key] = value / 2**30
+                break
+            except (OSError, ValueError):
+                continue
+    try:
+        events = dict(line.split() for line in (root / "memory.events").read_text().splitlines())
+        metrics["container_oom_kill_total"] = int(events["oom_kill"])
+    except (OSError, ValueError, KeyError):
+        pass
+    return metrics
+
+
 _disabled = RuntimeMonitor()
 
 
@@ -342,7 +384,7 @@ def get_monitor(args, role: str = "rollout") -> RuntimeMonitor:
         return _disabled
     if role not in _monitors:
         monitor = _monitors[role] = RuntimeMonitor(args=args, role=role)
-        monitor.register("host", host_memory_metrics)
+        monitor.register("host", _host_memory_metrics)
     return _monitors[role]
 
 

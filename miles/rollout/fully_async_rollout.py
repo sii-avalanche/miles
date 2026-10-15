@@ -284,15 +284,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         workload_counts: dict[str, int] = {}
         group_workloads: dict[int, str] = {}
         prefix = "drain" if input.trainer_model_id is None else f"drain/{input.trainer_model_id}"
-        self._monitor.update(
-            {
-                f"{prefix}/rollout_id": input.rollout_id,
-                f"{prefix}/target_groups": target_data_size,
-                f"{prefix}/collected_groups": 0,
-                f"{prefix}/progress_fraction": 0,
-            }
-        )
-        self._monitor.update({f"workload/{name}/collection_progress_fraction": 0 for name in self._workload_targets})
+        self._report_collection(prefix, input.rollout_id, workload_counts)
 
         while len(data) < target_data_size:
             entry = await self._next_group(
@@ -315,19 +307,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             workload_counts[workload] = workload_counts.get(workload, 0) + 1
             if self._monitor.enabled:
                 group_workloads[id(entry.group)] = workload
-            self._monitor.update(
-                {
-                    f"{prefix}/collected_groups": len(data),
-                    f"{prefix}/progress_fraction": len(data) / target_data_size,
-                }
-            )
-            if (target := self._workload_targets.get(workload)) is not None:
-                self._monitor.update(
-                    {
-                        f"workload/{workload}/collection_progress_fraction": workload_counts[workload]
-                        / (target_data_size * target)
-                    }
-                )
+            self._report_collection(prefix, input.rollout_id, workload_counts)
 
         sample = first_sample(data[-1])
         logger.info(
@@ -370,6 +350,24 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             )
 
         return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
+
+    def _report_collection(self, prefix: str, rollout_id: int, counts: dict[str, int]) -> None:
+        if not self._monitor.enabled:
+            return
+        target = self.args.rollout_batch_size
+        collected = sum(counts.values())
+        self._monitor.update(
+            {
+                f"{prefix}/rollout_id": rollout_id,
+                f"{prefix}/target_groups": target,
+                f"{prefix}/collected_groups": collected,
+                f"{prefix}/progress_fraction": collected / target,
+                **{
+                    f"workload/{name}/collection_progress_fraction": counts.get(name, 0) / (target * fraction)
+                    for name, fraction in self._workload_targets.items()
+                },
+            }
+        )
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         self._monitor.increment("producer/recycled_groups_total")

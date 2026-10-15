@@ -43,14 +43,22 @@ fall back to dump-derived `dump/*` aggregates).
 
 Views:
 
-- **Metrics** — a wandb-style category sidebar over every logged metric, plus
-  an `sglang` category (scraped engine series) when present; hover for values,
-  drag to zoom.
-- **Compute Utilization** — per-GPU lanes below 64 GPUs (phase band, NVML
-  utilization, sglang overlay, click-to-zoom bubble strip); above that, a
-  scale-invariant fleet overview (phase composition + utilization band) with a
-  lane-selection grammar (`g:` / `rank:` / `node:` / `every:`) and outlier
-  quick-picks.
+- **Overview** — default run page: whole-fleet GPU utilization and phase composition,
+  then generation, reward, recording, batch collection, trainer waits, training,
+  weight sync and Data Pool on one wall-clock window.
+- **GPU details** — per-GPU curves, memory, engine overlays, MFU, lane selection,
+  utilization distribution and outlier quick-picks. Also accepts legacy `#/timeline`.
+- **Data & samples** — pool versions, workload composition, batch selection,
+  rejections and retries; links into rollout samples and HTML / Trace artifacts.
+- **Training metrics** — learning curves for the current run, with raw metric
+  families retained for inspection. W&B links are for comparing experiments.
+- **Monitoring & alerts** — optional same-origin embedded Grafana, scoped to the
+  run and the shared time window; explicit fallback when monitoring is absent.
+
+The wall-clock window persists across these views in the current document.
+Grafana receives the window on entry or **Apply shared time window**; changes
+inside Grafana do not update Miles. Legacy `#/runtime` opens Overview.
+
 - **Rollouts** — per-step trajectory table and scatter, GRPO group degeneracy
   (`zero_std`), average weight-version staleness, eval tab. Opens on the newest
   step that has samples, skipping one still being dumped; a step named in the
@@ -77,3 +85,9 @@ producers (Timer sinks / rollout hooks / NVML samplers / sglang scraper)
 dump .pt + dashboard_columns/*.parquet + trajectory/*.jsonl   [written by training]
     -> serve.py: MetricStore + DumpReader -> FastAPI -> static SPA
 ```
+
+Runtime instrumentation lives in `miles/utils/perf_monitor.py`, including its
+private JSONL and host-resource helpers. Rollout MoE summaries are part of
+`miles/ray/rollout/metrics.py`; the executor only invokes the logging boundary.
+Buffer queue telemetry uses one cached queue and one set of workload/version
+counts, from which fleet totals are derived when sampled.

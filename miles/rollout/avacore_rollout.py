@@ -3,7 +3,6 @@ import copy
 import json
 import logging
 import os
-import time
 from argparse import Namespace
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
@@ -246,8 +245,7 @@ class AvaCoreRollout:
         *,
         trial_id: int | None = None,
     ) -> None:
-        started = time.monotonic()
-        try:
+        with self._monitor.wait("record/end_to_end"):
             await self._prepare_recording(sampling_params)
             if trial_id is None:
                 trial_id = await self._outbox.allocate_trial(sample, self.args.n_samples_per_prompt)
@@ -277,8 +275,6 @@ class AvaCoreRollout:
 
             with self._monitor.wait("record/persist"):
                 await self._outbox.enqueue(await asyncio.to_thread(snapshot))
-        finally:
-            self._monitor.observe("record/end_to_end", time.monotonic() - started)
 
     async def close(self) -> None:
         if self._outbox is None:

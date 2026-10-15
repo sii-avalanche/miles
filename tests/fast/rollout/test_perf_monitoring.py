@@ -1,14 +1,13 @@
 import asyncio
 import time
 from argparse import Namespace
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from miles.rollout import fully_async_data_buffer as buffers
 from miles.rollout.fully_async_data_buffer import DataBufferConstructorInput, DataBufferInput, DefaultDataBuffer
-from miles.rollout.moe_metrics import expert_load_metrics
+from miles.ray.rollout.metrics import expert_load_metrics
 from miles.utils.perf_monitor import RuntimeMonitor
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
@@ -166,7 +165,27 @@ def test_no_expert_assignments_does_not_fabricate_balance():
     assert values["moe/rollout_layer_1/sample_coverage"] == 0
 
 
-async def test_record_timeout_is_counted_and_retained_until_retry_succeeds(monkeypatch, tmp_path):
+@pytest.mark.parametrize("expert", [0, -1])
+def test_expert_logging_preserves_custom_hook_and_survives_bad_replay(monkeypatch, expert):
+    from miles.ray.rollout import metrics
+
+    captured = []
+    monkeypatch.setattr(metrics, "load_function", lambda _: lambda *args: captured.append(args) or True)
+    args = Namespace(perf_monitor_expert_layer=1, num_experts=4, custom_rollout_log_function_path="custom")
+    samples = [Sample(rollout_routed_experts=np.array([[[expert]]], dtype=np.int32))]
+    extra = {"existing": 7}
+    metrics.log_rollout_data(1, args, samples, extra, 2.0)
+    assert len(captured) == 1
+    reported = captured[0][3]
+    assert reported["existing"] == 7
+    assert captured[0][4] >= 2.0
+    assert ("moe/rollout_layer_1/assignments" in reported) == (expert == 0)
+    assert extra == {"existing": 7}
+
+
+async def test_record_timeout_is_counted_and_retained_until_retry_succeeds(tmp_path):
+    from ava_core.core import ChatMessage, Trace
+    from ava_core.generate.core import Sample as Row
     from psycopg_pool import PoolTimeout
 
     from miles.rollout import avacore_rollout
@@ -176,7 +195,7 @@ async def test_record_timeout_is_counted_and_retained_until_retry_succeeds(monke
     saved = []
 
     class Run:
-        async def create_rollout_from_data(self, **kwargs):
+        async def create_rollout(self, **kwargs):
             attempted.set()
             if not healthy.is_set():
                 raise PoolTimeout("pool has no connections")
@@ -195,14 +214,10 @@ async def test_record_timeout_is_counted_and_retained_until_retry_succeeds(monke
     adapter.run = asyncio.get_running_loop().create_future()
     adapter.run.set_result(Run())
     sample = Sample(epoch=0, index=0, metadata={"_index": 0})
-    trace = SimpleNamespace(last_assistant=lambda: SimpleNamespace(metadata={"weight_version": 1}), subtraces=[])
-    monkeypatch.setattr(
-        avacore_rollout,
-        "STORED",
-        SimpleNamespace(unstructure=lambda value: {"messages": []} if value is trace else value),
-    )
+    trace = Trace(message=ChatMessage(role="assistant", content="answer", metadata={"weight_version": 1}))
+    row = Row({"prompt": "question"}, key=lambda _: "0")
     try:
-        await adapter.record({}, sample, trace, None, {})
+        await adapter.record(row, sample, (trace,), None, {})
         await asyncio.wait_for(attempted.wait(), timeout=1)
         metrics = adapter._monitor.snapshot()
         assert adapter.failed_writes == metrics["runtime/rollout/record/pool_timeout_total"] >= 1
@@ -216,7 +231,7 @@ async def test_record_timeout_is_counted_and_retained_until_retry_succeeds(monke
         assert saved[0]["query_id"] == "0"
         assert saved[0]["trial_id"] == 0
         sample.reset_for_retry()
-        await adapter.record({}, sample, trace, None, {})
+        await adapter.record(row, sample, (trace,), None, {})
         assert await adapter._outbox.flush(timeout=1)
         assert [value["trial_id"] for value in saved] == [0, 16]
         assert [value["metadata"]["generation_round"] for value in saved] == [0, 1]

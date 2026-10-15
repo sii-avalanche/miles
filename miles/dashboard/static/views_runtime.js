@@ -1,17 +1,17 @@
 import { api } from "./api.js";
 import { el, setViewCleanup } from "./app.js";
 import { createAsyncFlow, loadAsyncFlow } from "./async_flow.js";
-import { createTimeWindow, createTimeBar } from "./time_window.js";
+import { getRunTimeWindow, createTimeBar } from "./time_window.js";
 import { createRuntimeStatus } from "./runtime_status.js";
-import { grafanaUrl } from "./observability.js";
+import { createFleet } from "./fleet.js";
+import { PHASE_COLORS } from "./phase_colors.js";
 
-export async function renderRuntime(view, meta) {
-  const timeWindow = createTimeWindow({ bounds: meta.time_range, origin: meta.start_ts,
-    maxSpan: Math.min(meta.capabilities?.max_window_s ?? 14400, 14400) });
+export async function renderRuntime(view, meta, route = {}) {
+  const dataView = route.view === "data";
+  const timeWindow = getRunTimeWindow(meta);
   const timeBars = [];
   const timeBar = label => { const bar = createTimeBar(timeWindow, label); timeBars.push(bar); return bar.root; };
-  const asyncFlow = createAsyncFlow({ timeBar });
-  asyncFlow.root.id = "execution";
+  const asyncFlow = createAsyncFlow({ timeBar, showHistory: dataView, showEngines: dataView });
   const flowHelp = asyncFlow.root.querySelector?.(":scope > p.muted");
   if (flowHelp) {
     const help = el("details", { class: "flow-help" }, [el("summary", {}, ["Timeline legend and counting rules"])]);
@@ -19,30 +19,39 @@ export async function renderRuntime(view, meta) {
     help.append(flowHelp);
   }
   const runtimeStatus = createRuntimeStatus();
+  const fleet = !dataView && meta.capabilities?.has_timeline ? createFleet({
+    phaseColors: PHASE_COLORS, runStart: () => meta.start_ts, timeBar,
+    viewRange: () => timeWindow.get(),
+  }) : null;
   let flowData, flowMeta;
   const status = el("p", { class: "muted" });
-  const utilizationView = el("div");
-  utilizationView.id = "gpu";
-  const grafana = grafanaUrl(meta) ? el("a", { class: "btn grafana-link", href: grafanaUrl(meta, timeWindow.get()), target: "_blank", rel: "noopener" }, ["Grafana · Metrics and alerts ↗"]) : null;
+  const gpuStatus = el("p", { class: "muted" });
+  const shortcuts = dataView ? [
+    ["Rollout samples & traces", "#/rollout/latest"], ["Overview", "#/"],
+  ] : [
+    ["GPU details →", "#/gpu"], ["Data pool & group history →", "#/data"],
+    ["Training metrics →", "#/metrics"], ["Monitoring & alerts →", "#/monitoring"],
+  ];
   view.replaceChildren(
-    el("div", { class: "compute-heading" }, [el("div", {}, [el("h2", {}, ["RL Compute"]),
-      el("p", { class: "muted" }, ["Batch collection, training, weight versions and group history."])]), ...(grafana ? [grafana] : [])]),
-    el("nav", { class: "compute-sections", "aria-label": "RL Compute sections" }, [
-      el("a", { href: "#execution", onclick: event => { event.preventDefault(); asyncFlow.root.scrollIntoView({ behavior: "smooth" }); } }, ["Execution · Batch / Wait / Weight"]),
-      el("a", { href: "#gpu", onclick: event => { event.preventDefault(); utilizationView.scrollIntoView({ behavior: "smooth" }); } }, ["GPU · Utilization and phases"]),
-      el("a", { href: "#groups", onclick: event => { event.preventDefault(); asyncFlow.root.querySelector(".group-history")?.scrollIntoView({ behavior: "smooth" }); } }, ["Data history · Prompt / Group / Attempt"]),
-    ]), status,
-    el("p", { class: "muted" }, ["Time charts share a window. Select rejection events to inspect prompts, attempts and subsequent training. GPU utilization shows observed activity; missing samples remain blank."]),
-    runtimeStatus.root, asyncFlow.root, utilizationView,
+    el("h2", {}, [dataView ? "Data & samples" : "Overview"]),
+    el("p", { class: "muted" }, [dataView
+      ? "Data pool versions, batch selection, rejected groups and retries. Open samples to inspect conversations, tokens and Traces."
+      : "GPU utilization and the complete RL pipeline on one time window: generation, reward, data pool, trainer wait, training and weight sync."]),
+    el("nav", { class: "compute-sections", "aria-label": "Related views" }, shortcuts.map(([label, href]) => el("a", { href }, [label]))),
+    timeBar("Shared window"), status,
+    ...(!dataView ? [runtimeStatus.root,
+      el("h3", {}, ["GPU utilization & phase composition"]),
+      el("p", { class: "muted" }, ["All recorded GPUs: utilization median, p10–p90 and minimum. Phase colors describe controller activity; gaps mean missing samples."]),
+      ...(fleet ? [fleet.root, gpuStatus] : [el("p", { class: "muted" }, ["GPU telemetry was not recorded for this run."])]),
+    ] : []),
+    asyncFlow.root,
   );
-  let utilizationCleanup = null;
   let cancelled = false;
   let refreshing = false;
   let pendingRefresh = false, refreshTimer = null;
   function drawRuntime() {
     if (cancelled || !flowData) return;
     const range = timeWindow.get();
-    if (grafana) grafana.href = grafanaUrl(flowMeta || meta, range);
     const events = flowData.events.filter(e => e.t0 <= range.t1 && (e.t1 ?? range.t1) >= range.t0);
     asyncFlow.draw({ ...flowData, events,
       history: { ...flowData.history, rows: (flowData.history?.rows ?? []).filter(r => r.ts >= range.t0 && r.ts <= range.t1) },
@@ -53,9 +62,9 @@ export async function renderRuntime(view, meta) {
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(refresh, 300);
   }
-  const unsubscribe = timeWindow.subscribe(() => { drawRuntime(); scheduleRefresh(); });
+  const unsubscribe = timeWindow.subscribe(() => { drawRuntime(); fleet?.redraw(); scheduleRefresh(); });
   let interval = null;
-  const onResize = drawRuntime;
+  const onResize = () => { drawRuntime(); fleet?.redraw(); };
   window.addEventListener("resize", onResize);
   setViewCleanup(() => {
     cancelled = true;
@@ -63,7 +72,7 @@ export async function renderRuntime(view, meta) {
     clearTimeout(refreshTimer);
     unsubscribe();
     for (const bar of timeBars) bar.destroy();
-    utilizationCleanup?.();
+    fleet?.destroy();
     window.removeEventListener("resize", onResize);
   });
   async function refresh() {
@@ -81,6 +90,9 @@ export async function renderRuntime(view, meta) {
       const [flow, currentStatus] = await Promise.all([
         loadAsyncFlow(liveMeta, t0, t1),
         api("/api/runtime/status").catch(() => null),
+        fleet?.refresh({ t0, t1 }).then(() => { gpuStatus.textContent = ""; }).catch(error => {
+          if (!cancelled) gpuStatus.textContent = `GPU overview unavailable: ${error.message}`;
+        }),
       ]);
       if (cancelled || requestedVersion !== timeWindow.get().version) return;
       flowData = flow; flowMeta = liveMeta;
@@ -99,15 +111,5 @@ export async function renderRuntime(view, meta) {
   }
   await refresh();
   if (cancelled) return;
-  if (meta.capabilities?.has_timeline) {
-    try {
-      const { renderTimeline } = await import("./views_timeline.js");
-      await renderTimeline(utilizationView, meta, null, {
-        embedded: true, timeWindow, registerCleanup: cleanup => { utilizationCleanup = cleanup; },
-      });
-    } catch (error) {
-      utilizationView.replaceChildren(el("p", { class: "error" }, [String(error)]));
-    }
-  }
   if (!cancelled && meta.mode === "follow") interval = setInterval(refresh, 5000);
 }

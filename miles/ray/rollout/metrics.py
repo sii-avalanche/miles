@@ -1,4 +1,6 @@
 import logging
+import time
+from collections.abc import Iterable
 from numbers import Number
 from typing import Any
 
@@ -15,6 +17,7 @@ from miles.utils.metric_utils import (
     has_repetition,
     namespace_metrics,
 )
+from miles.utils.perf_monitor import get_monitor
 from miles.utils.tracking_utils import tracking
 from miles.utils.types import Sample
 
@@ -74,6 +77,15 @@ def log_eval_skip(rollout_id, args, reason: str):
 def log_rollout_data(
     rollout_id, args, samples, rollout_extra_metrics, rollout_time, trainer_model_id: str | None = None
 ):
+    if (layer := getattr(args, "perf_monitor_expert_layer", None)) is not None:
+        rollout_extra_metrics = dict(rollout_extra_metrics or {})
+        started = time.monotonic()
+        try:
+            with get_monitor(args).wait("telemetry/expert_counts"):
+                rollout_extra_metrics.update(expert_load_metrics(samples, layer=layer, num_experts=args.num_experts))
+        except Exception:
+            logger.warning("Expert telemetry failed; this batch has no expert metrics", exc_info=True)
+        rollout_time += time.monotonic() - started
     if (x := args.custom_rollout_log_function_path) is not None:
         custom_log_func = load_function(x)
         if custom_log_func(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
@@ -365,3 +377,38 @@ def _compute_passrate_from_samples(args, all_samples: list[Sample]) -> dict[str,
         flat_rewards=flat_rewards,
         group_size=group_size,
     )
+
+
+def expert_load_metrics(samples: Iterable[Sample], *, layer: int, num_experts: int) -> dict[str, float]:
+    """Count served-policy routing assignments, including prompts, before training."""
+    counts = np.zeros(num_experts, dtype=np.int64)
+    samples_seen = samples_counted = 0
+    for sample in samples:
+        samples_seen += 1
+        routed = sample.rollout_routed_experts
+        if routed is None:
+            continue
+        if routed.ndim != 3 or routed.shape[1] < layer:
+            continue
+        samples_counted += 1
+        # Only one layer; bound temporary int64 allocations even for 250k-token traces.
+        for start in range(0, routed.shape[0], 8192):
+            ids = np.asarray(routed[start : start + 8192, layer - 1, :]).reshape(-1)
+            if ids.size and (ids.min() < 0 or ids.max() >= num_experts):
+                raise ValueError("routing replay contains out-of-range expert ids")
+            counts += np.bincount(ids.astype(np.int64, copy=False), minlength=num_experts)
+    prefix = f"moe/rollout_layer_{layer}/"
+    result = {
+        f"{prefix}sample_coverage": samples_counted / samples_seen if samples_seen else 0,
+        f"{prefix}assignments": int(counts.sum()),
+    }
+    mean = float(counts.mean())
+    if mean > 0:
+        result.update(
+            {
+                f"{prefix}cv": float(counts.std()) / mean,
+                f"{prefix}max_over_mean": int(counts.max()) / mean,
+                f"{prefix}cold_experts_fraction": float(np.mean(counts < 0.1 * mean)),
+            }
+        )
+    return result

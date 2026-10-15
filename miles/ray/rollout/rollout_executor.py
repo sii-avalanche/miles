@@ -25,7 +25,6 @@ from miles.rollout.base_types import (
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
 from miles.rollout.group_identity import batch_group_identities
-from miles.rollout.moe_metrics import expert_load_metrics
 from miles.utils import object_store
 from miles.utils.async_utils import maybe_await
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
@@ -171,12 +170,6 @@ class RolloutExecutor:
             metadata=metadata,
             trainer_model_id=trainer_model_id,
         )
-        if (layer := getattr(self.args, "perf_monitor_expert_layer", None)) is not None:
-            try:
-                with self._monitor.wait("telemetry/expert_counts"):
-                    metrics.update(expert_load_metrics(data, layer=layer, num_experts=self.args.num_experts))
-            except Exception:
-                logger.warning("Expert telemetry failed; this batch has no expert metrics", exc_info=True)
         log_rollout_data(
             rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
         )

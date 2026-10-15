@@ -3,7 +3,8 @@ import { renderMetrics } from "./views_metrics.js";
 import { renderRollout } from "./views_rollout.js";
 import { renderTokens } from "./views_tokens.js";
 import { renderRuntime } from "./views_runtime.js";
-import { grafanaUrl } from "./observability.js";
+import { renderMonitoring } from "./views_monitoring.js";
+import { renderGpu } from "./views_timeline.js";
 
 // tiny DOM builder: el("div", {class: "x", onclick: fn}, [children|strings])
 export function el(tag, attrs = {}, children = []) {
@@ -44,11 +45,9 @@ function parseRoute() {
   const [path, query] = (location.hash.slice(1) || "/").split("?");
   const segments = path.split("/").filter(Boolean);
   const params = new URLSearchParams(query || "");
-  if (!segments.length || segments[0] === "runtime") return { view: "runtime" };
-  if (segments[0] === "timeline") {
-    history.replaceState(null, "", "#/runtime");
-    return { view: "runtime" };
-  }
+  if (!segments.length || ["overview", "runtime"].includes(segments[0])) return { view: "overview" };
+  if (["gpu", "timeline"].includes(segments[0])) return { view: "gpu", lanes: params.get("lanes") };
+  if (["data", "monitoring"].includes(segments[0])) return { view: segments[0] };
   if (segments[0] === "rollout" && segments.length >= 2) {
     const evaluation = params.get("eval") === "1";
     // "latest" is resolved against the dump at render time rather than baked
@@ -79,12 +78,13 @@ function crumbs(route, meta) {
   if (/\/runs\/[a-f0-9]+\/$/.test(APP_BASE.pathname)) {
     parts.push(nav("All runs", new URL("../../", APP_BASE).href, false));
   }
-  parts.push(nav("RL Compute", "#/", route.view === "runtime"));
-  parts.push(nav("Metrics", "#/metrics", route.view === "metrics"));
-  if (grafanaUrl(meta)) parts.push(el("a", { class: "nav", href: grafanaUrl(meta), target: "_blank", rel: "noopener" }, ["Grafana ↗"]));
-  // the per-step data view is a top-level destination, not a hidden
-  // click-through from chart points; land on the newest usable train step
-  if (meta.rollout_ids.train.length) {
+  parts.push(nav("Overview", "#/", route.view === "overview"));
+  parts.push(nav("GPU details", "#/gpu", route.view === "gpu"));
+  parts.push(nav("Data & samples", "#/data", ["data", "rollout", "tokens"].includes(route.view)));
+  parts.push(nav("Training metrics", "#/metrics", route.view === "metrics"));
+  parts.push(nav("Monitoring & alerts", "#/monitoring", route.view === "monitoring"));
+  // Data & samples owns rollout inspection; keep a table shortcut in detail views.
+  if (["rollout", "tokens"].includes(route.view) && meta.rollout_ids.train.length) {
     const onRollout = route.view === "rollout" || route.view === "tokens";
     const replaceInPlace = (event) => {
       event.preventDefault();
@@ -110,7 +110,9 @@ function crumbs(route, meta) {
   document.getElementById("crumbs").replaceChildren(...parts);
 }
 
+let renderVersion = 0;
 async function render() {
+  const version = ++renderVersion;
   if (activeViewCleanup) {
     activeViewCleanup();
     activeViewCleanup = null;
@@ -120,23 +122,26 @@ async function render() {
   view.replaceChildren(el("p", { class: "muted" }, ["loading…"]));
   try {
     const meta = await getMeta();
+    if (version !== renderVersion) return;
     crumbs(route, meta);
     const modeLabel =
-      meta.mode === "follow" ? "● live — auto-refreshing from a still-running job" : "◼ static snapshot — job has finished";
+      meta.mode === "follow" ? "Auto-refresh enabled; source freshness determines current activity" : "Static snapshot; auto-refresh disabled";
     const runinfo = [
       el("span", {}, [`run: ${meta.run_name ?? "unnamed run"}`]),
       " · ",
       el("span", { title: modeLabel }, [meta.mode === "follow" ? "● live" : "◼ static"]),
       ...(meta.capabilities.has_metrics ? [] : [" · dump-derived metrics"]),
     ];
-    if (meta.wandb_url) runinfo.push(" · ", el("a", { href: meta.wandb_url, target: "_blank" }, ["wandb ↗"]));
+    if (meta.wandb_url) runinfo.push(" · ", el("a", { href: meta.wandb_url, target: "_blank", rel: "noopener", title: "Compare experiments, configs and training curves" }, ["W&B · Experiments ↗"]));
     document.getElementById("runinfo").replaceChildren(...runinfo);
     if (route.view === "metrics") await renderMetrics(view, meta);
-    else if (route.view === "runtime") await renderRuntime(view, meta);
+    else if (["overview", "data"].includes(route.view)) await renderRuntime(view, meta, route);
+    else if (route.view === "gpu") await renderGpu(view, meta, route);
+    else if (route.view === "monitoring") await renderMonitoring(view, meta);
     else if (route.view === "rollout") await renderRollout(view, meta, route);
     else await renderTokens(view, meta, route);
   } catch (err) {
-    view.replaceChildren(el("div", { class: "error" }, [String(err)]));
+    if (version === renderVersion) view.replaceChildren(el("div", { class: "error" }, [String(err)]));
   }
 }
 

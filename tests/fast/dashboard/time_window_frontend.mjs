@@ -43,3 +43,9 @@ empty.updateBounds([10, 10]);
 assert.equal(empty.get().ready, false);
 assert.equal(empty.setWindow(NaN, Infinity), false);
 console.log("Shared time window passed: synchronized bars, bounded pan, live following, keyboard and cleanup.");
+
+const shared = mod.namespace.getRunTimeWindow({ time_range: [1000, 21000], start_ts: 1000 });
+shared.setWindow(2000, 5000);
+const nextView = mod.namespace.getRunTimeWindow({ time_range: [1000, 22000], start_ts: 1000 });
+assert.equal(shared, nextView);
+assert.deepEqual([nextView.get().t0, nextView.get().t1], [2000, 5000], "view changes preserve a historical window");

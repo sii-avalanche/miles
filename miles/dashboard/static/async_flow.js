@@ -61,7 +61,7 @@ export function batchPoolSnapshots(metrics, events) {
   return [...snapshots.values()].sort((a, b) => a.ts - b.ts);
 }
 
-export function createAsyncFlow({ timeBar } = {}) {
+export function createAsyncFlow({ timeBar, showHistory = true, showEngines = true } = {}) {
   const canvas = el("canvas", { class: "timeline" });
   const note = el("p", { class: "muted" });
   const table = el("tbody");
@@ -131,7 +131,10 @@ export function createAsyncFlow({ timeBar } = {}) {
     ]), el("div", { class: "legend" }, BUCKETS.map(([, label, color]) =>
       el("span", { style: `color:${color};margin-right:12px` }, [`■ ${label}`]))), note, canvas,
     ...(timeBar ? [timeBar("Async flow")] : []),
-    poolTable, groupSection,
+    ...(showHistory ? [poolTable, groupSection] : [
+      el("details", {}, [el("summary", {}, ["Pool version breakdown"]), poolTable]),
+      el("p", {}, [el("a", { href: "#/data" }, ["Inspect rejections, retries and group history →"])]),
+    ]),
     el("details", {}, [el("summary", {}, ["Batch versions, weight publications and rejected data (latest 100 events)"]),
       ...(timeBar ? [timeBar("Batch events")] : []),
       el("table", {}, [el("thead", {}, [el("tr", {}, ["Time", "Event / batch", "Details"].map(x => el("th", {}, [x])))]), table])]),
@@ -141,7 +144,7 @@ export function createAsyncFlow({ timeBar } = {}) {
     canvas.setAttribute?.("data-time-start", t0);
     canvas.setAttribute?.("data-time-end", t1);
     history = data.history ?? { rows: [], counts: {} };
-    drawGroups();
+    if (showHistory) drawGroups();
     const decisions = new Map(history.rows.filter(row => row.timestamp_kind === "decision" && row.event === "buffer_reject").map(row => [row.ts, row]));
     const events = finalEvents(data.events ?? []);
     const readyBatches = new Set(events.filter(e => e.name === "batch_ready").map(e => e.rollout_id));
@@ -162,8 +165,8 @@ export function createAsyncFlow({ timeBar } = {}) {
     const hasBatchRecords = BATCH + "collected_groups" in data.metrics || events.some(e => e.role === "rollout" && ["batch_pool", "batch_abort"].includes(e.name));
     const hasBatchPool = hasBatchRecords || ["one_step_off_policy", "synchronous"].includes(meta.training_strategy?.kind);
     const rows = [
-      ...engines.map((s, i) => ({ label: `Engine ${i + 1}`, engine: s })),
-      ...(!engines.length ? [{ label: "Engine requests", missing: true }] : []),
+      ...(showEngines ? (engines.length ? engines.map((s, i) => ({ label: `Engine ${i + 1}`, engine: s }))
+        : [{ label: "Engine requests", missing: true }]) : []),
       ...ROLLOUT_STAGES.map(stage => ({ label: stageLabel(stage, meta.reward_info), stage })),
       ...["Collect batch", "Trainer wait", "Train", "Train → inference"].map(label => ({ label })),
       ...prefixes.map(prefix => ({ label: `Pool${prefix.slice("runtime/rollout/buffer".length)}`, prefix })),
@@ -315,6 +318,7 @@ export function createAsyncFlow({ timeBar } = {}) {
       const hit = hits.findLast(h => x >= h.x && x <= h.end && y >= h.y && y <= h.y + h.height);
       if (!hit?.decision) return;
       if (hit.decision.artifact) window.open(artifactUrl(hit.decision.artifact), "_blank", "noopener");
+      else if (!showHistory) location.hash = "#/data";
       else {
         selectedTs = hit.decision.ts; reason.value = hit.decision.reason; search.value = "";
         drawGroups(); groupSection.scrollIntoView?.({ behavior: "smooth", block: "start" });
@@ -328,7 +332,7 @@ export function createAsyncFlow({ timeBar } = {}) {
       (data.truncated ? "Event limit reached; narrow the time window to inspect omitted events. " : "") +
       ((data.metrics["runtime/rollout/telemetry/events_dropped_total"]?.y?.at(-1) ?? 0) > 0
         ? "The telemetry writer reported dropped events; decision history may be incomplete. " : "") +
-      (data.engines.length > engines.length ? `Showing ${engines.length} of ${data.engines.length} engine series. ` : "") +
+      (showEngines && data.engines.length > engines.length ? `Showing ${engines.length} of ${data.engines.length} engine series. ` : "") +
       (prefixes.length ? "Pool height scales to the maximum queued groups in this window." : hasBatchPool ? "" : "Pool sizes were not recorded by this run; new telemetry requires updated training code.");
     table.replaceChildren(...events.filter(e => ["buffer_reject", "batch_reject", "batch_ready", "weight_published", "batch_abort"].includes(e.name) ||
       (e.name === "training_batch_selected" && !readyBatches.has(e.rollout_id)))
