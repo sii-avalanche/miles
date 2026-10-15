@@ -40,7 +40,22 @@ class AvaCoreRollout:
         self.args = args
         self.config = config
         conv = launch_converter()
-        self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
+        self._remote_generate = None
+        generate_config = interpolated(self.config["generate"])
+        if "remote_rollout" in config:
+            # AvaTrain owns this optional service adapter. Router args stay GPU-local:
+            # the dashboard and inference controller must keep their real SGLang endpoints.
+            from avatrain.remote_rollout import RemoteGenerate, RemoteSettings
+
+            run_id = os.environ.get("RUN_DIR")
+            if not run_id:
+                raise ValueError("Remote rollout requires RUN_DIR to share the run's sandbox concurrency gate")
+            self._remote_generate = RemoteGenerate(
+                generate_config, RemoteSettings(**interpolated(config["remote_rollout"])), run_id=run_id
+            )
+            self.generate_fn = self._remote_generate
+        else:
+            self.generate_fn = conv.structure(generate_config, GenerateFunction)
         self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
@@ -277,6 +292,8 @@ class AvaCoreRollout:
                 await self._outbox.enqueue(await asyncio.to_thread(snapshot))
 
     async def close(self) -> None:
+        if self._remote_generate is not None:
+            await self._remote_generate.aclose()
         if self._outbox is None:
             return
         if self._recording_ready is not None and not self._recording_ready.done():
@@ -293,7 +310,11 @@ class AvaCoreRollout:
             )
 
     async def dispose(self) -> None:
-        loop = self._recording_ready.get_loop() if self._recording_ready is not None else asyncio.get_running_loop()
+        loop = (
+            self._recording_ready.get_loop()
+            if self._recording_ready is not None
+            else getattr(self._remote_generate, "loop", None) or asyncio.get_running_loop()
+        )
         if loop is asyncio.get_running_loop():
             await self.close()
         else:
