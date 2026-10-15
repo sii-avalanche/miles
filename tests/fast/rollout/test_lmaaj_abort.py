@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from ava_core import TokioPost
-from ava_core.core import ChatMessage, ChatTrace, HttpEndpoint, OpenAIClient, TokenTrace
+from ava_core.core import ChatMessage, HttpEndpoint, OpenAIClient, Trace
 from ava_core.core.retry import HTTPRetry
 from ava_core.rewards.core import Reward
 from ava_core.rewards.lmaaj import LMaaJ
@@ -114,7 +114,7 @@ def abort_without_workers(monkeypatch):
 
 async def make_adapter(client):
     async def generate(_row, **_kwargs):
-        return ChatTrace.from_messages([ChatMessage(role="assistant", content="candidate")])
+        return (Trace.from_messages([ChatMessage(role="assistant", content="candidate")]),)
 
     adapter = object.__new__(avacore_rollout.AvaCoreRollout)
     adapter.generate_fn = generate
@@ -183,14 +183,16 @@ async def test_abort_stops_judge_retry_backoff(abort_without_workers):
 async def test_abort_finishes_completed_reward_snapshot(abort_without_workers, monkeypatch, tmp_path):
     adapter = object.__new__(avacore_rollout.AvaCoreRollout)
     state = make_state(adapter)
-    trace = TokenTrace(
-        segments=(),
-        parser=None,
-        _messages=(ChatMessage(role="assistant", content="candidate", metadata={"weight_version": 1}),),
+    from miles.rollout.avacore_trace import _segment
+
+    trace = Trace(
+        message=ChatMessage(role="assistant", content="candidate", metadata={"weight_version": 1}),
+        generated=True,
+        segments=(_segment(dict(tokens=[1], log_probs=[-0.1], template="candidate", is_generated=True)),),
     )
 
     async def generate(_row, **_kwargs):
-        return trace
+        return (trace,)
 
     async def reward(_trace, _row):
         return Reward(score=1)

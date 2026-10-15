@@ -36,6 +36,24 @@ class TestIsMegatronCheckpoint:
         assert _is_megatron_checkpoint(tmp_path) is False
 
     @pytest.mark.parametrize(
+        "weights_file",
+        ["model.safetensors.index.json", "model.safetensors", "pytorch_model.bin.index.json", "pytorch_model.bin"],
+    )
+    def test_hf_export_named_like_megatron_iteration(self, tmp_path, weights_file):
+        directory = tmp_path / "iter_0001374"
+        directory.mkdir()
+        (directory / "config.json").write_text("{}")
+        (directory / weights_file).write_text("")
+
+        assert _is_megatron_checkpoint(directory) is False
+
+    def test_explicit_megatron_tracker_takes_precedence_over_hf_assets(self, tmp_path):
+        (tmp_path / "latest_checkpointed_iteration.txt").write_text("release")
+        (tmp_path / "model.safetensors.index.json").write_text("{}")
+
+        assert _is_megatron_checkpoint(tmp_path) is True
+
+    @pytest.mark.parametrize(
         "name",
         [
             "iter_0000001",

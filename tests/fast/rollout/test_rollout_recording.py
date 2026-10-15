@@ -3,12 +3,50 @@ import copy
 import gzip
 import json
 import threading
+from argparse import Namespace
 
 import pytest
 
 from miles.rollout import rollout_recording
 from miles.rollout.rollout_recording import DurableRolloutOutbox
 from miles.utils.types import Sample
+
+
+@pytest.mark.parametrize("version", ["default", "007", 3, None])
+async def test_avacore_record_preserves_original_weight_version(tmp_path, version):
+    from ava_core.core import ChatMessage, Trace
+    from ava_core.generate.core import Sample as Row
+    from ava_core.rewards.core import Reward
+
+    from miles.rollout.avacore_rollout import AvaCoreRollout
+    from miles.utils.perf_monitor import RuntimeMonitor
+
+    saved = []
+
+    async def write(value):
+        saved.append(value)
+
+    async def prepared(_params):
+        pass
+
+    adapter = object.__new__(AvaCoreRollout)
+    adapter.args = Namespace(n_samples_per_prompt=2)
+    adapter._monitor = RuntimeMonitor(args=Namespace(perf_monitor_interval=10), role="rollout", sink=lambda _: None)
+    adapter._prepare_recording = prepared
+    adapter._outbox = outbox(tmp_path, write)
+    trace = Trace(message=ChatMessage(role="assistant", content="answer", metadata={"weight_version": version}))
+    sample = Sample(index=0, group_index=0, metadata={"_index": 7})
+    await adapter._outbox.start()
+    try:
+        await adapter.record(Row({"prompt": "question"}, key=lambda _: "7"), sample, (trace,), Reward(score=1), {}, trial_id=0)
+        assert await adapter._outbox.flush(timeout=2)
+        assert saved[0]["metadata"]["weight_version"] == version
+        assert type(saved[0]["metadata"]["weight_version"]) is type(version)
+        committed = next((tmp_path / "committed").glob("*.json.gz"))
+        with gzip.open(committed, "rt") as stream:
+            assert json.load(stream)["metadata"]["weight_version"] == version
+    finally:
+        await adapter._outbox.close(timeout=2)
 
 
 def record(trial_id=0):

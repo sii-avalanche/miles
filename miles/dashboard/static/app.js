@@ -80,8 +80,8 @@ function crumbs(route, meta) {
     parts.push(nav("All runs", new URL("../../", APP_BASE).href, false));
   }
   parts.push(nav("RL Compute", "#/", route.view === "runtime"));
-  if (!grafanaUrl(meta)) parts.push(nav("Metrics", "#/metrics", route.view === "metrics"));
-  else parts.push(el("a", { class: "nav", href: grafanaUrl(meta), target: "_blank", rel: "noopener" }, ["Grafana ↗"]));
+  parts.push(nav("Metrics", "#/metrics", route.view === "metrics"));
+  if (grafanaUrl(meta)) parts.push(el("a", { class: "nav", href: grafanaUrl(meta), target: "_blank", rel: "noopener" }, ["Grafana ↗"]));
   // the per-step data view is a top-level destination, not a hidden
   // click-through from chart points; land on the newest usable train step
   if (meta.rollout_ids.train.length) {

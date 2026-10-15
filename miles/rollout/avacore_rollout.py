@@ -13,17 +13,19 @@ from typing import Any
 import numpy as np
 import pybase64
 from ava_core.config import interpolated, launch_converter
-from ava_core.core import Schema, TokenTrace, Trace
+from ava_core.core import Schema, Trace
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import Reward
 from ava_core.runner import RECOVERABLE_ERRORS
 from ava_core.store.core import STORED, Run
-from ava_core.store.postgres import PostgresBackend, PostgresRun
+from ava_core.store.postgres import PostgresBackend
 
+from miles.rollout.avacore_trace import conversation_tips, graph_nodes, snapshot_traces, write_record
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.rollout.rollout_recording import DurableRolloutOutbox, _atomic_json
+from miles.rollout.screening_resume import inherit_records
 from miles.utils.perf_monitor import get_monitor
 from miles.utils.types import Sample, WeightVersionsPerCall
 
@@ -54,10 +56,6 @@ class AvaCoreRollout:
         self._monitor.register("record", self._record_perf_snapshot)
 
     def _init_recording(self) -> None:
-        if not hasattr(PostgresRun, "create_rollout_from_data"):
-            raise RuntimeError(
-                "Update AvaCore before enabling durable recording: create_rollout_from_data is required"
-            )
         recording = self.recording
         self._pool_min = int(recording.get("pool_min_size", 8))
         self._pool_max = int(recording.get("pool_max_size", 64))
@@ -110,6 +108,18 @@ class AvaCoreRollout:
             self._recording_ready = asyncio.create_task(self._start_recording(sampling_params))
         await asyncio.shield(self._recording_ready)
 
+    async def inherit_completed(self, groups, manifests, sampling_params) -> int:
+        """Copy confirmed old responses to this run without regenerating or rejudging."""
+        if self.recording is None:
+            raise ValueError("Inherited rollouts require recording")
+        if any(manifest["run"] == self.recording["run"] for manifest in manifests.values()):
+            raise ValueError("Screening inheritance requires a new run")
+        await self._prepare_recording(sampling_params)
+        count = await inherit_records(self._outbox, groups, manifests)
+        if not await self._outbox.flush(self._shutdown_timeout):
+            raise RuntimeError("Inherited rollout writes are still pending; replay the new run's rollout_records")
+        return count
+
     async def generate(
         self, sample: Sample, sampling_params: dict[str, Any], *, evaluation: bool = False
     ) -> Sample | list[Sample]:
@@ -121,38 +131,41 @@ class AvaCoreRollout:
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         try:
             with self._monitor.wait("sample/generate"):
-                trace = await self.generate_fn(row, sampling_params=sampling_params, **replay)
+                traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
             if any(
                 message.metadata["finish_reason"]["type"] == "abort"
-                for node in flattened(trace)
-                for message in node.messages
+                for node in graph_nodes(traces)
+                for message in (node.message,)
                 if "finish_reason" in message.metadata
             ):
                 sample.status = Sample.Status.ABORTED
                 return sample
             with self._monitor.wait("sample/reward"):
-                reward = await self.reward_fn(trace, row)
+                reward = await self.reward_fn(traces[0], row)
         except RECOVERABLE_ERRORS as error:
             self._monitor.increment("sample/recoverable_errors_total")
             logger.warning("AvaCore rollout of sample %s aborted: %r", sample.index, error)
             sample.status = Sample.Status.ABORTED
             return sample
 
-        assert isinstance(trace, TokenTrace), "AvaCore rollouts must drive the policy through a token-level client"
+        assert traces and any(node.segments for node in graph_nodes(traces)), (
+            "AvaCore rollouts must drive the policy through a token-level client"
+        )
         if self.recording is not None and not evaluation:
             # Only disk durability is awaited here. Database writes run independently
             # with bounded concurrency; a retry cannot mutate an accepted snapshot.
-            persist = asyncio.create_task(self.record(row, sample, trace, reward, sampling_params, trial_id=trial_id))
+            persist = asyncio.create_task(self.record(row, sample, traces, reward, sampling_params, trial_id=trial_id))
             try:
                 await asyncio.shield(persist)
             except asyncio.CancelledError:
                 await persist
                 raise
-        samples = [
-            filled(self.args, copy.deepcopy(sample), node, reward.score)
-            for node in flattened(trace)
-            if isinstance(node, TokenTrace) and any(segment.is_generated for segment in node.segments)
-        ]
+        samples, owned = [], set()
+        for tip in conversation_tips(traces):
+            generated = {node for node in tip.prefixes if node.generated and node.segments}
+            if generated - owned:
+                samples.append(filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned))
+                owned.update(generated)
         return samples[0] if len(samples) == 1 else samples
 
     def _record_perf_snapshot(self) -> dict[str, float]:
@@ -172,9 +185,9 @@ class AvaCoreRollout:
                 self.recording["postgres"],
                 min_size=self._pool_min,
                 max_size=self._pool_max,
-                timeout=self._pool_timeout,
             )
         )
+        store.pool.timeout = self._pool_timeout
         self._record_pool = store.pool
         run = await self.stack.enter_async_context(
             store.rl_run(
@@ -208,9 +221,7 @@ class AvaCoreRollout:
         with self._monitor.wait("record/open_wait"):
             run = await self._get_run()
         with self._monitor.wait("record/create_rollout"):
-            await run.create_rollout_from_data(
-                **(record | {"instance": Row(record["instance"], key=lambda _: record["query_id"])})
-            )
+            await write_record(run, record)
 
     def _record_event(self, event: str, error: Exception | None) -> None:
         self._monitor.increment(f"record/{event}_total")
@@ -229,7 +240,7 @@ class AvaCoreRollout:
         self,
         row: Row,
         sample: Sample,
-        trace: TokenTrace,
+        traces: tuple[Trace, ...],
         reward: Reward,
         sampling_params: dict[str, Any],
         *,
@@ -240,8 +251,10 @@ class AvaCoreRollout:
             await self._prepare_recording(sampling_params)
             if trial_id is None:
                 trial_id = await self._outbox.allocate_trial(sample, self.args.n_samples_per_prompt)
+            # Raw-HF inference can report a name such as "default". Keep the
+            # source version; staleness calculations separately select numeric versions.
             metadata = {
-                "weight_version": int(trace.last_assistant().metadata["weight_version"]),
+                "weight_version": traces[0].last_assistant().metadata.get("weight_version"),
                 "epoch": sample.epoch,
                 "group_index": sample.group_index,
                 "sample_index": sample.index,
@@ -256,8 +269,7 @@ class AvaCoreRollout:
                     "query_id": str(sample.metadata["_index"]),
                     "trial_id": trial_id,
                     "instance": STORED.unstructure(row),
-                    "trace": STORED.unstructure(trace),
-                    "subtraces": [STORED.unstructure(node) for node in trace.subtraces],
+                    "trace_graph": snapshot_traces(traces),
                     "reward": STORED.unstructure(reward),
                     "status": "completed",
                     "metadata": metadata,
@@ -301,26 +313,30 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     )
 
 
-def flattened(trace: Trace) -> list[Trace]:
-    return [trace] + [node for subtrace in trace.subtraces for node in flattened(subtrace)]
-
-
-def filled(args: Namespace, sample: Sample, trace: TokenTrace, reward: float) -> Sample:
-    # Context after the last generated turn trains nothing, and no request routed it for replay.
-    segments = trace.segments[: max(i for i, segment in enumerate(trace.segments) if segment.is_generated) + 1]
+def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, *, owned: set[Trace] | None = None) -> Sample:
+    # Shared generated prefixes train only in the first listed branch, as in the result store.
+    owned = owned or set()
+    segments = trace.path_segments
+    segments = segments[: max(i for i, segment in enumerate(segments) if segment.is_generated) + 1]
     length = sum(len(segment.tokens) for segment in segments)
     prompt_length = len(segments[0].tokens)
     sample.tokens = trace.tokens[:length]
     sample.response = "".join(segment.template for segment in segments[1:])
     sample.response_length = length - prompt_length
-    sample.loss_mask = trace.loss_mask[prompt_length:length]
+    mask = [
+        int(segment.is_generated and node not in owned)
+        for node in trace.prefixes
+        for segment in node.segments
+        for _ in segment.tokens
+    ]
+    sample.loss_mask = mask[prompt_length:length]
     sample.rollout_log_probs = [log_prob or 0.0 for log_prob in trace.log_probs[prompt_length:length]]
     spans, offset = [], 0
     for segment in segments:
         if segment.is_generated:
             spans.append((offset, offset + len(segment.tokens)))
         offset += len(segment.tokens)
-    finished = [message for message in trace.messages if "finish_reason" in message.metadata]
+    finished = [node.message for node in trace.prefixes if node.generated and node.segments]
     for message, (start, end) in zip(finished, spans, strict=True):
         # The trace keeps log probs per token, not per call: anchor the call's weight versions to its own segment.
         versioning = ("weight_version", "weight_versions")
@@ -329,10 +345,11 @@ def filled(args: Namespace, sample: Sample, trace: TokenTrace, reward: float) ->
             message.metadata | {"output_token_logprobs": [None] * (end - start)}, output_end=end
         )
     if args.use_rollout_routing_replay and sample.status != Sample.Status.ABORTED:
-        assert trace.routed_experts, (
+        chunks = [segment.metadata["routed_experts"] for segment in segments if "routed_experts" in segment.metadata]
+        assert chunks, (
             "Internal error: routing replay enabled but no routed experts returned. Perhaps some traces are not generated by the configured generate function."
         )
-        routed = np.frombuffer(b"".join(pybase64.b64decode(chunk) for chunk in trace.routed_experts), dtype=np.int32)
+        routed = np.frombuffer(b"".join(pybase64.b64decode(chunk) for chunk in chunks), dtype=np.int32)
         row = args.num_layers * args.moe_router_topk
         if routed.size == length * row:
             # sglang also forwarded the final token, whose routing feeds no training position

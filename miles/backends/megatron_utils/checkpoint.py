@@ -186,9 +186,22 @@ def save_checkpoint_with_lora(
 
 
 def _is_megatron_checkpoint(path: str | Path) -> bool:
-    return (Path(path) / "latest_checkpointed_iteration.txt").is_file() or bool(
-        re.fullmatch(r"iter_\d{7}", Path(path).name)
-    )
+    path = Path(path)
+    if (path / "latest_checkpointed_iteration.txt").is_file():
+        return True
+    # HF exports may also be named iter_0000001. Their weights take precedence
+    # over the legacy directory-name heuristic, or Megatron silently loads nothing.
+    if any(
+        (path / name).is_file()
+        for name in (
+            "model.safetensors.index.json",
+            "model.safetensors",
+            "pytorch_model.bin.index.json",
+            "pytorch_model.bin",
+        )
+    ):
+        return False
+    return bool(re.fullmatch(r"iter_\d{7}", path.name))
 
 
 @contextmanager

@@ -251,6 +251,16 @@ def test_group_staleness_uses_oldest_version_across_nested_samples():
     assert group_staleness([make_sample(weight_versions=("12",))], current_version=10) == -2
 
 
+def test_named_weight_versions_are_preserved_but_excluded_from_staleness():
+    sample = make_sample(weight_versions=("default", "007", "future"))
+    assert sample.oldest_weight_version == 7
+    assert group_staleness([sample], current_version=10) == 3
+    assert [span.version for span in sample.all_weight_version_spans] == ["default", "007", "future"]
+    default = make_sample(weight_versions=("default",))
+    assert default.oldest_weight_version is None
+    assert group_staleness([default], current_version=10) is None
+
+
 def test_group_weight_version_stats_preserve_sample_and_token_populations():
     first = make_sample()
     first.weight_versions = [

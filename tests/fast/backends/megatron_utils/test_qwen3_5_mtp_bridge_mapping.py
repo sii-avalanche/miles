@@ -219,3 +219,21 @@ def test_the_stubs_do_not_outlive_the_test_that_installed_them():
     stub = sys.modules.get("megatron")
 
     assert stub is None or hasattr(stub, "__path__")
+
+
+@pytest.mark.parametrize("ep_size,ep_rank", [(1, 0), (2, 1), (32, 17), (64, 63)])
+@pytest.mark.parametrize("prefix", ["decoder.layers.0", "mtp.layers.0.transformer_layer"])
+@pytest.mark.parametrize("projection", ["linear_fc1", "linear_fc2"])
+def test_fused_expert_load_uses_global_expert_index(ep_size, ep_rank, prefix, projection):
+    module = load_bridge_module()
+    bridge = module.Qwen3_5Bridge.__new__(module.Qwen3_5Bridge)
+    bridge.config = types.SimpleNamespace(num_moe_experts=256)
+    bridge.mpu = types.SimpleNamespace(ep_size=ep_size, ep_rank=ep_rank)
+    # Every HF expert has a distinct value, so importing another EP rank's expert is observable.
+    weights = torch.arange(256, dtype=torch.float32).view(256, 1, 1).expand(256, 4, 2)
+    local_expert = 3
+    global_expert = ep_rank * (256 // ep_size) + local_expert
+
+    converted = bridge._weight_to_mcore_format(f"{prefix}.mlp.experts.{projection}.weight{local_expert}", [weights])
+
+    assert torch.equal(converted, weights[global_expert])

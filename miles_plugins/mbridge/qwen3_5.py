@@ -377,8 +377,11 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
         if "mlp.experts.linear_fc" in mcore_weights_name and len(hf_weights) == 1:
             w = hf_weights[0]
             if w.dim() == 3:
-                # Extract expert_id from name like "...linear_fc1.weight42"
-                expert_id = int(mcore_weights_name.split("weight")[-1])
+                # mbridge passes the local name here, but the fused HF tensor
+                # contains all experts, including those owned by other EP ranks.
+                local_expert_id = int(mcore_weights_name.split("weight")[-1])
+                experts_per_rank = self.config.num_moe_experts // self.mpu.ep_size
+                expert_id = self.mpu.ep_rank * experts_per_rank + local_expert_id
                 expert_w = w[expert_id]  # (out_features, in_features)
                 return expert_w.contiguous()
 
