@@ -15,6 +15,8 @@ def chunked_head_kwargs(args):
     if not math.isfinite(args.rollout_temperature) or args.rollout_temperature <= 0:
         raise ValueError("Chunked LM head requires a positive finite rollout temperature")
     unsupported = {
+        # Direct weight access bypasses DDP's output-layer parameter-sync hook.
+        "overlap_param_gather": getattr(args, "overlap_param_gather", False),
         "context parallel": getattr(args, "context_parallel_size", 1) != 1,
         "pipeline parallel": getattr(args, "pipeline_model_parallel_size", 1) != 1,
         "non-policy loss": getattr(args, "loss_type", "policy_loss") != "policy_loss",

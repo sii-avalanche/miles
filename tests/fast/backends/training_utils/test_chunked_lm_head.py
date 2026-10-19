@@ -303,3 +303,23 @@ def test_precomputed_logprobs_reuse_slicing_without_rescaling():
         process(values, with_entropy=True, **kwargs)
     with pytest.raises(ValueError):
         process(values, rollout_sampling_mask=[], **kwargs)
+
+
+@pytest.mark.parametrize("dp_size", [2, 4])
+def test_parameter_gather_overlap_rejected_before_projection(dp_size):
+    settings = SimpleNamespace(
+        chunked_lm_head_size=1024, rollout_temperature=1.0,
+        untie_embeddings_and_output_weights=True, use_distributed_optimizer=True,
+        overlap_param_gather=True, data_parallel_size=dp_size,
+    )
+    with patch.object(adapter, "_project") as project:
+        with pytest.raises(ValueError, match="overlap_param_gather"):
+            adapter.chunked_head_kwargs(settings)
+        project.assert_not_called()
+    # The ordinary model forward still owns synchronization when chunking is off.
+    settings.chunked_lm_head_size = 0
+    assert adapter.chunked_head_kwargs(settings) == {}
+    # Distributed optimizer without overlapping parameter gathers stays supported.
+    settings.chunked_lm_head_size = 1024
+    settings.overlap_param_gather = False
+    assert adapter.chunked_head_kwargs(settings)
