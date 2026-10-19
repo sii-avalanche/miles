@@ -84,11 +84,16 @@ def make_app(
     use_utilization_overview: bool = False,
     low_mfu: float = DEFAULT_LOW_MFU,
     observability: dict | None = None,
+    run_metadata: dict | None = None,
 ) -> FastAPI:
     app = FastAPI(title="miles dashboard", docs_url=None, redoc_url=None)
     group_history = GroupHistory(reader.dump_dir.parent / "analysis" / "rollout_history")
-    judge = reward_info(reader.dump_dir.parent / "config.toml")
-    strategy = training_strategy(reader.dump_dir.parent, store.meta.args if store.meta else {})
+    judge = (run_metadata or {}).get("reward_info")
+    if judge is None:
+        judge = reward_info(reader.dump_dir.parent / "config.toml")
+    strategy = (run_metadata or {}).get("training_strategy")
+    if strategy is None:
+        strategy = training_strategy(reader.dump_dir.parent, store.meta.args if store.meta else {})
 
     @app.get("/api/runtime/status")
     def current_runtime_status():

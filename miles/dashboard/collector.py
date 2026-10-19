@@ -174,6 +174,7 @@ class DashboardCollector:
         # restarts) get a sampler too — a one-shot spawn at init cannot.
         # None marks a node where NVML is unavailable (never retried).
         self._samplers: dict[str, Any] = {}
+        self._publisher = None
 
     # ------------------------------ lifecycle -------------------------------
 
@@ -182,6 +183,13 @@ class DashboardCollector:
 
     def start(self) -> None:
         assert self._flush_thread is None, "collector already started"
+        # Optional dependency and credentials stay out of the args/meta snapshot.
+        from miles.dashboard.publisher import start_publisher
+
+        try:
+            self._publisher = start_publisher(self.config.dashboard_dir)
+        except Exception as error:
+            logger.warning("Dashboard publisher could not start (%s); local files retained", type(error).__name__)
         self._flush_thread = threading.Thread(target=self._run_flush_loop, name="dashboard-flush", daemon=True)
         self._flush_thread.start()
 
@@ -196,6 +204,8 @@ class DashboardCollector:
                 _kill_sampler(handle)
         self._samplers.clear()
         self.flush()
+        if self._publisher is not None:
+            self._publisher.stop()
 
     # ------------------------------- ingestion ------------------------------
 

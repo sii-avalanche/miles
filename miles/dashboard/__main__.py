@@ -30,6 +30,10 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--no-auth", action="store_true", help="Disable authentication for a private entrypoint")
     serve.add_argument("--monitoring", action="store_true", default=os.getenv("AVATRAIN_MONITORING") == "1")
     serve.add_argument("--monitoring-dir", type=Path, default=os.getenv("AVATRAIN_MONITORING_DIR"))
+    commands.add_parser("init-db", help="Initialize the shared dashboard schema using AVATRAIN_DASHBOARD_POSTGRES")
+    sync = commands.add_parser("sync", help="Publish or resume publication of an existing run's telemetry")
+    sync.add_argument("run_dir", type=Path)
+    sync.add_argument("--follow", action="store_true", help="Retry publication every five seconds")
     view = commands.add_parser("view", help="View one run's telemetry and optional tensor dumps")
     view.add_argument("--dump-details", type=Path)
     view.add_argument("--dashboard-dir", type=Path)
@@ -89,12 +93,38 @@ def _service_app(args, parser):
         args.runs_dir, cache_dir=args.cache_dir, password=password, username=args.username,
         max_runs=args.max_runs, monitoring=args.monitoring, monitoring_dir=args.monitoring_dir,
         port=args.port, root_path=args.root_path,
+        postgres=os.getenv("AVATRAIN_DASHBOARD_POSTGRES"),
     )
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = _parser()
     args = parser.parse_args(argv)
+    if args.command in ("init-db", "sync"):
+        from miles.dashboard.postgres import DashboardDatabase
+        from miles.dashboard.publisher import TelemetryPublisher
+
+        dsn = os.getenv("AVATRAIN_DASHBOARD_POSTGRES")
+        if not dsn:
+            parser.error("Set AVATRAIN_DASHBOARD_POSTGRES")
+        database = DashboardDatabase(dsn)
+        if args.command == "init-db":
+            database.initialize()
+            print("Shared dashboard schema initialized")
+        else:
+            publisher = TelemetryPublisher(database, args.run_dir.resolve())
+            if args.follow:
+                import time
+
+                publisher.start()
+                try:
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    publisher.stop()
+            else:
+                print(f"Published {publisher.sync()} bytes")
+        return
     if args.command == "register":
         from miles.dashboard.catalog import write_manifest
 

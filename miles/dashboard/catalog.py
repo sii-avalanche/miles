@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -76,7 +77,20 @@ def write_manifest(
             raise ValueError("Invalid submission token")
         data["submission_id"] = submission_id
     data["updated_at"] = time.time()
+    if os.getenv("AVATRAIN_DASHBOARD_POSTGRES"):
+        # Keep existing file-backed bookmarks when enabling DB publication later.
+        identity = run_id(f"{run_dir.parent.name}/{run_dir.name}") if path.exists() else uuid.uuid4().hex
+        data.setdefault("dashboard_id", identity)
+        data.setdefault("owner", os.getenv("AVATRAIN_DASHBOARD_OWNER", os.getenv("USER", "unknown")))
     _atomic_json(path, data)
+    if os.getenv("AVATRAIN_DASHBOARD_POSTGRES"):
+        # Optional persistence must not make a successful training run fail.
+        from miles.dashboard.publisher import publish_manifest
+
+        try:
+            publish_manifest(run_dir)
+        except Exception as error:
+            logger.warning("Dashboard registration pending (%s); local manifest retained", type(error).__name__)
 
 
 def discover_runs(runs_dir: Path) -> list[dict]:
@@ -97,7 +111,7 @@ def discover_runs(runs_dir: Path) -> list[dict]:
             # Do not follow telemetry symlinks outside the allowed tree either.
             ready = telemetry.is_dir() and telemetry.resolve().is_relative_to(root)
             items.append({
-                "id": run_id(relative),
+                "id": data.get("dashboard_id", run_id(relative)),
                 "name": path.name,
                 "config_name": path.parent.name,
                 "relative_path": relative,

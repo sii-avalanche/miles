@@ -5,6 +5,7 @@ import base64
 import binascii
 import contextlib
 import hmac
+import hashlib
 import html
 import logging
 import json
@@ -86,11 +87,12 @@ class BasicAuth:
 class DashboardCache:
     """Load dashboards only when visited and cap resident runs with an LRU."""
 
-    def __init__(self, runs_dir: Path, cache_dir: Path, max_runs: int, *, grafana: bool = False):
+    def __init__(self, runs_dir: Path, cache_dir: Path, max_runs: int, *, grafana: bool = False, database=None):
         self.runs_dir = runs_dir
         self.cache_dir = cache_dir
         self.max_runs = max_runs
         self.grafana = grafana
+        self.database = database
         self.loaded = OrderedDict()
         self.lock = threading.Lock()
         self.catalog = []
@@ -100,7 +102,19 @@ class DashboardCache:
         with self.lock:
             now = time.monotonic()
             if now - self.catalog_read_at >= 5:
-                self.catalog = discover_runs(self.runs_dir)
+                local = discover_runs(self.runs_dir)
+                if self.database:
+                    try:
+                        remote = self.database.list_runs()
+                    except Exception as error:
+                        logger.warning("Shared dashboard catalog unavailable (%s)", type(error).__name__)
+                        if not local and not self.catalog:
+                            raise HTTPException(503, "Shared dashboard database unavailable") from None
+                        remote = [entry for entry in self.catalog if entry.get("storage") == "postgres"]
+                    merged = {entry["id"]: entry for entry in local}
+                    merged.update({entry["id"]: entry for entry in remote})
+                    local = sorted(merged.values(), key=lambda entry: entry["created_at"], reverse=True)
+                self.catalog = local
                 self.catalog_read_at = now
             return self.catalog
 
@@ -115,17 +129,35 @@ class DashboardCache:
             if key in self.loaded:
                 self.loaded.move_to_end(key)
                 return self.loaded[key][0]
-            run_dir = (self.runs_dir / entry["relative_path"]).resolve()
-            telemetry = (run_dir / "logs" / "dashboard").resolve()
-            if not run_dir.is_relative_to(self.runs_dir) or not telemetry.is_relative_to(self.runs_dir):
-                raise HTTPException(404, "Run not found")
-            if not telemetry.is_dir():
-                raise HTTPException(409, "This run has no dashboard telemetry yet")
-            store = MetricStore.load(telemetry)
+            run_metadata = None
+            if entry.get("storage") == "postgres":
+                from miles.dashboard.postgres_reader import PostgresMetricStore
+
+                if not entry["telemetry_ready"]:
+                    raise HTTPException(409, "This run has no dashboard telemetry yet")
+                # A private empty artifact directory prevents DB catalog fields
+                # from resolving paths in the server's training filesystem.
+                run_dir = self.cache_dir / "database" / hashlib.sha256(key.encode()).hexdigest()
+                run_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    store = PostgresMetricStore(self.database, key, run_dir / "logs/dashboard")
+                except Exception as error:
+                    logger.warning("Shared telemetry unavailable (%s)", type(error).__name__)
+                    raise HTTPException(503, "Shared dashboard telemetry unavailable") from None
+                run_metadata = store.metadata
+            else:
+                run_dir = (self.runs_dir / entry["relative_path"]).resolve()
+                telemetry = (run_dir / "logs" / "dashboard").resolve()
+                if not run_dir.is_relative_to(self.runs_dir) or not telemetry.is_relative_to(self.runs_dir):
+                    raise HTTPException(404, "Run not found")
+                if not telemetry.is_dir():
+                    raise HTTPException(409, "This run has no dashboard telemetry yet")
+                store = MetricStore.load(telemetry)
             # Tensor dumps are not the run logs; keep them opt-in and separate.
             app = make_app(
                 store, DumpReader(run_dir / "logs", cache_dir=self.cache_dir / key, tensor_lru=1),
                 follow=True, use_utilization_overview=True,
+                run_metadata=run_metadata,
                 observability={"grafana_url": f"../../grafana/d/miles-overview/rl-observability?var-run={key}"} if self.grafana else None,
             )
             self.loaded[key] = (app, store)
@@ -139,8 +171,8 @@ class DashboardCache:
         for store in stores:
             try:
                 store.follow()
-            except (OSError, ValueError):
-                logger.warning("Could not refresh a dashboard stream", exc_info=True)
+            except Exception as error:
+                logger.warning("Could not refresh a dashboard stream (%s)", type(error).__name__)
 
 
 class RunDispatcher:
@@ -175,6 +207,8 @@ class RunDispatcher:
 
                 return await self.static(static_scope, receive, static_send)
             if remainder.startswith("analysis/"):
+                if entry.get("storage") == "postgres":
+                    raise HTTPException(404, "This run has no published analysis artifact")
                 run_dir = (self.cache.runs_dir / entry["relative_path"]).resolve()
                 if not run_dir.is_relative_to(self.cache.runs_dir):
                     raise HTTPException(404, "Run not found")
@@ -194,14 +228,20 @@ def make_service(
     runs_dir: Path, *, cache_dir: Path, password: str | None, username: str = "admin", max_runs: int = 3,
     monitoring: bool = False, monitoring_dir: Path | None = None, port: int = 7788,
     root_path: str = "",
+    postgres: str | None = None,
 ) -> FastAPI:
     runs_dir = runs_dir.resolve()
-    if not runs_dir.is_dir():
+    if not runs_dir.is_dir() and not postgres:
         raise ValueError(f"Runs directory does not exist: {runs_dir}")
     if max_runs < 1:
         raise ValueError("max-runs must be positive")
-    cache = DashboardCache(runs_dir, cache_dir, max_runs, grafana=monitoring)
-    exporter = PrometheusExporter(runs_dir, cache.list_runs)
+    database = None
+    if postgres:
+        from miles.dashboard.postgres import DashboardDatabase
+
+        database = DashboardDatabase(postgres)
+    cache = DashboardCache(runs_dir, cache_dir, max_runs, grafana=monitoring, database=database)
+    exporter = PrometheusExporter(runs_dir, cache.list_runs, database=database)
     stack = None
     if monitoring:
         stack = MonitoringStack(monitoring_dir or cache_dir / "monitoring", port=port,
@@ -245,7 +285,8 @@ def make_service(
     def runs(q: str = Query("", max_length=128), limit: int = Query(50, ge=1, le=100)):
         items = cache.list_runs()
         search = q.strip().lower()
-        selected = [item for item in items if search in f'{item["job_id"] or ""} {item["relative_path"]}'.lower()]
+        selected = [item for item in items if search in
+                    f'{item["job_id"] or ""} {item["relative_path"]} {item.get("owner", "")}'.lower()]
         return {"runs": selected[:limit], "total": len(selected)}
 
     @app.get("/api/jobs/{job_id}")
@@ -405,8 +446,13 @@ def _freshness(output, run_id, component, ts, now, max_age):
 
 
 def _hardware_metrics(output, directory, root, run_id, now, max_age):
+    _hardware_rows(output, _latest_stream(directory, "gpu_util", root),
+                   _latest_stream(directory, "engine_series", root), run_id, now, max_age)
+
+
+def _hardware_rows(output, gpu_rows, engine_rows, run_id, now, max_age):
     gpu = {}
-    for row in _latest_stream(directory, "gpu_util", root):
+    for row in gpu_rows:
         key = (str(row.get("node", "unknown")), str(row.get("gpu", "unknown")))
         if key not in gpu or row["ts"] >= gpu[key]["ts"]:
             gpu[key] = row
@@ -420,7 +466,7 @@ def _hardware_metrics(output, directory, root, run_id, now, max_age):
     if gpu:
         _freshness(output, run_id, "gpu", max(row["ts"] for row in gpu.values()), now, max_age)
     engines = {}
-    for row in _latest_stream(directory, "engine_series", root):
+    for row in engine_rows:
         if row.get("metric") not in ENGINE_METRICS or not _number(row.get("value")):
             continue
         # Keep DP identities: request counts must not be silently overwritten.
@@ -436,11 +482,12 @@ def _hardware_metrics(output, directory, root, run_id, now, max_age):
 
 
 class PrometheusExporter:
-    """Own a short response cache; scraping never opens tensor dumps or a database."""
+    """Cache bounded file/database tails; scraping never opens tensor dumps."""
 
-    def __init__(self, root: Path, catalog):
+    def __init__(self, root: Path, catalog, *, database=None):
         self.root = root.resolve()
         self.catalog = catalog
+        self.database = database
         self.lock = threading.Lock()
         self.cached_at = float("-inf")
         self.cached = ""
@@ -455,6 +502,12 @@ class PrometheusExporter:
             entries = sorted((entry for entry in self.catalog() if entry["telemetry_ready"]),
                              key=lambda entry: entry["created_at"], reverse=True)[:MAX_RUNS]
             for entry in entries:
+                if entry.get("storage") == "postgres":
+                    try:
+                        self._database_metrics(output, entry, wall_time)
+                    except Exception:
+                        self.errors += 1
+                    continue
                 directory = self.root / entry["relative_path"] / "logs" / "dashboard"
                 if not directory.resolve().is_relative_to(self.root):
                     continue
@@ -475,6 +528,17 @@ class PrometheusExporter:
             self.cached = output.render()
             self.cached_at = time.monotonic()
             return self.cached
+
+    def _database_metrics(self, output, entry, now):
+        metadata, files = self.database.describe(entry["id"])
+        interval = metadata.get("meta", {}).get("args", {}).get("perf_monitor_interval", 10)
+        max_age = max(30, 3 * interval) if _number(interval) else 30
+        output.add("avatrain_run_info", 1, dict(run_id=entry["id"], run_name=entry["name"],
+                                              job_id=entry["job_id"] or "", state=entry["state"]))
+        rows = {stream: self.database.tail(entry["id"], files, stream)
+                for stream in ("metrics", "gpu_util", "engine_series")}
+        _runtime_metrics(output, rows["metrics"], entry["id"], now, max_age)
+        _hardware_rows(output, rows["gpu_util"], rows["engine_series"], entry["id"], now, max_age)
 
 
 

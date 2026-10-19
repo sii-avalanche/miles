@@ -49,7 +49,7 @@
       status.textContent = data.total ? `${data.total} matching runs (${data.runs.length} shown)` : "No matching runs. Existing jobs may need to be registered.";
       for (const run of data.runs) {
         const card = node("article", "");
-        card.append(node("h2", run.job_id || "Job ID not registered"), node("p", run.relative_path), node("p", `Created: ${new Date(run.created_at * 1000).toLocaleString()} · Recorded state: ${run.state} · telemetry: ${run.telemetry_ready ? "available" : "not available"}`));
+        card.append(node("h2", run.job_id || "Job ID not registered"), node("p", run.relative_path), node("p", `${run.owner ? `Owner: ${run.owner} · ` : ""}Created: ${new Date(run.created_at * 1000).toLocaleString()} · Recorded state: ${run.state} · telemetry: ${run.telemetry_ready ? "available" : "not available"}`));
         if (run.telemetry_ready) {
           for (const [label, hash] of [["Overview", ""], ["Training metrics", "metrics"], ["Monitoring & alerts", "monitoring"]]) {
             const link = node("a", label); link.href = new URL(`runs/${run.id}/#/${hash}`, base); card.append(link);
