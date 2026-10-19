@@ -1,32 +1,18 @@
 """Lossless durable snapshots of AvaCore message DAGs and legacy rollout records."""
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any
 
 from ava_core.core import ChatMessage, Trace, Tool
-from ava_core.core.segment import ChatSegment
+from ava_core.core.training_trace import (
+    _segment,
+    graph_nodes as graph_nodes,
+    restore_traces as restore_traces,
+    snapshot_traces as snapshot_traces,
+)
 from ava_core.generate.core import Sample as Row
 from ava_core.rewards.core import Reward
 from ava_core.store.core import STORED
-
-
-def graph_nodes(traces: tuple[Trace, ...]) -> list[Trace]:
-    """Topological order, retaining identity across branches and source edges."""
-    nodes, seen = [], set()
-    pending = [(trace, False) for trace in reversed(traces)]
-    while pending:
-        node, ready = pending.pop()
-        if node in seen:
-            continue
-        if ready:
-            seen.add(node)
-            nodes.append(node)
-        else:
-            pending.append((node, True))
-            pending.extend((source, False) for source in reversed(node.sources))
-            if node.prev is not None:
-                pending.append((node.prev, False))
-    return nodes
 
 
 def conversation_tips(traces: tuple[Trace, ...]) -> list[Trace]:
@@ -34,80 +20,6 @@ def conversation_tips(traces: tuple[Trace, ...]) -> list[Trace]:
     parents = {node.prev for node in nodes}
     # Match the store's ownership order: listed traces first, source-only tips next.
     return list(dict.fromkeys((*traces, *(node for node in nodes if node not in parents and node not in traces))))
-
-
-def snapshot_traces(traces: tuple[Trace, ...]) -> dict[str, Any]:
-    nodes = graph_nodes(traces)
-    ids = {node: index for index, node in enumerate(nodes)}
-    return {
-        "version": 1,
-        "tips": [ids[node] for node in traces],
-        "nodes": [
-            {
-                "message": STORED.unstructure(node.message),
-                "prev": ids.get(node.prev),
-                "sources": [ids[source] for source in node.sources],
-                "generated": node.generated,
-                "tools": STORED.unstructure(node.tools) if node.prev is None else [],
-                "metadata": {key: value for key, value in node.metadata.items() if key != "agent_patch_bytes"},
-                "segments": [
-                    {
-                        "tokens": list(segment.tokens),
-                        "log_probs": segment.log_probs,
-                        "template": segment.template,
-                        "is_generated": segment.is_generated,
-                        "metadata": segment.metadata,
-                    }
-                    for segment in node.segments
-                ],
-            }
-            for node in nodes
-        ],
-    }
-
-
-@dataclass(frozen=True)
-class _StoredTokenizer:
-    """Snapshots already contain exact rendered text; no model/tokenizer load on writes."""
-
-    template: str
-
-    def decode(self, _tokens, **_kwargs):
-        return self.template
-
-
-def _segment(data: dict[str, Any]) -> ChatSegment:
-    tokens, probs = data["tokens"], data["log_probs"]
-    if len(tokens) != len(probs):
-        raise ValueError("Stored token and log-probability lengths differ")
-    if any(p is None for p in probs) and any(p is not None for p in probs):
-        raise ValueError("A segment mixes prompt and generated log-probabilities")
-    return ChatSegment(
-        tokens=tuple(tokens),
-        _log_probs=tuple(probs) if probs and probs[0] is not None else None,
-        is_generated=data["is_generated"],
-        tokenizer=_StoredTokenizer(data["template"]),
-        metadata=data.get("metadata", {}),
-    )
-
-
-def restore_traces(data: dict[str, Any]) -> tuple[Trace, ...]:
-    if data["version"] != 1:
-        raise ValueError(f"Unsupported Trace snapshot version: {data['version']}")
-    nodes = []
-    for item in data["nodes"]:
-        nodes.append(
-            Trace(
-                message=STORED.structure(item["message"], ChatMessage),
-                prev=nodes[item["prev"]] if item["prev"] is not None else None,
-                sources=tuple(nodes[index] for index in item["sources"]),
-                generated=item["generated"],
-                segments=tuple(_segment(segment) for segment in item["segments"]),
-                metadata=item["metadata"],
-                _tools=tuple(STORED.structure(item["tools"], list[Tool])),
-            )
-        )
-    return tuple(nodes[index] for index in data["tips"])
 
 
 def _legacy_trace(data: dict[str, Any], tokenizer) -> Trace:

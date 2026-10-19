@@ -15,6 +15,7 @@ from ava_core.config import interpolated, launch_converter
 from ava_core.core import Schema, Trace
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
+from ava_core.generate.remote_rollout import RemoteGenerate, RemoteSettings
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import Reward
 from ava_core.runner import RECOVERABLE_ERRORS
@@ -44,10 +45,7 @@ class AvaCoreRollout:
         self._remote_generate = None
         generate_config = interpolated(self.config["generate"])
         if "remote_rollout" in config:
-            # AvaTrain owns this optional service adapter. Router args stay GPU-local:
-            # the dashboard and inference controller must keep their real SGLang endpoints.
-            from avatrain.remote_rollout import RemoteGenerate, RemoteSettings
-
+            # Legacy TOMLs use the same AvaCore client; router args remain GPU-local.
             run_id = os.environ.get("RUN_DIR")
             if not run_id:
                 raise ValueError("Remote rollout requires RUN_DIR to share the run's sandbox concurrency gate")
