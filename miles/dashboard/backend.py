@@ -9,10 +9,9 @@ Call matrix of ``init_dashboard`` (design doc §6.1), reached through the
   ``GpuSampler`` actor per GPU node.
 - train actor main rank (``primary=False``): resolves the named actor so
   ``dashboard_log`` works there.
-- rollout manager (``primary=False, router_addr=...``): additionally attaches
-  a Timer phase sink for ``rollout`` / ``eval_rollout`` events. The router
-  itself is registered later through ``hooks.register_router`` — at
-  init_tracking time the router has not started yet.
+- rollout manager (``primary=False, router_addr=...``): attaches phase and
+  trajectory sinks. The inference controller publishes router and engine
+  addresses together once the engines are ready.
 
 All pushes are fire-and-forget; when the collector cannot be resolved the
 module warns once and every later call is a no-op — the dashboard must never
@@ -69,7 +68,7 @@ def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None
         ray.get(_handle.ping.remote())
         _handle.start.remote()
         logger.info(
-            "miles dashboard: telemetry -> %s | view live: python -m miles.dashboard.serve "
+            "miles dashboard: telemetry -> %s | view live: python -m miles.dashboard view "
             "--dashboard-dir %s --follow --port 7788",
             config.dashboard_dir,
             config.dashboard_dir,
@@ -82,7 +81,7 @@ def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None
         # the kwarg marks the rollout-manager process. It cannot be used for
         # scraping: init_tracking runs before start_rollout_servers, so the
         # address is still "http://None:None" here — the real registration
-        # happens via hooks.register_router once the router is up.
+        # happens with the inference controller's engine topology update.
         hooks.attach_phase_sink(_handle, Role.ROLLOUT_MANAGER)
         hooks.attach_trajectory_sink(_handle)
 

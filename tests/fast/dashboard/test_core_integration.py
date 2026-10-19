@@ -13,7 +13,7 @@ from argparse import Namespace
 import pytest
 
 from miles.dashboard.dump_reader import DumpReader
-from miles.dashboard.server import make_app
+from miles.dashboard.web.api import make_app
 from miles.dashboard.store import MetricStore, Role, Stream
 from miles.utils.timer import Timer, timer
 

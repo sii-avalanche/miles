@@ -298,9 +298,7 @@ def register_train_actor(args) -> None:
 
 
 def register_router(args) -> None:
-    """Called by the rollout manager AFTER start_rollout_servers: only then are
-    ``args.sglang_router_ip/port`` filled in. init_tracking runs earlier in
-    __init__, so the backend cannot register the router at init time."""
+    """Compatibility hook; the inference controller now publishes one topology update."""
     if not args.use_miles_dashboard:
         return
     from miles.dashboard import backend
@@ -316,29 +314,34 @@ def register_router(args) -> None:
         _warner.warn("dashboard router registration failed; engine metrics will be missing")
 
 
-async def register_engines(servers, *, provider: BaseWorkerProvider) -> None:
-    """Called at the top of every InferenceController.prepare_rollout(): pushes an engine
-    topology snapshot whenever the set of engine actors changed (startup,
-    fault-tolerance recovery). Steady state costs one worker-manager round trip
-    and a local tuple compare."""
+async def register_engines(servers, *, provider: BaseWorkerProvider, router_addr: str | None = None) -> None:
+    """Publish inference addresses together; unchanged topology needs no RPC."""
     global _engines_fingerprint
     from miles.dashboard import backend
 
-    handle = backend.current_collector()
+    # InferenceController does not initialize tracking itself.
+    handle = backend.resolve_collector() if router_addr is not None else backend.current_collector()
     if handle is None:
         return
     try:
         cells = _alive_engine_cells(servers)
         worker_infos_per_cell = _collect_worker_infos(cells, provider=provider)
-        fingerprint = tuple(
-            (info.name, info.generation, info.self_addrs["primary"].host, info.self_addrs["primary"].port)
-            for worker_infos in worker_infos_per_cell
-            for info in worker_infos
+        fingerprint = (
+            router_addr,
+            tuple(
+                (info.name, info.generation, info.self_addrs["primary"].host, info.self_addrs["primary"].port)
+                for worker_infos in worker_infos_per_cell
+                for info in worker_infos
+            ),
         )
         if fingerprint == _engines_fingerprint:
             return
         engines = await _compute_engine_infos(cells, worker_infos_per_cell, provider=provider)
-        handle.update_topology.remote(TopologySnapshot(ts=time.time(), engines=engines))
+        snapshot = TopologySnapshot(ts=time.time(), engines=engines)
+        if router_addr is None:
+            handle.update_topology.remote(snapshot)
+        else:
+            handle.update_topology.remote(snapshot, router_addr=router_addr)
         _engines_fingerprint = fingerprint
     except Exception:
         _warner.warn("dashboard engine registration failed; topology may be stale")

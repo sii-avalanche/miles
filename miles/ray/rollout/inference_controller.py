@@ -84,9 +84,8 @@ class InferenceController:
         self._watcher_disposers.append(await self._engine_provider.watch_cells(self._reconcile))
         self._ticker = SimpleTicker(self._tick_cells, interval_seconds=TICK_INTERVAL_SECONDS)
 
-        dashboard_hooks.register_router(self.args)
-
         await self.wait_expected_num_cells()
+        await self._publish_dashboard_topology()
 
     # TEMPORARY: exists only so a suspend can take this lock, reverted with the weight-update fault tolerance work
     @with_lock
@@ -149,11 +148,20 @@ class InferenceController:
     @with_lock
     async def prepare_rollout(self, rollout_id: int, model_id: str | None = None) -> None:
         await self._health_monitoring_resume(model_id)
-        await dashboard_hooks.register_engines(self.servers, provider=self._engine_provider)
+        await self._publish_dashboard_topology()
 
     @with_lock
     async def prepare_eval(self, model_id: str | None = None) -> None:
         await self._health_monitoring_resume(model_id)
+        await self._publish_dashboard_topology()
+
+    @lock_exempt
+    async def _publish_dashboard_topology(self) -> None:
+        if self.args.use_miles_dashboard:
+            await dashboard_hooks.register_engines(
+                self.servers, provider=self._engine_provider,
+                router_addr=f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}",
+            )
 
     @with_lock
     async def dispose(self) -> None:

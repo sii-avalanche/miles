@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from miles.dashboard.collector import CollectorConfig, DashboardCollector
 from miles.dashboard.dump_reader import DumpReader
-from miles.dashboard.server import make_app
+from miles.dashboard.web.api import make_app
 from miles.dashboard.store import (
     EngineInfo,
     EngineSample,

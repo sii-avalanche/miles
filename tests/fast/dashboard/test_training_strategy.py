@@ -1,6 +1,6 @@
 import pytest
 
-from miles.dashboard.training_strategy import training_strategy
+from miles.dashboard.web.status import training_strategy
 
 BATCH = "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
 FULLY_ASYNC = "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"

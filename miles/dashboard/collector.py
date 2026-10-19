@@ -285,7 +285,9 @@ class DashboardCollector:
                     result[f"inference/{name.removesuffix('_mean')}_max"] = max(point.value for point in fresh)
         return result
 
-    def update_topology(self, snapshot: TopologySnapshot) -> None:
+    def update_topology(self, snapshot: TopologySnapshot, *, router_addr: str | None = None) -> None:
+        if router_addr is not None:
+            self.set_router(router_addr)
         # an addr the actor path ever registered must not be resurrected as
         # "external" after a restart retires it — scrape memory is a fallback
         # for engines the actor path NEVER knew, not a liveness source

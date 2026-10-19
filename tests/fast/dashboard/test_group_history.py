@@ -4,8 +4,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from miles.dashboard.dump_reader import DumpReader
-from miles.dashboard.group_history import GroupHistory, build_group_history
-from miles.dashboard.server import make_app
+from miles.dashboard.web.group_history import GroupHistory, build_group_history
+from miles.dashboard.web.api import make_app
 from miles.dashboard.store import MetricStore, RuntimeEvent
 
 

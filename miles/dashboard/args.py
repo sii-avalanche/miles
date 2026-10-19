@@ -65,7 +65,7 @@ def add_dashboard_arguments(parser) -> None:
         action="store_true",
         default=False,
         help="Collect phases, GPU utilization and engine metrics. Use --dashboard-dir for telemetry only, "
-        "or --dump-details for telemetry plus sample dumps. View with `python -m miles.dashboard.serve`.",
+        "or --dump-details for telemetry plus sample dumps. View with `python -m miles.dashboard view`.",
     )
     group.add_argument(
         "--dashboard-dir",

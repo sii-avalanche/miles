@@ -1,11 +1,111 @@
-import { api } from "./api.js";
-import { el, fmtNum, setViewCleanup, statBox } from "./app.js";
 import { createCarpet } from "./carpet.js";
 import { createFleet } from "./fleet.js";
 import { extent, hideTooltip, showTooltip } from "./charts.js";
-import { getRunTimeWindow, createTimeBar } from "./time_window.js";
-
 import { PHASE_COLORS } from "./phase_colors.js";
+import { api } from "./api.js";
+import { el, fmtNum, setViewCleanup, statBox } from "./app.js";
+import { createAsyncFlow, loadAsyncFlow } from "./async_flow.js";
+import { getRunTimeWindow, createTimeBar } from "./time_window.js";
+import { createRuntimeStatus } from "./runtime_status.js";
+
+export async function renderOverview(view, meta, route = {}) {
+  const timeWindow = getRunTimeWindow(meta);
+  const timeBar = createTimeBar(timeWindow, "Shared window");
+  const asyncFlow = createAsyncFlow();
+  const flowHelp = asyncFlow.root.querySelector?.(":scope > p.muted");
+  if (flowHelp) {
+    const help = el("details", { class: "flow-help" }, [el("summary", {}, ["Timeline legend and counting rules"])]);
+    flowHelp.before(help);
+    help.append(flowHelp);
+  }
+  const runtimeStatus = createRuntimeStatus();
+  const gpuContent = el("div");
+  const gpuTimeline = meta.capabilities?.has_timeline ? createGpuTimeline(gpuContent, meta, route, timeWindow) : null;
+  let flowData, flowMeta;
+  const status = el("p", { class: "muted" });
+  const gpuStatus = el("p", { class: "muted" });
+  view.replaceChildren(
+    el("h2", {}, ["Overview"]),
+    el("p", { class: "muted" }, ["GPU activity, rollout, data pool and training on one shared time window."]),
+    el("nav", { class: "compute-sections", "aria-label": "Inspect samples" }, [
+      el("a", { href: "#/rollout/latest" }, ["Rollout samples & traces →"]),
+    ]),
+    timeBar.root, status, runtimeStatus.root,
+    el("h3", {}, ["GPU activity"]),
+    ...(gpuTimeline ? [gpuContent, gpuStatus] : [el("p", { class: "muted" }, ["GPU telemetry was not recorded for this run."])]),
+    asyncFlow.root,
+  );
+  let cancelled = false;
+  let refreshing = false;
+  let pendingRefresh = false, refreshTimer = null;
+  function drawRuntime() {
+    if (cancelled || !flowData) return;
+    const range = timeWindow.get();
+    const events = flowData.events.filter(e => e.t0 <= range.t1 && (e.t1 ?? range.t1) >= range.t0);
+    asyncFlow.draw({ ...flowData, events,
+      history: { ...flowData.history, rows: (flowData.history?.rows ?? []).filter(r => r.ts >= range.t0 && r.ts <= range.t1) },
+    }, flowMeta, range.t0, range.t1, range.origin);
+
+  }
+  function scheduleRefresh() {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refresh, 300);
+  }
+  const unsubscribe = timeWindow.subscribe(() => {
+    drawRuntime();
+    // Source bounds advance during refresh; only user changes need another fetch.
+    if (!refreshing) scheduleRefresh();
+  });
+  let interval = null;
+  const onResize = () => { drawRuntime(); };
+  window.addEventListener("resize", onResize);
+  setViewCleanup(() => {
+    cancelled = true;
+    if (interval) clearInterval(interval);
+    clearTimeout(refreshTimer);
+    unsubscribe();
+    timeBar.destroy();
+    gpuTimeline?.destroy();
+    window.removeEventListener("resize", onResize);
+  });
+  async function refresh() {
+    if (cancelled) return;
+    if (refreshing) { pendingRefresh = true; return; }
+    refreshing = true;
+    let requestedVersion;
+    try {
+      const liveMeta = await api("/api/meta");
+      if (cancelled) return;
+      timeWindow.updateBounds(liveMeta.time_range);
+      const range = timeWindow.get();
+      requestedVersion = range.version;
+      const { t0, t1 } = range;
+      const [flow, currentStatus] = await Promise.all([
+        loadAsyncFlow(liveMeta, t0, t1),
+        api("/api/runtime/status").catch(() => null),
+        gpuTimeline?.refresh().then(() => { gpuStatus.textContent = ""; }).catch(error => {
+          if (!cancelled) gpuStatus.textContent = `GPU overview unavailable: ${error.message}`;
+        }),
+      ]);
+      if (cancelled || requestedVersion !== timeWindow.get().version) return;
+      flowData = flow; flowMeta = liveMeta;
+      runtimeStatus.update(currentStatus);
+      drawRuntime();
+      const observed = currentStatus?.rollout?.observed_at;
+      status.textContent = observed ? `Latest rollout sample: ${Math.max(0, Date.now() / 1000 - observed).toFixed(1)} s ago · ${liveMeta.mode}` : "No rollout samples recorded yet.";
+    } catch (error) {
+      if (!cancelled) { status.textContent = String(error); runtimeStatus.update(null); }
+    } finally {
+      refreshing = false;
+      if (!cancelled && (pendingRefresh || (requestedVersion !== undefined && requestedVersion !== timeWindow.get().version))) {
+        pendingRefresh = false; scheduleRefresh();
+      }
+    }
+  }
+  await refresh();
+  if (cancelled) return;
+  if (!cancelled && meta.mode === "follow") interval = setInterval(refresh, 5000);
+}
 
 const DEFAULT_PHASE_COLOR = "#9c9488";
 const OVERLAY_METRICS = [
@@ -23,7 +123,6 @@ const TEXT = "#231f1c";
 const MUTED = "#7a7168";
 const GRID = "#e8e1d8";
 
-const FOLLOW_REDRAW_MS = 5000;
 const LANE_CAP = 32;
 const DEFAULT_LANES = 8; // no-selection default: evenly spaced across the cluster
 const QUICK_PICKS = [
@@ -54,13 +153,8 @@ function formatElapsed(seconds) {
   return `+${mins}:${pad(secs)}`;
 }
 
-async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }) {
+function createGpuTimeline(view, meta, route, timeWindow) {
   let cancelled = false, loadSequence = 0;
-  const timeBars = [];
-  const timeBar = label => {
-    if (!timeWindow) return null;
-    const bar = createTimeBar(timeWindow, label); timeBars.push(bar); return bar.root;
-  };
   // mutable data state, reloaded on every follow-mode refresh
   let selection = route?.lanes || null; // lane-selection grammar string
   let autoDefault = !selection; // seed the spaced default once topology is known
@@ -80,44 +174,22 @@ async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }
   let v0 = 0;
   let v1 = 1;
   let haveData = false;
-  let overlayMetric = meta.capabilities.has_engine_series ? OVERLAY_METRICS[0] : null;
+  let overlayMetric = null; // Engine activity already appears in the shared RL flow.
   let showMem = false;
   let showAbsolute = false; // x-axis ticks: relative "+h:mm:ss" (default) vs wall-clock
   let multiNode = false;
   const laneKey = (l) => `${l.node}:${l.gpu}`;
   // hard viewport cap (design §17): the lane view never displays more than
   // MAXW at once, so every data fetch is O(window), never O(run)
-  const MAXW = meta.capabilities.max_window_s ?? Infinity;
+  const MAXW = timeWindow.get().maxSpan;
   let allLanes = []; // full topology lane list (seeds the spaced default selection)
-  let fetched = null; // {t0, t1} bounds the loaded phases/gpu/engine data covers
-  let liveMeta = meta;
   const updateSelectionUrl = () => {
-    history.replaceState(null, "", selection ? `#/gpu?lanes=${encodeURIComponent(selection)}` : "#/gpu");
+    history.replaceState(null, "", selection ? `#/?lanes=${encodeURIComponent(selection)}` : "#/");
   };
 
-  // T0/T1 come from meta.time_range (an O(1) edge-stamp read server-side),
-  // not from scanning fetched data. Keeps the trailing window pinned to the
-  // growing run unless the user has panned away.
-  function applyRange(range) {
-    if (timeWindow) {
-      timeWindow.updateBounds(range);
-      const state = timeWindow.get();
-      [T0, T1, v0, v1, haveData] = [state.start, state.end, state.t0, state.t1, state.ready];
-      return;
-    }
-    if (!range) {
-      haveData = false;
-      return;
-    }
-    const trailing = !haveData || v1 >= T1 - 1e-6;
-    const span = haveData ? v1 - v0 : Math.min(MAXW, range[1] - range[0] || 1);
-    [T0, T1] = range;
-    if (trailing) {
-      v1 = T1;
-      v0 = Math.max(T0, T1 - Math.min(span, MAXW));
-    }
-    if (v1 - v0 < 1) v0 = Math.max(T0, v1 - 1);
-    haveData = true;
+  function applyRange() {
+    const state = timeWindow.get();
+    [T0, T1, v0, v1, haveData] = [state.start, state.end, state.t0, state.t1, state.ready];
   }
 
   async function loadData() {
@@ -138,11 +210,7 @@ async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }
       return;
     }
 
-    // fetch a margin beyond the viewport so small pans redraw without a reload
-    const span = v1 - v0;
-    const margin = Math.max(0, Math.min(span / 4, (MAXW - span) / 2));
-    const f0 = Math.max(T0, v0 - margin);
-    const f1 = Math.min(T1, v1 + margin);
+    const [f0, f1] = [v0, v1];
     const requestedWindow = [v0, v1];
     // first sight of the topology: DEFAULT_LANES evenly spaced across the
     // global index range (8 gpus -> all, 64 -> g0,g8,...,g56) becomes a REAL
@@ -169,7 +237,6 @@ async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }
       : [];
     if (cancelled || sequence !== loadSequence || requestedWindow[0] !== v0 || requestedWindow[1] !== v1) return;
     engineSeries = engines;
-    fetched = { t0: f0, t1: f1 };
     lanes = allLanes;
     resolvedKeys = null;
     if (selection) {
@@ -203,25 +270,12 @@ async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }
     }
   }
 
-  // pan/zoom past the fetched bounds: debounced windowed reload
-  let reloadTimer = null;
+  // The parent owns fetching; local gestures move the shared time window.
   function afterViewChange() {
     if (cancelled) return;
-    if (timeWindow?.setWindow(v0, v1)) return;
+    if (timeWindow.setWindow(v0, v1)) return;
     draw();
     if (manyLanes()) fleet.redraw();
-    syncCarpet();
-    if (!fetched || v0 < fetched.t0 - 1e-6 || v1 > fetched.t1 + 1e-6) {
-      clearTimeout(reloadTimer);
-      reloadTimer = setTimeout(async () => {
-        try {
-          await loadData();
-        } catch {
-          return; // transient fetch failure — the next interaction retries
-        }
-        renderAll();
-      }, 300);
-    }
   }
 
   // external engines (no miles actor) have unknown GPU placement (gpus=[]):
@@ -276,16 +330,8 @@ async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }
       ...(meta.capabilities.has_engine_series ? chips : [el("span", { class: "muted" }, ["(no engine series)"])]),
       memBtn,
       absBtn,
-      el(
-        "button",
-        { onclick: () => ((v1 = T1), (v0 = Math.max(T0, T1 - MAXW)), afterViewChange()) },
-        ["latest window"],
-      ),
       overlayScale,
       followBadge,
-      ...(meta.data_buffer_length != null
-        ? [el("span", { class: "muted" }, [`databuffer: ${meta.data_buffer_length} groups`])]
-        : []),
       el("span", { class: "muted" }, [`Wheel = zoom · drag = pan · window ≤ ${Math.round(MAXW / 3600)}h`]),
     );
   };
@@ -374,7 +420,7 @@ async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }
     },
   });
   const fleet = createFleet({ phaseColors: PHASE_COLORS, runStart: () => T0,
-    ...(timeWindow ? { timeBar, viewRange: () => ({ t0: v0, t1: v1 }) } : {}),
+    viewRange: () => ({ t0: v0, t1: v1 }),
   });
 
   // above this many lanes the per-rank carpet stops scaling (payload and
@@ -390,11 +436,6 @@ async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }
     fleet.root.style.display = manyLanes() ? "" : "none";
     await (manyLanes() ? fleet.refresh(carpetRange()) : carpet.refresh(carpetRange()));
   }
-  let carpetTimer = null;
-  const syncCarpet = () => {
-    clearTimeout(carpetTimer);
-    carpetTimer = setTimeout(() => refreshOverview().catch(() => {}), 250);
-  };
 
   // ----------------------------- bubble strip -------------------------------
   const bubbleStrip = el("div", { class: "bubblestrip" });
@@ -585,6 +626,7 @@ async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }
   };
 
   function renderAll() {
+    if (cancelled) return;
     renderFreshness();
     renderSelection();
     renderBubbles();
@@ -754,71 +796,38 @@ async function renderTimeline(view, meta, route, { timeWindow, registerCleanup }
 
   view.replaceChildren(
     toolbar, selRow, mfuPanel, advisoryPanel, carpet.root, fleet.root, bubbleStrip,
-    el("div", { class: "panel" }, [canvas, ...(timeWindow ? [timeBar("GPU utilization")] : [])]),
+    el("div", { class: "panel" }, [canvas]),
     legendPanel,
   );
   renderToolbar();
-  applyRange(meta.time_range);
-  const unsubscribe = timeWindow?.subscribe(state => {
+  applyRange();
+  const unsubscribe = timeWindow.subscribe(state => {
     [T0, T1, v0, v1, haveData] = [state.start, state.end, state.t0, state.t1, state.ready];
     afterViewChange();
   });
-  let intervalId = null;
   const onResize = () => {
     if (cancelled) return;
     draw();
     manyLanes() ? fleet.redraw() : carpet.redraw();
   };
   window.addEventListener("resize", onResize);
-  registerCleanup(() => {
-    cancelled = true;
-    if (intervalId !== null) clearInterval(intervalId);
-    clearTimeout(carpetTimer);
-    clearTimeout(reloadTimer);
-    unsubscribe?.();
-    for (const bar of timeBars) bar.destroy();
-    carpet.destroy(); fleet.destroy();
-    window.removeEventListener("resize", onResize);
-    window.removeEventListener("mouseup", onMouseUp);
-  });
-  await Promise.all([loadData(), loadAdvisories()]);
-  if (cancelled) return;
-  await refreshOverview(); // topology decides carpet vs fleet panels
-  if (cancelled) return;
-  renderAll();
-  if (!manyLanes()) carpet.redraw(); // selection markers need the loaded lane list
-
-  // ------------------------- follow-mode auto refresh -----------------------
-  let refreshing = false;
-  if (meta.mode === "follow") {
-    intervalId = setInterval(async () => {
-      if (refreshing) return;
-      refreshing = true;
-      try {
-        // Refresh the global range from the current source timestamps.
-        liveMeta = await api("/api/meta");
-        applyRange(liveMeta.time_range);
-        await Promise.all([loadData(), loadAdvisories()]);
-        renderAll();
-        await refreshOverview();
-      } catch {
-        // transient fetch failure (server restart, network blip): keep polling
-      } finally {
-        refreshing = false;
-      }
-    }, FOLLOW_REDRAW_MS);
-  }
-}
-
-export async function renderGpu(view, meta, route) {
-  const content = el("div");
-  view.replaceChildren(el("h2", {}, ["GPU details"]),
-    el("p", { class: "muted" }, ["Inspect individual GPUs, memory, phases, MFU and engine activity. The selected time window is shared with Overview and Data & samples."]), content);
-  if (!meta.capabilities?.has_timeline) {
-    content.append(el("p", { class: "muted" }, ["GPU telemetry was not recorded for this run."]));
-    return;
-  }
-  await renderTimeline(content, meta, route, {
-    timeWindow: getRunTimeWindow(meta), registerCleanup: setViewCleanup,
-  });
+  return {
+    async refresh() {
+      if (cancelled) return;
+      applyRange();
+      await Promise.all([loadData(), loadAdvisories()]);
+      if (cancelled) return;
+      await refreshOverview();
+      if (cancelled) return;
+      renderAll();
+      if (!manyLanes()) carpet.redraw();
+    },
+    destroy() {
+      cancelled = true;
+      unsubscribe();
+      carpet.destroy(); fleet.destroy();
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("mouseup", onMouseUp);
+    },
+  };
 }

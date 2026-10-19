@@ -6,6 +6,17 @@ from pathlib import Path
 from threading import Lock
 
 
+def resolve_artifact(directory: Path, artifact: str) -> Path:
+    """Allow supported analysis files within the resolved export directory."""
+    directory = directory.resolve()
+    path = (directory / artifact).resolve()
+    if not path.is_relative_to(directory) or path.suffix not in {
+        ".html", ".png", ".pdf", ".md", ".csv", ".json", ".jsonl", ".gz",
+    } or not path.is_file():
+        raise FileNotFoundError("Analysis artifact not found")
+    return path
+
+
 def _identity(row: dict) -> tuple | None:
     # A group keeps its identity across retries; the same prompt in another epoch
     # has a different group_index and must not be confused with this retry chain.
@@ -141,18 +152,4 @@ class GroupHistory:
         return {**result, "rows": rows[:limit], "truncated": len(rows) > limit, "window_rows": len(rows)}
 
     def artifact_path(self, artifact: str) -> Path:
-        path = (self.analysis_dir / artifact).resolve()
-        if not path.is_relative_to(self.analysis_dir) or path.suffix not in {
-            ".html",
-            ".png",
-            ".pdf",
-            ".md",
-            ".csv",
-            ".json",
-            ".jsonl",
-            ".gz",
-        }:
-            raise FileNotFoundError("Unknown analysis artifact")
-        if not path.is_file():
-            raise FileNotFoundError("Analysis artifact not found")
-        return path
+        return resolve_artifact(self.analysis_dir, artifact)

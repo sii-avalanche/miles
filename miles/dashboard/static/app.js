@@ -2,9 +2,8 @@ import { APP_BASE, getMeta } from "./api.js";
 import { renderMetrics } from "./views_metrics.js";
 import { renderRollout } from "./views_rollout.js";
 import { renderTokens } from "./views_tokens.js";
-import { renderRuntime } from "./views_runtime.js";
+import { renderOverview } from "./views_overview.js";
 import { renderMonitoring } from "./views_monitoring.js";
-import { renderGpu } from "./views_timeline.js";
 
 // tiny DOM builder: el("div", {class: "x", onclick: fn}, [children|strings])
 export function el(tag, attrs = {}, children = []) {
@@ -45,9 +44,10 @@ function parseRoute() {
   const [path, query] = (location.hash.slice(1) || "/").split("?");
   const segments = path.split("/").filter(Boolean);
   const params = new URLSearchParams(query || "");
-  if (!segments.length || ["overview", "runtime"].includes(segments[0])) return { view: "overview" };
-  if (["gpu", "timeline"].includes(segments[0])) return { view: "gpu", lanes: params.get("lanes") };
-  if (["data", "monitoring"].includes(segments[0])) return { view: segments[0] };
+  if (!segments.length || ["overview", "runtime", "gpu", "timeline", "data"].includes(segments[0])) {
+    return { view: "overview", lanes: params.get("lanes") };
+  }
+  if (segments[0] === "monitoring") return { view: "monitoring" };
   if (segments[0] === "rollout" && segments.length >= 2) {
     const evaluation = params.get("eval") === "1";
     // "latest" is resolved against the dump at render time rather than baked
@@ -79,11 +79,9 @@ function crumbs(route, meta) {
     parts.push(nav("All runs", new URL("../../", APP_BASE).href, false));
   }
   parts.push(nav("Overview", "#/", route.view === "overview"));
-  parts.push(nav("GPU details", "#/gpu", route.view === "gpu"));
-  parts.push(nav("Data & samples", "#/data", ["data", "rollout", "tokens"].includes(route.view)));
   parts.push(nav("Training metrics", "#/metrics", route.view === "metrics"));
   parts.push(nav("Monitoring & alerts", "#/monitoring", route.view === "monitoring"));
-  // Data & samples owns rollout inspection; keep a table shortcut in detail views.
+  // Keep the sample table accessible from its detail views.
   if (["rollout", "tokens"].includes(route.view) && meta.rollout_ids.train.length) {
     const onRollout = route.view === "rollout" || route.view === "tokens";
     const replaceInPlace = (event) => {
@@ -135,8 +133,7 @@ async function render() {
     if (meta.wandb_url) runinfo.push(" · ", el("a", { href: meta.wandb_url, target: "_blank", rel: "noopener", title: "Compare experiments, configs and training curves" }, ["W&B · Experiments ↗"]));
     document.getElementById("runinfo").replaceChildren(...runinfo);
     if (route.view === "metrics") await renderMetrics(view, meta);
-    else if (["overview", "data"].includes(route.view)) await renderRuntime(view, meta, route);
-    else if (route.view === "gpu") await renderGpu(view, meta, route);
+    else if (route.view === "overview") await renderOverview(view, meta, route);
     else if (route.view === "monitoring") await renderMonitoring(view, meta);
     else if (route.view === "rollout") await renderRollout(view, meta, route);
     else await renderTokens(view, meta, route);

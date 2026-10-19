@@ -1,0 +1,79 @@
+{
+  "uid": "miles-rollouts",
+  "title": "Miles · Saved rollout results",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "timezone": "browser",
+  "tags": [
+    "miles",
+    "postgres"
+  ],
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "name": "db_run",
+        "label": "AvaCore run ID",
+        "type": "query",
+        "datasource": {
+          "uid": "ava-rollouts",
+          "type": "postgres"
+        },
+        "query": "SELECT DISTINCT run_id FROM rollouts_view ORDER BY run_id DESC LIMIT 50",
+        "refresh": 1,
+        "multi": false,
+        "includeAll": false,
+        "current": {},
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Saved results (latest 200; saving does not imply training selection)",
+      "type": "table",
+      "datasource": {
+        "uid": "ava-rollouts",
+        "type": "postgres"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT query_id, trial_id, status, score, updated_at, left(reason::text, 500) AS reason FROM rollouts_view WHERE run_id = ${db_run:sqlstring}::bigint AND $__timeFilter(updated_at) ORDER BY updated_at DESC LIMIT 200",
+          "datasource": {
+            "uid": "ava-rollouts",
+            "type": "postgres"
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    }
+  ],
+  "links": [
+    {
+      "title": "RL monitoring",
+      "type": "link",
+      "url": "/grafana/d/miles-overview/rl-observability"
+    }
+  ],
+  "description": "Provisioned only when AVATRAIN_GRAFANA_POSTGRES_URL is configured with a read-only, SELECT-only account. Database run IDs differ from dashboard run IDs. Uses existing rollouts_view; never loads full Trace JSON in the summary table."
+}

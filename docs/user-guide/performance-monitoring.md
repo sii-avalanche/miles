@@ -27,7 +27,7 @@ To only publish runtime metrics to W&B/local logs, omit `use_miles_dashboard`;
 fleet GPU/engine sampling requires the dashboard collector.
 
 ```bash
-./.venv/bin/python -m miles.dashboard.serve \
+./.venv/bin/python -m miles.dashboard view \
   --dashboard-dir runs/xy1008/<run>/logs/dashboard \
   --host 127.0.0.1 --port 7788 --follow --use-utilization-overview
 ```

@@ -1,5 +1,5 @@
 import { el, setViewCleanup } from "./app.js";
-import { grafanaUrl } from "./observability.js";
+import { grafanaUrl } from "./api.js";
 import { getRunTimeWindow, createTimeBar } from "./time_window.js";
 
 export async function renderMonitoring(view, meta) {

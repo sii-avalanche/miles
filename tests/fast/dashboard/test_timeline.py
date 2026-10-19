@@ -12,7 +12,7 @@ from tests.fast.dashboard.dummy_telemetry import (
 )
 
 from miles.dashboard.dump_reader import DumpReader
-from miles.dashboard.server import make_app
+from miles.dashboard.web.api import make_app
 from miles.dashboard.store import MetricStore, Role
 
 

@@ -1,0 +1,749 @@
+{
+  "uid": "miles-overview",
+  "title": "Miles \u00b7 Monitoring & Alerts",
+  "schemaVersion": 39,
+  "version": 2,
+  "editable": false,
+  "timezone": "browser",
+  "tags": [
+    "miles",
+    "rl"
+  ],
+  "time": {
+    "to": "now",
+    "from": "now-1h"
+  },
+  "refresh": "15s",
+  "templating": {
+    "list": [
+      {
+        "name": "run",
+        "label": "Run",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "miles-prometheus"
+        },
+        "query": {
+          "query": "query_result(avatrain_run_info)",
+          "refId": "RunVariableQuery"
+        },
+        "regex": "/run_id=\"(?<value>[^\"]+)\".*run_name=\"(?<text>[^\"]+)\"/",
+        "refresh": 1,
+        "sort": 2,
+        "multi": false,
+        "includeAll": false,
+        "current": {},
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 100,
+      "title": "Health & alerts",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 4,
+      "title": "Rollout source sample age",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "time() - avatrain_telemetry_timestamp_seconds{run_id=~\"$run\",component=\"rollout\"}",
+          "refId": "A",
+          "legendFormat": "{{metric}}",
+          "instant": true,
+          "range": false,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 8,
+        "h": 5
+      },
+      "description": "Age of the original source sample; old samples are excluded from live charts.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 15,
+      "title": "Telemetry freshness (1 = fresh; 0 = old)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "avatrain_telemetry_fresh{run_id=~\"$run\"}",
+          "refId": "A",
+          "legendFormat": "{{component}}",
+          "instant": true,
+          "range": false,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 8,
+        "y": 1,
+        "w": 8,
+        "h": 5
+      },
+      "description": "Historical snapshots above remain readable. Live charts stop when the original samples become stale.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 16,
+      "title": "Active monitoring alerts",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "ALERTS{run_id=~\"$run\",alertstate=\"firing\"} or ALERTS{alertname=\"MilesScrapeUnavailable\",alertstate=\"firing\"}",
+          "refId": "A",
+          "legendFormat": "{{metric}}",
+          "instant": true,
+          "range": false,
+          "format": "table",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Threshold alerts are operational symptoms. Open Miles Overview for the associated execution window, batch and prompt evidence.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 101,
+      "title": "GPU & inference capacity",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 5,
+      "title": "GPU utilization",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "avatrain_gpu_utilization_ratio{run_id=~\"$run\"}",
+          "refId": "A",
+          "legendFormat": "{{node}} \u00b7 GPU {{gpu}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 3
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "GPU memory",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "avatrain_gpu_memory_bytes{run_id=~\"$run\"}",
+          "refId": "A",
+          "legendFormat": "{{node}} \u00b7 GPU {{gpu}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 3
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Inference throughput",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "avatrain_engine_value{run_id=~\"$run\",metric=\"sglang_gen_throughput\"}",
+          "refId": "A",
+          "legendFormat": "{{engine}} \u00b7 DP {{dp_rank}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 3
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "KV / Mamba usage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "avatrain_engine_value{run_id=~\"$run\",metric=~\"sglang_(token|mamba)_usage\"}",
+          "refId": "A",
+          "legendFormat": "{{engine}} \u00b7 {{metric}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 3
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 102,
+      "title": "Execution & stage waits",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 11,
+      "title": "Generating, reward and pending database writes",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "avatrain_runtime_value{run_id=~\"$run\",component=\"rollout\",metric=~\"(sample/(generate|reward)/waiting|record/pending_writes)\"}",
+          "refId": "A",
+          "legendFormat": "{{metric}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 3
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Longest stage wait",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "avatrain_runtime_value{run_id=~\"$run\",component=\"rollout\",metric=~\"(sample/(generate|reward)/oldest_wait_seconds|record/oldest_pending_seconds)\"}",
+          "refId": "A",
+          "legendFormat": "{{metric}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Reward time includes limiter queue, HTTP requests and retries.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 3
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 103,
+      "title": "Data pool & group throughput",
+      "type": "row",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 9,
+      "title": "Collection and buffer fill",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "avatrain_runtime_value{run_id=~\"$run\",component=\"rollout\",metric=~\"(drain/progress_fraction|buffer/fill_fraction|batch_pool/fill_fraction|workload/.*/collection_progress_fraction)\"}",
+          "refId": "A",
+          "legendFormat": "{{metric}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        },
+        {
+          "expr": "avatrain_runtime_value{run_id=~\"$run\",component=\"rollout\",metric=\"batch/collected_groups\"} / ignoring(metric) (avatrain_runtime_value{run_id=~\"$run\",component=\"rollout\",metric=\"batch/target_groups\"} > 0)",
+          "refId": "B",
+          "legendFormat": "One-step batch collected / target",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 12,
+        "h": 8
+      },
+      "description": "One-step: valid groups collected divided by this batch target. Fully async: collection progress or buffer occupancy. Missing telemetry is not zero.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 3
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Produced / selected / rejected groups per second",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "miles-prometheus"
+      },
+      "targets": [
+        {
+          "expr": "avatrain_runtime_value{run_id=~\"$run\",component=\"rollout\",metric=~\"(producer/groups_completed_per_s|buffer/(groups_consumed|stale_rejected_groups|dynamic_rejected_groups)_per_s|batch/groups_(completed|selected|rejected)_per_s)\"}",
+          "refId": "A",
+          "legendFormat": "{{metric}}",
+          "instant": false,
+          "range": true,
+          "format": "time_series",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "miles-prometheus"
+          }
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 41,
+        "w": 12,
+        "h": 8
+      },
+      "description": "Group rates, not sample rates. One-step rates require batch/groups_* telemetry from updated training workers; older runs did not record these counters. Selected counts groups returned by the one-step collector; batch-end cancellation requests are separate from filter rejections.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "fillOpacity": 10,
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 3
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    }
+  ],
+  "links": [
+    {
+      "title": "Miles \u00b7 Overview",
+      "type": "link",
+      "url": "../../../runs/${run}/#/",
+      "targetBlank": true
+    },
+    {
+      "title": "Explore metrics",
+      "type": "link",
+      "url": "../../explore",
+      "targetBlank": true
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "description": "Operational trends and alerts, grouped by health, GPU capacity, execution, data pool and recorded totals. Miles Overview correlates GPU activity with RL events; Training metrics and W&B cover learning quality and experiment comparisons. Gaps mean missing or stale telemetry."
+}

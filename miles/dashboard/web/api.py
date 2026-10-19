@@ -5,7 +5,7 @@
 and the :class:`DumpReader` (rollout/train ``.pt`` dumps) — into the REST
 API consumed by the SPA. The server is strictly read-only over files on
 disk; live viewing is the same app with a follow loop tailing the store
-(see ``serve.py``).
+(see ``python -m miles.dashboard view``).
 
 Metric catalog: keys from ``metrics.jsonl`` are served as-is; dump-derived
 per-step aggregates are namespaced as ``dump/<column>`` so the L0 view works
@@ -28,16 +28,15 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.routing import get_route_path
 
-from miles.dashboard.advisory import DEFAULT_LOW_MFU, compute_advisories, mfu_summary
+from miles.dashboard.web import STATIC_DIR
+from miles.dashboard.web.diagnostics import DEFAULT_LOW_MFU, compute_advisories, mfu_summary
 from miles.dashboard.dump_reader import STEP_AGGREGATE_METRICS, DumpReader, DumpStillWriting
-from miles.dashboard.group_history import GroupHistory
-from miles.dashboard.runtime_status import reward_info, runtime_status
+from miles.dashboard.web.group_history import GroupHistory
+from miles.dashboard.web.status import reward_info, runtime_status, training_strategy
 from miles.dashboard.store import MetricStore, Stream
-from miles.dashboard.training_strategy import training_strategy
 
 DUMP_METRIC_PREFIX = "dump/"
 
-_STATIC_DIR = Path(__file__).parent / "static"
 
 
 @contextmanager
@@ -366,8 +365,8 @@ def make_app(
             )
             return _json_safe(payload)
 
-    if _STATIC_DIR.is_dir():
-        app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+    if STATIC_DIR.is_dir():
+        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
         @app.middleware("http")
         async def _no_stale_frontend(request, call_next):
@@ -382,6 +381,6 @@ def make_app(
 
         @app.get("/", include_in_schema=False)
         def index():
-            return FileResponse(_STATIC_DIR / "index.html")
+            return FileResponse(STATIC_DIR / "index.html")
 
     return app
