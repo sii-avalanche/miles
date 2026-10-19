@@ -1,7 +1,7 @@
 import polars as pl
 from tests.fast.dashboard.dummy_dump import blank_samples, dump_dummy_run
 
-from miles.dashboard.advisory import compute_advisories
+from miles.dashboard.web.diagnostics import compute_advisories
 from miles.dashboard.dump_reader import DumpReader, RolloutIds
 from miles.dashboard.store import EngineSample, Meta, MetricsRecord, MetricStore, PhaseEvent, Stream
 

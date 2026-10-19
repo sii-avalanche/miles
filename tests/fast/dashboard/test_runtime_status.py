@@ -3,8 +3,8 @@ import json
 from fastapi.testclient import TestClient
 
 from miles.dashboard.dump_reader import DumpReader
-from miles.dashboard.runtime_status import reward_info, runtime_status
-from miles.dashboard.server import make_app
+from miles.dashboard.web.status import reward_info, runtime_status
+from miles.dashboard.web.api import make_app
 from miles.dashboard.store import MetricsRecord, MetricStore
 
 R = "runtime/rollout/"

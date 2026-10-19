@@ -9,26 +9,21 @@ Every group-level decision lives here — what to keep, what to hand to
 
 import asyncio
 import logging
-import threading
-import time
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
-from collections import Counter, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
-from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
+from miles.rollout.filter_hub.base_types import call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import (
-    GroupWeightVersionStats,
     apply_aborted_filter,
     apply_missing_reward_filter,
-    group_staleness,
     group_weight_version_stats,
 )
-from miles.rollout.group_identity import group_identity
 from miles.utils.function_registry import load_function
-from miles.utils.perf_monitor import get_monitor, workload_of, workload_targets
+from miles.monitoring.collection.runtime import get_monitor
+from miles.monitoring.collection.buffer import BufferTelemetry
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -149,175 +144,60 @@ class DefaultDataBuffer(DataBuffer):
         self._unused_handler_fn = input.unused_handler_fn
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
-        self._current_version: int | None = None
-        self._reference_is_published = False
-
-        self._metric_gatherer = MetricGatherer()
-        self._metric_aborted_groups = 0
-        self._metric_stale_groups = 0
-        self._metric_consumed_staleness: list[int] = []
-        self._metric_selected_newest_lag: list[int] = []
-        self._metric_selected_version_span: list[int] = []
-        self._metric_selected_token_lag_sum = 0.0
-        self._metric_selected_versioned_tokens = 0
-        self._metric_selected_samples = 0
-        self._metric_selected_versioned_samples = 0
-        self._monitor = get_monitor(args)
-        self._perf_prefix = "buffer" if input.trainer_model_id is None else f"buffer/{input.trainer_model_id}"
-        self._queued_version_stats = deque()
-        self._workload_version_counts = {name: Counter() for name in workload_targets(args)}
-        if getattr(args, "perf_monitor_workload_targets", None) is not None:
-            self._workload_version_counts["other"] = Counter()
-        self._telemetry_lock = threading.Lock()
-        self._trainer_model_id = input.trainer_model_id
-        for name in ("stale_rejected", "aborted", "missing_reward", "dynamic_rejected", "drop", "retry"):
-            self._monitor.increment(f"{self._perf_prefix}/{name}_groups_total", 0)
-        self._monitor.register(self._perf_prefix, self._perf_snapshot)
-
-    def _perf_snapshot(self) -> dict[str, float]:
-        with self._telemetry_lock:
-            version = self._current_version
-            workloads = {name: counter.copy() for name, counter in self._workload_version_counts.items()}
-        total = Counter()
-        for counter in workloads.values():
-            total.update(counter)
-        metrics = self._version_snapshot(total, version)
-        for name, counter in workloads.items():
-            metrics.update(
-                {f"workload/{name}/{key}": value for key, value in self._version_snapshot(counter, version).items()}
-            )
-        return metrics
-
-    def _version_snapshot(self, counts: Counter, version: int | None) -> dict[str, float]:
-        queued = sum(counts.values())
-        metrics = {
-            "queued_groups": queued,
-            "capacity_groups": self._capacity,
-            "fill_fraction": queued / self._capacity,
-            "versions/unknown_groups": 0,
-            "versions/mixed_groups": sum(n for (_, mixed), n in counts.items() if mixed),
-        }
-        if version is not None:
-            metrics["current_weight_version"] = version
-            buckets = [*(f"lag_{lag}" for lag in range(4)), "older", "future"]
-            metrics.update({f"versions/{bucket}_groups": 0 for bucket in buckets})
-        for (oldest, _), count in counts.items():
-            if oldest is None:
-                bucket = "unknown"
-            elif version is None:
-                continue
-            else:
-                lag = version - oldest
-                bucket = f"lag_{lag}" if 0 <= lag < 4 else "older" if lag >= 4 else "future"
-            metrics[f"versions/{bucket}_groups"] += count
-        return metrics
-
-    def _track_queue(self, entry: DataBufferInput | None = None) -> None:
-        if not self._monitor.enabled:
-            return
-        if entry is not None:
-            started = time.monotonic()
-            stats = group_weight_version_stats(entry.group)
-            workload = workload_of(entry.prompt_group[0], self._args)
-            key = (stats.oldest_version, stats.oldest_version != stats.newest_version)
-        with self._telemetry_lock:
-            if entry is not None:
-                self._queued_version_stats.append((started, workload, key))
-                self._workload_version_counts[workload][key] += 1
-            else:
-                started, workload, key = self._queued_version_stats.popleft()
-                counter = self._workload_version_counts[workload]
-                counter[key] -= 1
-                if not counter[key]:
-                    del counter[key]
-        if entry is None:
-            self._monitor.observe(f"{self._perf_prefix}/residence", time.monotonic() - started)
+        self._telemetry = BufferTelemetry(
+            args, get_monitor(args), capacity=lambda: self._capacity, trainer_model_id=input.trainer_model_id
+        )
 
     def set_weight_version(self, version: int, trainer_model_id: str | None = None) -> None:
-        with self._telemetry_lock:
-            self._current_version = version
-            self._reference_is_published = True
-
-    def _record_rejection(self, entry: DataBufferInput, reason: str, *, reusable: bool) -> None:
-        if not self._monitor.enabled:
-            return
-        counter = {"dynamic_filter": "dynamic_rejected", "stale": "stale_rejected"}.get(reason, reason)
-        self._monitor.increment(f"{self._perf_prefix}/{counter}_groups_total")
-        stats = group_weight_version_stats(entry.group)
-        action = (
-            "retry" if reusable and getattr(self._args, "async_unused_samples_handler", "drop") == "retry" else "drop"
-        )
-        self._monitor.increment(f"{self._perf_prefix}/{action}_groups_total")
-        workload = workload_of(entry.prompt_group[0], self._args)
-        self._monitor.increment(f"{self._perf_prefix}/workload/{workload}/{reason}_rejected_groups_total")
-        self._monitor.increment(f"{self._perf_prefix}/workload/{workload}/{action}_groups_total")
-        self._monitor.event(
-            "buffer_reject",
-            details=dict(
-                **group_identity(entry.prompt_group),
-                reason=reason,
-                action=action,
-                groups=1,
-                trainer_model_id=self._trainer_model_id,
-                oldest_version=stats.oldest_version,
-                newest_version=stats.newest_version,
-                current_version=self._current_version,
-                queued_groups=len(self._buffer),
-                workload=workload,
-            ),
-        )
+        self._telemetry.stats.set_version(version, published=True)
 
     async def put(self, input: DataBufferInput) -> None:
-        self._monitor.increment(f"{self._perf_prefix}/groups_seen_total")
-        self._monitor.increment(f"workload/{workload_of(input.prompt_group[0], self._args)}/groups_seen_total")
+        self._telemetry.seen(input)
         if not self._preput_filter(input):
             return
 
         async with self._cond:
             if len(self._buffer) >= self._capacity:
-                with self._monitor.wait(f"{self._perf_prefix}/full_wait"):
+                with self._telemetry.wait("full_wait"):
                     while len(self._buffer) >= self._capacity:
                         await self._cond.wait()
             self._buffer.append(input)
-            self._track_queue(input)
-            self._monitor.increment(f"{self._perf_prefix}/groups_enqueued_total")
+            self._telemetry.enqueued(input)
             self._cond.notify_all()
 
     def _preput_filter(self, input: DataBufferInput) -> bool:
         output = apply_aborted_filter(self._args, input.group)
         if not output.keep:
-            self._metric_aborted_groups += 1
-            self._record_rejection(input, "aborted", reusable=True)
+            self._telemetry.window.aborted()
+            self._telemetry.rejected(input, "aborted", reusable=True, queued_groups=len(self._buffer))
             self._unused_handler_fn(input.prompt_group)
             return False
 
         output = apply_missing_reward_filter(self._args, input.group)
         if not output.keep:
-            self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
-            self._record_rejection(input, "missing_reward", reusable=False)
+            self._telemetry.window.filter_metrics.on_dynamic_filter_drop(reason=output.reason)
+            self._telemetry.rejected(input, "missing_reward", reusable=False, queued_groups=len(self._buffer))
             return False
 
-        self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
+        self._telemetry.window.filter_metrics.on_group_before_dynamic_filter(self._args, input.group)
         output = call_dynamic_filter(self._dynamic_filter, self._args, input.group)
         if not output.keep:
-            self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
-            self._record_rejection(input, "dynamic_filter", reusable=False)
+            self._telemetry.window.filter_metrics.on_dynamic_filter_drop(reason=output.reason)
+            self._telemetry.rejected(input, "dynamic_filter", reusable=False, queued_groups=len(self._buffer))
             return False
         return True
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
         if current_version is not None:
-            with self._telemetry_lock:
-                if not self._reference_is_published:
-                    self._current_version = current_version
+            self._telemetry.stats.set_version(current_version)
         async with self._cond:
             while True:
                 if not self._buffer:
-                    with self._monitor.wait(f"{self._perf_prefix}/empty_wait"):
+                    with self._telemetry.wait("empty_wait"):
                         while not self._buffer:
                             await self._cond.wait()
                 entry = self._buffer.pop(0)
-                self._track_queue()
+                self._telemetry.dequeued()
                 self._cond.notify_all()  # wake producers blocked on a full buffer
 
                 version_stats = group_weight_version_stats(entry.group)
@@ -325,80 +205,17 @@ class DefaultDataBuffer(DataBuffer):
                 if staleness is not None:
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
-                        self._metric_stale_groups += 1
-                        self._record_rejection(entry, "stale", reusable=True)
+                        self._telemetry.window.stale()
+                        self._telemetry.rejected(entry, "stale", reusable=True, queued_groups=len(self._buffer))
                         self._unused_handler_fn(entry.prompt_group)
                         continue
-                    self._metric_consumed_staleness.append(staleness)
-                self._record_selected_version_stats(version_stats, current_version)
-                self._monitor.increment(f"{self._perf_prefix}/groups_consumed_total")
-                self._monitor.increment(
-                    f"workload/{workload_of(entry.prompt_group[0], self._args)}/groups_consumed_total"
-                )
+                    self._telemetry.window.consumed_staleness(staleness)
+                self._telemetry.window.selected(version_stats, current_version)
+                self._telemetry.consumed(entry)
                 return entry
 
-    def _record_selected_version_stats(
-        self,
-        stats: GroupWeightVersionStats,
-        current_version: int | None,
-    ) -> None:
-        self._metric_selected_samples += stats.sample_count
-        self._metric_selected_versioned_samples += stats.versioned_sample_count
-
-        if stats.oldest_version is not None and stats.newest_version is not None:
-            self._metric_selected_version_span.append(stats.newest_version - stats.oldest_version)
-
-        newest_lag = stats.newest_lag(current_version)
-        if newest_lag is not None:
-            self._metric_selected_newest_lag.append(newest_lag)
-
-        token_weighted_lag = stats.token_weighted_lag(current_version)
-        if token_weighted_lag is not None:
-            self._metric_selected_token_lag_sum += token_weighted_lag * stats.versioned_token_count
-            self._metric_selected_versioned_tokens += stats.versioned_token_count
-
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
-        prefix = "rollout/fully_async/"
-        metrics = {
-            f"{prefix}queue_size": len(self._buffer),
-            f"{prefix}aborted_groups_filtered": self._metric_aborted_groups,
-            f"{prefix}stale_groups_filtered": self._metric_stale_groups,
-            **self._metric_gatherer.collect(),
-        }
-        if consumed := self._metric_consumed_staleness:
-            metrics[f"{prefix}avg_staleness"] = sum(consumed) / len(consumed)
-            metrics[f"{prefix}max_staleness"] = max(consumed)
-        if newest_lag := self._metric_selected_newest_lag:
-            metrics[f"{prefix}avg_post_generation_staleness"] = sum(newest_lag) / len(newest_lag)
-            metrics[f"{prefix}max_post_generation_staleness"] = max(newest_lag)
-        if version_span := self._metric_selected_version_span:
-            metrics[f"{prefix}avg_generation_version_span"] = sum(version_span) / len(version_span)
-            metrics[f"{prefix}max_generation_version_span"] = max(version_span)
-        if self._metric_selected_versioned_tokens:
-            metrics[f"{prefix}token_weighted_staleness"] = (
-                self._metric_selected_token_lag_sum / self._metric_selected_versioned_tokens
-            )
-        if self._metric_selected_samples:
-            metrics[f"{prefix}weight_version_sample_coverage"] = (
-                self._metric_selected_versioned_samples / self._metric_selected_samples
-            )
-        buffered = [
-            s for entry in self._buffer if (s := group_staleness(entry.group, self._current_version)) is not None
-        ]
-        if buffered:
-            metrics[f"{prefix}buffer_avg_staleness"] = sum(buffered) / len(buffered)
-            metrics[f"{prefix}buffer_max_staleness"] = max(buffered)
-
-        self._metric_gatherer = MetricGatherer()
-        self._metric_consumed_staleness = []
-        self._metric_selected_newest_lag = []
-        self._metric_selected_version_span = []
-        self._metric_selected_token_lag_sum = 0.0
-        self._metric_selected_versioned_tokens = 0
-        self._metric_selected_samples = 0
-        self._metric_selected_versioned_samples = 0
-        self._metric_aborted_groups = self._metric_stale_groups = 0
-        return metrics
+        return self._telemetry.collect(self._buffer)
 
 
 # ============================ multi policy buffer =============================

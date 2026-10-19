@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from tests.fast.dashboard.dummy_dump import dump_dummy_run
 
 from miles.dashboard.dump_reader import DumpReader
-from miles.dashboard.server import _wandb_url, make_app
+from miles.dashboard.web.api import _wandb_url, make_app
 from miles.dashboard.store import Meta, MetricsRecord, MetricStore
 
 
@@ -234,7 +234,8 @@ def test_nan_values_serialize_as_null(dump_dir):
 def test_static_index(client):
     response = client.get("/")
     assert response.status_code == 200
-    assert "miles dashboard" in response.text
+    assert "Miles" in response.text
+    assert 'src="./static/app.js"' in response.text
 
 
 def test_dump_keys_advertised_only_without_telemetry(tmp_path):
@@ -274,7 +275,7 @@ def test_sample_messages_from_trajectory_sidecar(tmp_path):
 
 
 def test_make_demo_dir(tmp_path):
-    from miles.dashboard.serve import make_demo_dir
+    from miles.dashboard.__main__ import make_demo_dir
 
     make_demo_dir(tmp_path)
     reader = DumpReader(tmp_path)

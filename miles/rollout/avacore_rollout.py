@@ -25,7 +25,8 @@ from miles.rollout.avacore_trace import conversation_tips, graph_nodes, snapshot
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.rollout.rollout_recording import DurableRolloutOutbox, _atomic_json
 from miles.rollout.screening_resume import inherit_records
-from miles.utils.perf_monitor import get_monitor
+from miles.monitoring.collection.host import recorder_metrics
+from miles.monitoring.collection.runtime import get_monitor
 from miles.utils.types import Sample, WeightVersionsPerCall
 
 __all__ = ["AvaCoreRollout", "generate"]
@@ -183,14 +184,7 @@ class AvaCoreRollout:
         return samples[0] if len(samples) == 1 else samples
 
     def _record_perf_snapshot(self) -> dict[str, float]:
-        metrics = self._outbox.stats() if self._outbox is not None else {"pending_writes": 0}
-        if self._record_pool is not None:
-            stats = self._record_pool.get_stats()  # get_stats never resets the real pool's counters
-            metrics.update({f"pool/{key}": value for key, value in stats.items()})
-            for key in ("connections_errors", "connections_lost", "requests_errors"):
-                # Mark cumulative fields explicitly so the monitor can derive interval rates.
-                metrics[f"pool/{key}_total"] = stats.get(key, 0)
-        return metrics
+        return recorder_metrics(self._outbox, self._record_pool)
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None

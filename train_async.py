@@ -16,7 +16,7 @@ from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
 from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
 from miles.utils.misc import should_run_periodic_action
 from miles.utils.orchestration_utils import init_orchestration_script
-from miles.utils.perf_monitor import get_monitor
+from miles.monitoring.collection.runtime import get_monitor
 
 logger = logging.getLogger(__name__)
 

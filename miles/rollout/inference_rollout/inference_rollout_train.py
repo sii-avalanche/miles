@@ -19,7 +19,7 @@ from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
 from miles.utils.http_utils import get, post, router_worker_base_urls
 from miles.utils.misc import as_completed_async, call_agent_abort_hook
-from miles.utils.perf_monitor import get_monitor
+from miles.monitoring.collection.runtime import get_monitor
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)

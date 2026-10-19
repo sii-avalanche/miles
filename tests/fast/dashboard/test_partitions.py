@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from tests.fast.dashboard.dummy_telemetry import dump_dummy_telemetry
 
 from miles.dashboard.dump_reader import DumpReader
-from miles.dashboard.server import make_app
+from miles.dashboard.web.api import make_app
 from miles.dashboard.store import GpuSample, Meta, MetricStore, PhaseEvent, Role, Stream, _hour_key, _PartitionReader
 
 # hour-aligned base so partition boundaries land where the test says they do

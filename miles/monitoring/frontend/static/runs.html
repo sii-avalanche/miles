@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AvaTrain · Runs</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #231f1c; background: #faf8f5; }
+    main { max-width: 1050px; margin: 50px auto; padding: 0 24px; }
+    h1 { font-size: 30px; } .muted { color: #716b63; }
+    form { display: flex; gap: 12px; margin: 28px 0; }
+    input { flex: 1; min-width: 100px; } input, button { padding: 12px; font: inherit; border: 1px solid #d8d1c8; border-radius: 8px; }
+    button { background: #d55816; color: white; cursor: pointer; }
+    article { border: 1px solid #e5ddd0; border-radius: 10px; background: white; padding: 20px; margin: 14px 0; }
+    h2 { font-size: 18px; margin: 0 0 8px; } p { overflow-wrap: anywhere; }
+    a { color: #235fa8; margin-right: 20px; } #status { min-height: 24px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>AvaTrain · Runs</h1>
+  <p class="muted">Newest runs first, sorted by creation time. Search by platform job ID or run name. Open a run for GPU utilization, execution and data pool timelines, then drill into data, training or monitoring.</p>
+  <p><a id="grafana" hidden target="_blank" rel="noopener">Fleet monitoring & alerts · Grafana ↗</a></p>
+  <form id="search"><input id="query" maxlength="128" placeholder="j-1791635740-359604" aria-label="Job ID or run name"><button>Search</button></form>
+  <p id="status" role="status"></p>
+  <section id="runs"></section>
+</main>
+<script type="module">
+  const query = document.querySelector("#query"), status = document.querySelector("#status"), runs = document.querySelector("#runs");
+  const base = new URL("./", location.href);
+  fetch(new URL("api/observability", base)).then(response => response.json()).then(data => {
+    if (!data.grafana) return;
+    const link = document.querySelector("#grafana");
+    link.href = new URL("grafana/d/miles-overview/rl-observability", base); link.hidden = false;
+  }).catch(() => {});
+  query.value = new URLSearchParams(location.search).get("q") || "";
+  const node = (tag, text) => { const n = document.createElement(tag); n.textContent = text; return n; };
+  let loading = false;
+  async function load() {
+    if (loading) return;
+    loading = true;
+    status.textContent = "Loading runs…";
+    try {
+      const url = new URL("api/runs", base); url.searchParams.set("q", query.value.trim());
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      runs.replaceChildren();
+      status.textContent = data.total ? `${data.total} matching runs (${data.runs.length} shown)` : "No matching runs. Existing jobs may need to be registered.";
+      for (const run of data.runs) {
+        const card = node("article", "");
+        card.append(node("h2", run.job_id || "Job ID not registered"), node("p", run.relative_path), node("p", `${run.owner ? `Owner: ${run.owner} · ` : ""}Created: ${new Date(run.created_at * 1000).toLocaleString()} · Recorded state: ${run.state} · telemetry: ${run.telemetry_ready ? "available" : "not available"}`));
+        if (run.telemetry_ready) {
+          for (const [label, hash] of [["Overview", ""], ["Training metrics", "metrics"], ["Monitoring & alerts", "monitoring"]]) {
+            const link = node("a", label); link.href = new URL(`runs/${run.id}/#/${hash}`, base); card.append(link);
+          }
+        }
+        runs.append(card);
+      }
+    } catch (error) { status.textContent = `Could not load runs: ${error.message}`; }
+    finally { loading = false; }
+  }
+  document.querySelector("#search").onsubmit = event => { event.preventDefault(); const url = new URL(location.href); url.searchParams.set("q", query.value.trim()); history.replaceState(null, "", url); load(); };
+  load();
+  setInterval(() => { if (!document.hidden) load(); }, 15000);
+</script>
+</body>
+</html>

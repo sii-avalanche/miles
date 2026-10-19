@@ -1,0 +1,30 @@
+groups:
+  - name: miles-runtime
+    interval: 15s
+    rules:
+      - alert: MilesScrapeUnavailable
+        expr: up{job="miles"} == 0
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: Miles telemetry exporter cannot be scraped
+      - alert: MilesTrainerWaiting
+        expr: avatrain_runtime_value{component="driver",metric="phase/wait_rollout/oldest_wait_seconds"} > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Trainer has waited for rollout for more than five minutes
+          description: Inspect the run's RL Compute batch and workload tracks; this is a symptom, not a root cause.
+      - alert: MilesRewardLongWait
+        expr: avatrain_runtime_value{component="rollout",metric="sample/reward/oldest_wait_seconds"} > 900
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Reward stage has a sample waiting for more than fifteen minutes
+          description: Reward time includes limiter queue, API calls and retries.
+      - alert: MilesDatabaseBacklog
+        expr: avatrain_runtime_value{component="rollout",metric="record/oldest_pending_seconds"} > 300
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: A Trace has been waiting for database persistence for more than five minutes

@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any
 
-from miles.dashboard import hooks as dashboard_hooks
+from miles.monitoring.collection import hooks as dashboard_hooks
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, RolloutExecutorEvalFleet
 from miles.ray.rollout.metrics import log_eval_rollout_data, log_eval_skip, log_rollout_data
@@ -39,7 +39,7 @@ from miles.utils.http_utils import init_http_client
 from miles.utils.init_once import InitOnce, init_once
 from miles.utils.logging_utils import configure_logger
 from miles.utils.metric_checker import MetricChecker
-from miles.utils.perf_monitor import get_monitor
+from miles.monitoring.collection.runtime import get_monitor
 from miles.utils.timer import timer
 from miles.utils.tracking_utils.tracking import init_tracking
 from miles.utils.weight_version import assert_samples_weight_version_sane, assert_weight_version_is_published

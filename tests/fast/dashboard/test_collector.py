@@ -152,6 +152,25 @@ def test_auto_scrape_mode_is_direct(tmp_path):
     collector.shutdown()
 
 
+def test_topology_update_starts_scraping_and_repoints_router(tmp_path):
+    collector = make_collector(tmp_path, scraper_http_get=lambda url, timeout: ROUTER_FIXTURE)
+    snapshot = TopologySnapshot(ts=1.0, engines=[_engine("http://e:1")])
+    try:
+        collector.update_topology(snapshot, router_addr="http://router:3000")
+        scraper = collector._scraper
+        assert scraper.engine_addrs() == ["http://e:1"]
+        assert scraper.scrape_once(now=2.0) > 0
+        collector.update_topology(snapshot, router_addr="http://router:3000")
+        assert collector._scraper is scraper
+        collector.update_topology(snapshot, router_addr="http://router:3001")
+        assert scraper._stop_event.is_set()
+        assert collector._scraper.router_addr == "http://router:3001"
+        assert collector._scraper.engine_addrs() == ["http://e:1"]
+    finally:
+        collector.shutdown()
+    assert MetricStore.load(tmp_path / "dashboard").engine_series("sglang_num_running_reqs")
+
+
 def test_explicit_router_scrape_mode_is_honoured(tmp_path):
     collector = _router_mode_collector(tmp_path)
     collector.set_router("http://router:3000")

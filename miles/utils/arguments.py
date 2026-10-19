@@ -17,8 +17,8 @@ from miles.backends.megatron_utils.megatron_config import (
 )
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
-from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
-from miles.utils.perf_monitor import add_perf_monitor_arguments, validate_perf_monitor_args
+from miles.monitoring.transport.config import add_dashboard_arguments, validate_dashboard_args
+from miles.monitoring.transport.config import add_perf_monitor_arguments, validate_perf_monitor_args
 from miles.ray.specs.train import compute_trainer_ids, external_trainer_controller_addrs
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
 from miles.utils.audit_utils.event_logger.logger import EVENTS_DIRNAME

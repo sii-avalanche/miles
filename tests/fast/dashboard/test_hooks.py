@@ -330,6 +330,23 @@ async def test_register_engines_without_collector_is_noop():
     assert hooks._engines_fingerprint is None
 
 
+async def test_router_and_engines_publish_together_and_router_restart_republishes(monkeypatch):
+    handle = FakeHandle()
+    monkeypatch.setattr(backend, "resolve_collector", lambda: handle)
+    infos = {"inference-engine-0-0-0": [_worker_info("inference-engine-0-0-0", "node-a", [0, 1])]}
+    provider = FakeWorkerProvider(infos)
+    servers = _servers([FakeCell("http://a:1")])
+    for router in ["http://router:3000", "http://router:3000", "http://router:3001"]:
+        await hooks.register_engines(servers, provider=provider, router_addr=router)
+
+    assert len(handle.update_topology.calls) == 2
+    assert [kwargs["router_addr"] for _, kwargs in handle.update_topology.calls] == [
+        "http://router:3000", "http://router:3001",
+    ]
+    assert handle.set_router.calls == []
+    assert all([e.addr for e in args[0].engines] == ["http://a:1"] for args, _ in handle.update_topology.calls)
+
+
 async def test_register_engines_publishes_topology_from_a_running_event_loop(monkeypatch, caplog):
     """Driven from inside a running asyncio loop (as prepare_rollout does), the topology is published without warning."""
     handle = FakeHandle()

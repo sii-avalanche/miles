@@ -5,7 +5,7 @@ import torch
 
 from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
 from miles.utils.audit_utils.event_logger.models import MetricEvent
-from miles.utils.perf_monitor import start_monitor, stop_monitors
+from miles.monitoring.collection.runtime import start_monitor, stop_monitors
 
 from .base import (
     MilesDashboardBackend,

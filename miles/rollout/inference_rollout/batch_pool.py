@@ -2,7 +2,7 @@
 
 from argparse import Namespace
 
-from miles.utils.perf_monitor import get_monitor
+from miles.monitoring.collection.runtime import get_monitor
 
 
 class BatchPoolTelemetry:

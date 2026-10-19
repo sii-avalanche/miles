@@ -27,7 +27,7 @@ To only publish runtime metrics to W&B/local logs, omit `use_miles_dashboard`;
 fleet GPU/engine sampling requires the dashboard collector.
 
 ```bash
-./.venv/bin/python -m miles.dashboard.serve \
+./.venv/bin/python -m miles.dashboard view \
   --dashboard-dir runs/xy1008/<run>/logs/dashboard \
   --host 127.0.0.1 --port 7788 --follow --use-utilization-overview
 ```
@@ -82,9 +82,11 @@ Driver `wait_rollout` measures the exposed wait after overlap, while fully-async
 
 Prefixes below are `runtime/rollout/` unless otherwise specified.
 `*_total` counts since process start; `*_per_s` is a delta over the last emitted
-interval. Duration p50/p95/max use the last **256 completed operations**, not
-all operations or a fixed five-minute window. Open waits are visible before
-they complete; `seconds_per_s` includes the change in ongoing wait time.
+interval. Rates are emitted only for group throughput/filtering and process CPU.
+P95 uses the last **256 completed operations** for generation, reward, record
+persistence, group generation and buffer residence. Other timers retain completed
+counts and total seconds. Live waiting counts and oldest-wait age expose unfinished
+operations; no P50, maximum, window-count or derived wait-rate series are emitted.
 
 | Metric | Meaning / useful comparison |
 | --- | --- |
@@ -93,7 +95,7 @@ they complete; `seconds_per_s` includes the change in ongoing wait time.
 | `producer/in_flight_groups`, `producer/completed_pending_groups` | unfinished group tasks vs finished tasks not yet collected by the worker; a collected entry blocked inside `put` is counted by `full_wait/waiting` separately |
 | `producer/oldest_in_flight_seconds`, `producer/group_generation/p95_seconds` | current long tail vs recent completed group latency |
 | `buffer/fill_fraction`, `buffer/queued_groups`, `buffer/capacity_groups` | completed groups held in the default buffer, independent of database records |
-| `buffer/full_wait/waiting`, `buffer/full_wait/oldest_wait_seconds`, `buffer/full_wait/seconds_per_s` | producer blocked by a full buffer; prolonged values suggest consumption is slower than supply |
+| `buffer/full_wait/waiting`, `buffer/full_wait/oldest_wait_seconds`, `buffer/full_wait/seconds_total` | producer blocked by a full buffer; prolonged values suggest consumption is slower than supply |
 | `buffer/empty_wait/*` | consumer waiting for a group; pair with driver wait and filter rates |
 | `buffer/residence/p95_seconds` | time a popped group spent queued, including groups subsequently rejected as stale |
 | `buffer/groups_seen_per_s`, `buffer/groups_consumed_per_s` | group-level input and valid output rates; rates are not token throughput |
@@ -103,7 +105,6 @@ they complete; `seconds_per_s` includes the change in ongoing wait time.
 | `record/pending_writes`, `record/oldest_pending_seconds` | detached writes still unfinished; no new queue or connection limit is introduced |
 | `record/{success,failed,pool_timeout,other_errors}_total` | completed outcomes; a successful rollout does not imply a successful database record |
 | `record/pool/{pool_size,pool_available,requests_waiting,connections_errors}` | actual psycopg pool gauges/counters; fields appear after the pool opens |
-| `record/pool/{connections_errors,connections_lost,requests_errors}_per_s` | interval rates derived without resetting pool counters; pre-monitor historical totals are excluded from the first rate |
 | `record/open_wait/*` | awaiting the shared store/run initialization task |
 | `record/create_rollout/*`, `record/end_to_end/*` | complete create call vs complete record operation; both include waits/serialization/SQL, not isolated server SQL execution |
 | `host/process_cpu_seconds_per_s` | process CPU core equivalents: 1 means approximately one fully busy CPU core |
@@ -130,7 +131,8 @@ internal waits require equivalent instrumentation in that implementation.
   timeline records stage, rollout ID, start/end and exception class. An
   `ActorDiedError` during collection identifies the failure stage; distinguishing
   kernel OOM, signal, network failure and segfault still needs worker/kernel logs.
-* **Collection / workload share:** the default workload is `all`. For mixed
+* **Collection / workload share:** unconfigured runs emit overall metrics only,
+  without duplicate `workload/all` series. For mixed
   datasets, provide `[train] perf_monitor_workload_key = "source"` and
   `perf_monitor_workload_targets = { math = 0.7, code = 0.3 }`, with labels in
   `Sample.metadata["source"]`. Progress is `selected groups / (batch target ×
@@ -175,16 +177,18 @@ Run from the Miles checkout with the AvaTrain virtual environment:
 
 ```bash
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ../.venv/bin/python -m pytest \
-  tests/fast/utils/test_perf_monitor.py \
-  tests/fast/rollout/test_perf_monitoring.py \
   tests/fast/rollout/test_fully_async_rollout.py \
   tests/fast/rollout/test_fully_async_data_buffer.py \
   tests/fast/dashboard \
-  --ignore=tests/fast/dashboard/test_core_integration.py
-node --experimental-vm-modules tests/fast/dashboard/runtime_frontend.mjs
+  -k "not test_tracking_backend_end_to_end_local_ray"
+node --experimental-vm-modules tests/fast/dashboard/time_window_frontend.mjs
 ```
 
-These checks cover buffer instrumentation, rates and open waits, collector/file/API
-wiring, and frontend refresh/rendering logic. They do not validate a live Ray
+These checks cover buffer behavior, collector/file/API wiring, timeline
+aggregation and the shared frontend time window. They do not validate a live Ray
 cluster, GPU kernels, W&B service or production database. The frontend check uses
 a simulated DOM/canvas and does not perform browser screenshot comparison.
+
+Implementation ownership and concrete data paths are documented in
+[`miles/monitoring/README.md`](../../miles/monitoring/README.md). The five temporary
+runtime/async-flow validation files were run during migration and then removed.
