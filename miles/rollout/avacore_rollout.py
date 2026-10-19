@@ -15,7 +15,6 @@ from ava_core.core import Schema, Trace
 from ava_core.core.training_trace import graph_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
-from ava_core.generate.remote_rollout import RemoteGenerate, RemoteSettings
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import Reward
 from ava_core.runner import RECOVERABLE_ERRORS
@@ -37,21 +36,8 @@ class AvaCoreRollout:
         self.args = args
         self.config = config
         conv = launch_converter()
-        self._remote_generate = None
-        generate_config = interpolated(self.config["generate"])
-        if "remote_rollout" in config:
-            # Legacy TOMLs use the same AvaCore client; router args remain GPU-local.
-            run_id = os.environ.get("RUN_DIR")
-            if not run_id:
-                raise ValueError("Remote rollout requires RUN_DIR to share the run's sandbox concurrency gate")
-            self._remote_generate = RemoteGenerate(
-                generate_config, RemoteSettings(**interpolated(config["remote_rollout"])), run_id=run_id
-            )
-            self.generate_fn = self._remote_generate
-        else:
-            self.generate_fn = conv.structure(generate_config, GenerateFunction)
-            if generate_config.get("kind") == "remote":
-                self._remote_generate = self.generate_fn
+        self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
+        self._remote_generate = self.generate_fn if config["generate"].get("kind") == "remote" else None
         self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
