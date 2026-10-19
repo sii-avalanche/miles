@@ -57,6 +57,8 @@ class AvaCoreRollout:
             self.generate_fn = self._remote_generate
         else:
             self.generate_fn = conv.structure(generate_config, GenerateFunction)
+            if generate_config.get("kind") == "remote":
+                self._remote_generate = self.generate_fn
         self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
