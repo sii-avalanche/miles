@@ -11,9 +11,11 @@ from typing import Any
 import numpy as np
 import pybase64
 from ava_core.config import interpolated, launch_converter
-from ava_core.core import Schema, TokenTrace, Trace
+from ava_core.core import Schema, Trace
+from ava_core.core.training_trace import graph_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
+from ava_core.generate.remote_rollout import RemoteGenerate, RemoteSettings
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import Reward
 from ava_core.runner import RECOVERABLE_ERRORS
@@ -35,7 +37,21 @@ class AvaCoreRollout:
         self.args = args
         self.config = config
         conv = launch_converter()
-        self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
+        self._remote_generate = None
+        generate_config = interpolated(self.config["generate"])
+        if "remote_rollout" in config:
+            # Legacy TOMLs use the same AvaCore client; router args remain GPU-local.
+            run_id = os.environ.get("RUN_DIR")
+            if not run_id:
+                raise ValueError("Remote rollout requires RUN_DIR to share the run's sandbox concurrency gate")
+            self._remote_generate = RemoteGenerate(
+                generate_config, RemoteSettings(**interpolated(config["remote_rollout"])), run_id=run_id
+            )
+            self.generate_fn = self._remote_generate
+        else:
+            self.generate_fn = conv.structure(generate_config, GenerateFunction)
+            if generate_config.get("kind") == "remote":
+                self._remote_generate = self.generate_fn
         self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
@@ -47,32 +63,46 @@ class AvaCoreRollout:
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         try:
-            trace = await self.generate_fn(row, sampling_params=sampling_params, **replay)
+            traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
             if any(
                 message.metadata["finish_reason"]["type"] == "abort"
-                for node in flattened(trace)
-                for message in node.messages
+                for node in graph_nodes(traces)
+                for message in (node.message,)
                 if "finish_reason" in message.metadata
             ):
                 sample.status = Sample.Status.ABORTED
                 return sample
-            reward = await self.reward_fn(trace, row)
+            reward = await self.reward_fn(traces[0], row)
         except RECOVERABLE_ERRORS as error:
             logger.warning("AvaCore rollout of sample %s aborted: %r", sample.index, error)
             sample.status = Sample.Status.ABORTED
             return sample
 
-        assert isinstance(trace, TokenTrace), "AvaCore rollouts must drive the policy through a token-level client"
+        assert traces and any(node.segments for node in graph_nodes(traces)), (
+            "AvaCore rollouts must drive the policy through a token-level client"
+        )
         if self.recording is not None:
-            write = asyncio.create_task(self.record(row, sample, trace, reward, sampling_params))
+            write = asyncio.create_task(self.record(row, sample, traces, reward, sampling_params))
             self.writes.add(write)
             write.add_done_callback(self.writes.discard)
-        samples = [
-            filled(self.args, copy.deepcopy(sample), node, reward.score)
-            for node in flattened(trace)
-            if isinstance(node, TokenTrace) and any(segment.is_generated for segment in node.segments)
-        ]
+        samples, owned = [], set()
+        for tip in conversation_tips(traces):
+            generated = {node for node in tip.prefixes if node.generated and node.segments}
+            if generated - owned:
+                samples.append(filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned))
+                owned.update(generated)
         return samples[0] if len(samples) == 1 else samples
+
+    async def close(self) -> None:
+        if self._remote_generate is not None:
+            await self._remote_generate.aclose()
+
+    async def dispose(self) -> None:
+        loop = getattr(self._remote_generate, "loop", None) or asyncio.get_running_loop()
+        if loop is asyncio.get_running_loop():
+            await self.close()
+        else:
+            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.close(), loop))
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
@@ -97,7 +127,7 @@ class AvaCoreRollout:
         self,
         row: Row,
         sample: Sample,
-        trace: TokenTrace,
+        traces: tuple[Trace, ...],
         reward: Reward,
         sampling_params: dict[str, Any],
     ) -> None:
@@ -113,10 +143,10 @@ class AvaCoreRollout:
                 query_id=query_id,
                 trial_id=trial_id,
                 instance=row,
-                trace=trace,
+                traces=traces,
                 reward=reward,
                 status="completed",
-                metadata={"weight_version": int(trace.last_assistant().metadata["weight_version"])},
+                metadata={"weight_version": int(traces[0].last_assistant().metadata["weight_version"])},
             )
         except Exception as error:
             self.failed_writes += 1
@@ -133,26 +163,37 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     return GenerateFnOutput(samples=await rollout.generate(input.sample, input.sampling_params))
 
 
-def flattened(trace: Trace) -> list[Trace]:
-    return [trace] + [node for subtrace in trace.subtraces for node in flattened(subtrace)]
+def conversation_tips(traces: tuple[Trace, ...]) -> list[Trace]:
+    nodes = graph_nodes(traces)
+    parents = {node.prev for node in nodes}
+    # Match the store's ownership order: listed traces first, source-only tips next.
+    return list(dict.fromkeys((*traces, *(node for node in nodes if node not in parents and node not in traces))))
 
 
-def filled(args: Namespace, sample: Sample, trace: TokenTrace, reward: float) -> Sample:
-    # Context after the last generated turn trains nothing, and no request routed it for replay.
-    segments = trace.segments[: max(i for i, segment in enumerate(trace.segments) if segment.is_generated) + 1]
+def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, *, owned: set[Trace] | None = None) -> Sample:
+    # Shared generated prefixes train only in the first listed branch, as in the result store.
+    owned = owned or set()
+    segments = trace.path_segments
+    segments = segments[: max(i for i, segment in enumerate(segments) if segment.is_generated) + 1]
     length = sum(len(segment.tokens) for segment in segments)
     prompt_length = len(segments[0].tokens)
     sample.tokens = trace.tokens[:length]
     sample.response = "".join(segment.template for segment in segments[1:])
     sample.response_length = length - prompt_length
-    sample.loss_mask = trace.loss_mask[prompt_length:length]
+    mask = [
+        int(segment.is_generated and node not in owned)
+        for node in trace.prefixes
+        for segment in node.segments
+        for _ in segment.tokens
+    ]
+    sample.loss_mask = mask[prompt_length:length]
     sample.rollout_log_probs = [log_prob or 0.0 for log_prob in trace.log_probs[prompt_length:length]]
     spans, offset = [], 0
     for segment in segments:
         if segment.is_generated:
             spans.append((offset, offset + len(segment.tokens)))
         offset += len(segment.tokens)
-    finished = [message for message in trace.messages if "finish_reason" in message.metadata]
+    finished = [node.message for node in trace.prefixes if node.generated and node.segments]
     for message, (start, end) in zip(finished, spans, strict=True):
         # The trace keeps log probs per token, not per call: anchor the call's weight versions to its own segment.
         versioning = ("weight_version", "weight_versions")
@@ -161,10 +202,11 @@ def filled(args: Namespace, sample: Sample, trace: TokenTrace, reward: float) ->
             message.metadata | {"output_token_logprobs": [None] * (end - start)}, output_end=end
         )
     if args.use_rollout_routing_replay and sample.status != Sample.Status.ABORTED:
-        assert (
-            trace.routed_experts
-        ), "Internal error: routing replay enabled but no routed experts returned. Perhaps some traces are not generated by the configured generate function."
-        routed = np.frombuffer(b"".join(pybase64.b64decode(chunk) for chunk in trace.routed_experts), dtype=np.int32)
+        chunks = [segment.metadata["routed_experts"] for segment in segments if "routed_experts" in segment.metadata]
+        assert chunks, (
+            "Internal error: routing replay enabled but no routed experts returned. Perhaps some traces are not generated by the configured generate function."
+        )
+        routed = np.frombuffer(b"".join(pybase64.b64decode(chunk) for chunk in chunks), dtype=np.int32)
         row = args.num_layers * args.moe_router_topk
         if routed.size == length * row:
             # sglang also forwarded the final token, whose routing feeds no training position
