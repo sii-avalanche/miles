@@ -14,7 +14,7 @@ from miles.rollout.inference_rollout.inference_rollout_common import (
     generate_and_rm_group,
 )
 from miles.utils.types import Sample
-from miles.rollout.screening_resume import completed_groups, validate_recording_sources
+from miles.rollout.screening_resume import completed_groups, group_trials, recording_details, validate_recording_sources
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +89,12 @@ class SweepExport:
         if self.stop_reason is not None:
             raise ScreeningStopped(self.stop_reason)
 
-    def record(self, index, rewards=None, error=None, *, attempted_samples=None):
+    def record(self, index, rewards=None, error=None, *, attempted_samples=None, trial_ids=None, recording_source=None):
         self.raise_if_stopped()
+        if trial_ids is not None:
+            group_trials({"rewards": rewards, "trial_ids": trial_ids})
+            if not recording_source:
+                raise ValueError("Recording trial IDs require their snapshot directory")
         if index in self.seen or not 0 <= index < len(self.rows):
             raise ValueError(f"Duplicate or out-of-range input index: {index}")
         valid_rewards = rewards is not None and all(r in (0, 1) for r in rewards)
@@ -118,6 +122,8 @@ class SweepExport:
             self.unrequested_samples += skipped
             self.early_stopped_groups += int(stopped)
             details = {"attempted_samples": attempted, "early_stopped": stopped, "unrequested_samples": skipped}
+        if trial_ids is not None:
+            details.update(trial_ids=trial_ids, recording_source=recording_source)
         self._append("groups.jsonl", {"source_index": index, "rewards": rewards, "decision": decision, **details})
         self.seen.add(index)
         self.counts["processed"] += 1
@@ -231,6 +237,9 @@ class FullDatasetRollout(InferenceRolloutFn):
             self._inherit_task = asyncio.create_task(
                 self.state.avacore.inherit_completed(groups, manifests, self.state.sampling_params)
             )
+            if self.state.args.avacore_config["record"].get("expected_run_id") is not None:
+                # Verify/recover the original spool before issuing requests into that run.
+                await self._inherit_task
 
     def _check_inheritance(self):
         if self._inherit_task is not None and self._inherit_task.done():
@@ -293,7 +302,7 @@ class FullDatasetRollout(InferenceRolloutFn):
                     self.export.record(index, error=f"{type(error).__name__}: {error}")
                     logger.warning("Screening failed at input row %s: %s", index, error)
                     return None
-                self.export.record(index, rewards)
+                self.export.record(index, rewards, **recording_details(result))
                 return result
 
             tasks = [asyncio.create_task(process(i, group)) for i, group in enumerate(groups, offset)]

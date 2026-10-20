@@ -4,8 +4,10 @@ import json
 
 import pytest
 
-from miles.rollout.rollout_recording import DurableRolloutOutbox, _atomic_json
-from miles.rollout.screening_resume import completed_groups, inherit_records, validate_recording_sources
+from miles.utils.recording.outbox import DurableRolloutOutbox, _atomic_json
+from miles.rollout.screening_resume import (
+    completed_groups, inherit_records, validate_recording_sources, validate_reused_recording,
+)
 
 
 def source(tmp_path):
@@ -68,6 +70,78 @@ def test_missing_snapshot_or_wrong_collection_stops_before_generation(tmp_path):
     groups[0]["rewards"] = [1, 1]
     with pytest.raises(FileNotFoundError, match="Missing confirmed"):
         validate_recording_sources(groups, collection="data")
+
+
+@pytest.mark.parametrize("inherited_only", [False, True])
+async def test_same_run_resume_preserves_committed_records_and_allocates_new_trials(tmp_path, inherited_only):
+    from argparse import Namespace
+    from unittest.mock import AsyncMock
+    from miles.rollout.avacore_rollout import AvaCoreRollout
+    from miles.utils.types import Sample
+
+    directory, groups, _ = source(tmp_path)
+    manifests = validate_recording_sources(groups, collection="data")
+    original = {p.name: p.read_bytes() for p in (directory / "committed").iterdir()}
+    writes = []
+
+    async def write(record):
+        writes.append(record)
+
+    adapter = object.__new__(AvaCoreRollout)
+    adapter.args = Namespace(prompt_data="data.jsonl")
+    adapter.recording = {"model": "model", "run": "old"}
+    if inherited_only:
+        # An interrupted run may have only imported groups from its ancestors.
+        adapter.recording["expected_run_id"] = 6907
+        manifests = {path: {**manifest, "run": "ancestor"} for path, manifest in manifests.items()}
+    adapter._outbox = DurableRolloutOutbox(directory, write, workers=1)
+    adapter._shutdown_timeout = 2
+    adapter._prepare_recording = AsyncMock()
+    await adapter._outbox.seed_trials([("7", 0), ("7", 1000001)], 8)
+    await adapter._outbox.start()
+    try:
+        assert await adapter.inherit_completed(groups, manifests, {}) == 1
+        assert writes == []
+        assert original == {p.name: p.read_bytes() for p in (directory / "committed").iterdir()}
+        sample = Sample(index=56, epoch=0, group_index=7, metadata={"_index": 7})
+        assert await adapter._outbox.allocate_trial(sample, 8) > 1000001
+    finally:
+        await adapter._outbox.close(2)
+
+
+def test_same_run_resume_requires_the_original_spool_and_all_settled_trials(tmp_path):
+    directory, groups, _ = source(tmp_path)
+    identity = {"model": "model", "run": "old", "collection": "data"}
+    assert validate_reused_recording(groups, directory, identity) == 1
+    with pytest.raises(ValueError, match="different database run"):
+        validate_reused_recording(groups, directory, {**identity, "model": "other"})
+    groups[0]["rewards"] = [1, 0]
+    with pytest.raises(FileNotFoundError, match="Missing confirmed"):
+        validate_reused_recording(groups, directory, identity)
+
+
+async def test_nonzero_retry_trial_survives_later_resume_and_copy(tmp_path):
+    directory, groups, original = source(tmp_path)
+    next((directory / "committed").iterdir()).unlink()
+    original["trial_id"] = 16
+    name = hashlib.sha256(b"7:16").hexdigest() + ".json.gz"
+    _atomic_json(directory / "committed" / name, original, compressed=True)
+    groups[0]["trial_ids"] = [16]
+    manifests = validate_recording_sources(groups, collection="data")
+    saved = []
+
+    async def write(record):
+        saved.append(record)
+
+    outbox = DurableRolloutOutbox(tmp_path / "next", write, workers=1)
+    await outbox.start()
+    try:
+        await inherit_records(outbox, groups, manifests)
+        assert await outbox.flush(2)
+        assert saved[0]["trial_id"] == 16
+        assert saved[0]["metadata"]["inherited_from"]["trial_id"] == 16
+    finally:
+        await outbox.close(2)
 
 
 @pytest.mark.parametrize("change", ["hash", "count", "duplicate", "partial", "decision"])

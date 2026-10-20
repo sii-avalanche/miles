@@ -7,8 +7,8 @@ from argparse import Namespace
 
 import pytest
 
-from miles.rollout import rollout_recording
-from miles.rollout.rollout_recording import DurableRolloutOutbox
+from miles.utils.recording import outbox as recording_outbox
+from miles.utils.recording.outbox import DurableRolloutOutbox
 from miles.utils.types import Sample
 
 
@@ -40,6 +40,9 @@ async def test_avacore_record_preserves_original_weight_version(tmp_path, versio
     try:
         await adapter.record(Row({"prompt": "question"}, key=lambda _: "7"), sample, (trace,), Reward(score=1), {}, trial_id=0)
         assert await adapter._outbox.flush(timeout=2)
+        assert sample.recording_source == str(tmp_path)
+        assert sample.recording_trial_id == 0
+        assert sample.metadata == {"_index": 7}
         assert saved[0]["metadata"]["weight_version"] == version
         assert type(saved[0]["metadata"]["weight_version"]) is type(version)
         committed = next((tmp_path / "committed").glob("*.json.gz"))
@@ -69,6 +72,48 @@ def outbox(path, write, *, workers=1):
         retry_initial_seconds=0.001,
         retry_max_seconds=0.005,
     )
+
+
+@pytest.mark.parametrize("matches", [False, True])
+async def test_pinned_database_run_is_checked_before_opening_or_creating(matches, monkeypatch):
+    from contextlib import AsyncExitStack, asynccontextmanager
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from miles.rollout import avacore_rollout
+
+    existing = SimpleNamespace(kind="rl", model="model" if matches else "wrong", run="old",
+                               collection="data", model_step=None, collection_version=None)
+    run = SimpleNamespace(update=AsyncMock())
+
+    @asynccontextmanager
+    async def opened_run(**kwargs):
+        assert kwargs["resume"] is True
+        assert kwargs["run"] == "old"
+        yield run
+
+    store = SimpleNamespace(pool=SimpleNamespace(), get_run=AsyncMock(return_value=existing),
+                            rl_run=Mock(side_effect=opened_run))
+
+    @asynccontextmanager
+    async def backend(*args, **kwargs):
+        yield store
+
+    monkeypatch.setattr(avacore_rollout, "PostgresBackend", backend)
+    adapter = object.__new__(avacore_rollout.AvaCoreRollout)
+    adapter.recording = {"postgres": "unused", "model": "model", "run": "old", "expected_run_id": 6907}
+    adapter.args = Namespace(prompt_data="data.jsonl")
+    adapter.config = {}
+    adapter._pool_min = adapter._pool_max = 1
+    adapter._pool_timeout = 2
+    async with AsyncExitStack() as adapter.stack:
+        if matches:
+            assert await adapter.open({}) is run
+            store.rl_run.assert_called_once()
+        else:
+            with pytest.raises(ValueError, match="expected_run_id"):
+                await adapter.open({})
+            store.rl_run.assert_not_called()
+        store.get_run.assert_awaited_once_with(6907)
 
 
 async def test_outage_keeps_durable_snapshot_until_database_recovers(tmp_path):
@@ -133,6 +178,27 @@ async def test_pending_records_replay_after_shutdown_and_restart(tmp_path):
         assert not list((tmp_path / "pending").glob("*.json.gz"))
     finally:
         await second.close(timeout=1)
+
+
+async def test_capture_before_workers_start_is_delivered_once(tmp_path):
+    saved = []
+
+    async def write(value):
+        saved.append(value)
+
+    recorder = outbox(tmp_path, write)
+    expected = record()
+    path = await recorder.enqueue(expected)
+    assert path.exists()
+    assert saved == []
+    await recorder.start()
+    try:
+        assert await recorder.flush(timeout=1)
+        assert saved == [expected]
+        assert not path.exists()
+        assert (recorder.committed / path.name).exists()
+    finally:
+        await recorder.close(timeout=1)
 
 
 async def test_database_writers_have_bounded_concurrency(tmp_path):
@@ -277,7 +343,7 @@ async def test_producer_cancellation_finishes_disk_capture_and_queues_record(tmp
     writing = asyncio.Event()
     release = threading.Event()
     loop = asyncio.get_running_loop()
-    atomic_json = rollout_recording._atomic_json
+    atomic_json = recording_outbox._atomic_json
     saved = []
 
     def blocked_persistence(path, value, **kwargs):
@@ -290,7 +356,7 @@ async def test_producer_cancellation_finishes_disk_capture_and_queues_record(tmp
 
     recorder = outbox(tmp_path, write)
     await recorder.start()
-    monkeypatch.setattr(rollout_recording, "_atomic_json", blocked_persistence)
+    monkeypatch.setattr(recording_outbox, "_atomic_json", blocked_persistence)
     expected = record(6)
     capture = asyncio.create_task(recorder.enqueue(expected))
     try:

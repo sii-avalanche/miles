@@ -74,6 +74,9 @@ class Sample:
     epoch: int | None = None
     # Resampling keeps prompt identity while advancing the recording attempt.
     generation_attempt: int = 0
+    # Durable response identity, separate from the stored task's metadata.
+    recording_trial_id: int | None = None
+    recording_source: str | None = None
     # Rollout execution id; None falls back to ``index``. Compact / subagent
     # siblings must share it so the rollout is counted once.
     rollout_id: int | None = None

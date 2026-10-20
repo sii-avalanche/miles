@@ -21,10 +21,10 @@ from ava_core.runner import RECOVERABLE_ERRORS
 from ava_core.store.core import STORED, Run
 from ava_core.store.postgres import PostgresBackend
 
+from miles.utils.recording.outbox import DurableRolloutOutbox, _atomic_json
 from miles.rollout.avacore_trace import conversation_tips, graph_nodes, snapshot_traces, write_record
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
-from miles.rollout.rollout_recording import DurableRolloutOutbox, _atomic_json
-from miles.rollout.screening_resume import inherit_records
+from miles.rollout.screening_resume import inherit_records, validate_reused_recording
 from miles.monitoring.collection.host import recorder_metrics
 from miles.monitoring.collection.runtime import get_monitor
 from miles.utils.types import Sample, WeightVersionsPerCall
@@ -87,6 +87,8 @@ class AvaCoreRollout:
         else:
             await asyncio.to_thread(_atomic_json, path, manifest)
         self._sampling_params = sampling_params.copy()
+        if self.recording.get("expected_run_id") is not None:
+            await self._get_run()
         # Legacy resumed runs have no local allocation counters. Seed before generation
         # rather than assigning IDs that could overwrite their existing database rows.
         if self.recording.get("resume", True) and not self._legacy_seeded:
@@ -97,6 +99,8 @@ class AvaCoreRollout:
                     await self._outbox.seed_trials(list(run.statuses), self.args.n_samples_per_prompt)
                     await asyncio.to_thread(_atomic_json, self._outbox.path / "legacy_seeded.json", {"complete": True})
                     break
+                except (ValueError, LookupError):
+                    raise
                 except Exception as error:
                     self._record_event("failed", error)
                     await asyncio.sleep(delay)
@@ -109,11 +113,23 @@ class AvaCoreRollout:
         await asyncio.shield(self._recording_ready)
 
     async def inherit_completed(self, groups, manifests, sampling_params) -> int:
-        """Copy confirmed old responses to this run without regenerating or rejudging."""
+        """Reuse or copy settled responses without regenerating or rejudging."""
         if self.recording is None:
             raise ValueError("Inherited rollouts require recording")
-        if any(manifest["run"] == self.recording["run"] for manifest in manifests.values()):
-            raise ValueError("Screening inheritance requires a new run")
+        identity = {
+            "model": self.recording["model"], "run": self.recording["run"],
+            "collection": Path(self.args.prompt_data).stem,
+        }
+        reuse = self.recording.get("expected_run_id") is not None or any(
+            all(manifest[key] == value for key, value in identity.items()) for manifest in manifests.values()
+        )
+        if reuse:
+            count = await asyncio.to_thread(validate_reused_recording, groups, self._outbox.path, identity)
+            await self._prepare_recording(sampling_params)
+            if not await self._outbox.flush(self._shutdown_timeout):
+                raise RuntimeError("Original rollout writes are still pending; retry resume after recovery")
+            logger.info("Reused %d confirmed rollout snapshots in the existing database run", count)
+            return count
         await self._prepare_recording(sampling_params)
         count = await inherit_records(self._outbox, groups, manifests)
         if not await self._outbox.flush(self._shutdown_timeout):
@@ -182,6 +198,17 @@ class AvaCoreRollout:
         )
         store.pool.timeout = self._pool_timeout
         self._record_pool = store.pool
+        # An explicit ID makes a resume fail before an upsert could create a new run.
+        if (expected_id := self.recording.get("expected_run_id")) is not None:
+            existing = await store.get_run(expected_id)
+            identity = (
+                existing.kind, existing.model, existing.run, existing.collection,
+                existing.model_step, existing.collection_version,
+            )
+            if identity != (
+                "rl", self.recording["model"], self.recording["run"], Path(self.args.prompt_data).stem, None, None
+            ):
+                raise ValueError("Recording identity differs from expected_run_id")
         run = await self.stack.enter_async_context(
             store.rl_run(
                 model=self.recording["model"],
@@ -269,6 +296,9 @@ class AvaCoreRollout:
 
             with self._monitor.wait("record/persist"):
                 await self._outbox.enqueue(await asyncio.to_thread(snapshot))
+            # Set only after durability; returned samples carry the exact retry identity.
+            sample.recording_trial_id = trial_id
+            sample.recording_source = str(self._outbox.path)
 
     async def close(self) -> None:
         if self._outbox is None:

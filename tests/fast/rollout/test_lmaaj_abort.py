@@ -13,7 +13,8 @@ from ava_core.core.retry import HTTPRetry
 from ava_core.rewards.core import Reward
 from ava_core.rewards.lmaaj import LMaaJ
 
-from miles.rollout import avacore_rollout, rollout_recording
+from miles.utils.recording import outbox as recording_outbox
+from miles.rollout import avacore_rollout
 from miles.rollout.inference_rollout import inference_rollout_common as common
 from miles.rollout.inference_rollout import inference_rollout_train as train
 from miles.utils.perf_monitor import RuntimeMonitor
@@ -225,7 +226,7 @@ async def test_abort_finishes_completed_reward_snapshot(abort_without_workers, m
     started = asyncio.Event()
     release = threading.Event()
     loop = asyncio.get_running_loop()
-    atomic_json = rollout_recording._atomic_json
+    atomic_json = recording_outbox._atomic_json
 
     def blocked_capture(path, value, **kwargs):
         if path.parent == adapter._outbox.pending:
@@ -233,7 +234,7 @@ async def test_abort_finishes_completed_reward_snapshot(abort_without_workers, m
             assert release.wait(timeout=5)
         atomic_json(path, value, **kwargs)
 
-    monkeypatch.setattr(rollout_recording, "_atomic_json", blocked_capture)
+    monkeypatch.setattr(recording_outbox, "_atomic_json", blocked_capture)
     sample = Sample(index=0, epoch=0, group_index=0, metadata={"_index": 7})
     group = asyncio.create_task(common.generate_and_rm_group(state, [sample], {}))
     abort = None

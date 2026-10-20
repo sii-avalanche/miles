@@ -7,9 +7,33 @@ import logging
 import tomllib
 from pathlib import Path
 
-from miles.rollout.rollout_recording import DurableRolloutOutbox
+from miles.utils.recording.outbox import DurableRolloutOutbox
 
 logger = logging.getLogger(__name__)
+
+
+def group_trials(group):
+    """Older exports used round zero; resumed attempts retain their actual IDs."""
+    trials = group.get("trial_ids", list(range(len(group["rewards"]))))
+    if (
+        len(trials) != len(group["rewards"])
+        or len(set(trials)) != len(trials)
+        or any(type(trial) is not int or trial < 0 for trial in trials)
+    ):
+        raise ValueError("Invalid recording trial IDs in screening group")
+    return trials
+
+
+def recording_details(samples):
+    if not any(sample.recording_source is not None for sample in samples):
+        return {}
+    sources = {sample.recording_source for sample in samples}
+    if None in sources or len(sources) != 1 or any(sample.recording_trial_id is None for sample in samples):
+        raise ValueError("Screening group has inconsistent recording provenance")
+    return {
+        "trial_ids": [sample.recording_trial_id for sample in samples],
+        "recording_source": samples[0].recording_source,
+    }
 
 
 def completed_groups(directory, *, source_sha256, total, n_samples, early_stop):
@@ -39,6 +63,7 @@ def completed_groups(directory, *, source_sha256, total, n_samples, early_stop):
         decision = "kept" if mixed else "all_one" if rewards[0] == 1 else "all_zero"
         if group["decision"] != decision:
             raise ValueError(f"Resume decision disagrees with rewards: {index}")
+        group_trials(group)
         # Keep the original snapshot location across repeated resumes, including
         # an interruption before the intermediate run finishes replaying to DB.
         result.append({
@@ -64,11 +89,23 @@ def validate_recording_sources(groups, *, collection, policy_checkpoint=None):
             names = {p.name for subdir in ("committed", "pending") for p in (source / subdir).glob("*.json.gz")}
             sources[source] = (manifest, names)
         _, names = sources[source]
-        for trial in range(len(group["rewards"])):
+        for trial in group_trials(group):
             name = hashlib.sha256(f"{group['source_index']}:{trial}".encode()).hexdigest() + ".json.gz"
             if name not in names:
                 raise FileNotFoundError(f"Missing confirmed rollout snapshot: {source / name}")
     return {source: manifest for source, (manifest, _) in sources.items()}
+
+
+def validate_reused_recording(groups, directory, identity):
+    """Require every settled trial in the original spool; never rewrite its provenance."""
+    directory = Path(directory)
+    manifest = json.loads((directory / "run.json").read_text())
+    if any(manifest[key] != identity[key] for key in ("model", "run", "collection")):
+        raise ValueError("Reused recording directory belongs to a different database run")
+    validate_recording_sources(
+        [{**group, "recording_source": str(directory)} for group in groups], collection=identity["collection"]
+    )
+    return sum(len(group["rewards"]) for group in groups)
 
 
 def inherited_record(source, manifest, query_id, trial_id, score):
@@ -103,7 +140,7 @@ async def inherit_records(outbox, groups, manifests, *, pending_limit=1024):
     count = 0
     for group in groups:
         source = Path(group["recording_source"])
-        for trial, score in enumerate(group["rewards"]):
+        for trial, score in zip(group_trials(group), group["rewards"], strict=True):
             while outbox.stats()["pending_writes"] >= pending_limit:
                 await asyncio.sleep(0.1)
             record = await asyncio.to_thread(

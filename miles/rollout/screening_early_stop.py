@@ -9,6 +9,7 @@ from miles.rollout.generate_utils.generate_endpoint_utils import policy_uses_rou
 from miles.rollout.inference_rollout.inference_rollout_common import generate_and_rm
 from miles.utils.types import Sample
 from miles.rollout.screening import FullDatasetRollout, ScreeningStopped
+from miles.rollout.screening_resume import recording_details
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ class EarlyStopDatasetRollout(FullDatasetRollout):
             )
             logger.warning("Screening failed at input row %s: %s", index, error)
             return None
-        self.export.record(index, rewards, attempted_samples=attempted)
+        self.export.record(index, rewards, attempted_samples=attempted, **recording_details(completed))
         return completed
 
     async def _call_train(self, input):
