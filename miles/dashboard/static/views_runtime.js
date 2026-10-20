@@ -34,12 +34,9 @@ function legend(specs) {
 }
 
 function stepRows(events) {
-  const final = new Map();
-  for (const event of finalEvents(events)) {
-    if (event.role === "driver" && event.rollout_id !== null) final.set(`${event.rollout_id}/${event.name}/${event.t0}`, event);
-  }
   const byStep = new Map();
-  for (const event of final.values()) {
+  for (const event of finalEvents(events)) {
+    if (event.role !== "driver" || event.rollout_id === null) continue;
     if (!byStep.has(event.rollout_id)) byStep.set(event.rollout_id, []);
     byStep.get(event.rollout_id).push(event);
   }

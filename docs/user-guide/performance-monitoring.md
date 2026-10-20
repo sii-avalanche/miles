@@ -168,23 +168,3 @@ waits and connection health. The monitor does not run SQL probes or load tests.
 * Recording behavior, staleness policy, task concurrency and training losses
   are unchanged by enabling these fields. Monitor `telemetry/expert_counts`
   duration when assessing the optional routing-count overhead.
-
-## Local validation
-
-Run from the Miles checkout with the AvaTrain virtual environment:
-
-```bash
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ../.venv/bin/python -m pytest \
-  tests/fast/utils/test_perf_monitor.py \
-  tests/fast/rollout/test_perf_monitoring.py \
-  tests/fast/rollout/test_fully_async_rollout.py \
-  tests/fast/rollout/test_fully_async_data_buffer.py \
-  tests/fast/dashboard \
-  --ignore=tests/fast/dashboard/test_core_integration.py
-node --experimental-vm-modules tests/fast/dashboard/runtime_frontend.mjs
-```
-
-These checks cover buffer instrumentation, rates and open waits, collector/file/API
-wiring, and frontend refresh/rendering logic. They do not validate a live Ray
-cluster, GPU kernels, W&B service or production database. The frontend check uses
-a simulated DOM/canvas and does not perform browser screenshot comparison.
