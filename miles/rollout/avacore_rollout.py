@@ -12,7 +12,7 @@ import numpy as np
 import pybase64
 from ava_core.config import interpolated, launch_converter
 from ava_core.core import Schema, Trace
-from ava_core.core.training_trace import graph_nodes
+from ava_core.core.trace_codec import graph_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
 from ava_core.rewards import RewardFunction
@@ -36,9 +36,20 @@ class AvaCoreRollout:
         self.args = args
         self.config = config
         conv = launch_converter()
-        self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
-        self._remote_generate = self.generate_fn if config["generate"].get("kind") == "remote" else None
-        self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
+        generate_config = interpolated(self.config["generate"])
+        reward_config = interpolated(self.config["reward"])
+        remote = generate_config.get("kind") == "remote"
+        if remote:
+            # The service owns verification; the training process only reads the returned reward.
+            if reward_config.get("kind") != "remote_reward":
+                if "reward" in generate_config:
+                    raise ValueError("Set the remote scorer in either reward or generate.reward, not both")
+                generate_config = generate_config | {"reward": reward_config}
+            reward_config = {"kind": "remote_reward"}
+        self.generate_fn = conv.structure(generate_config, GenerateFunction)
+        self._remote_generate = self.generate_fn if remote else None
+        self._generate = self.generate_fn.send_sample if remote else self.generate_fn
+        self.reward_fn = conv.structure(reward_config, RewardFunction)
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
@@ -46,10 +57,11 @@ class AvaCoreRollout:
         self.failed_writes = 0
 
     async def generate(self, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
+        # Send tests and per-sample generator/verifier configs alongside the question.
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         try:
-            traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
+            traces = await self._generate(row, sampling_params=sampling_params, **replay)
             if any(
                 message.metadata["finish_reason"]["type"] == "abort"
                 for node in graph_nodes(traces)
