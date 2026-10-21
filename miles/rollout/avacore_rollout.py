@@ -3,7 +3,7 @@ import copy
 import logging
 import os
 from argparse import Namespace
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -12,7 +12,7 @@ import numpy as np
 import pybase64
 from ava_core.config import interpolated, launch_converter
 from ava_core.core import Schema, Trace
-from ava_core.core.trace_codec import graph_nodes
+from ava_core.core.trace import iter_trace_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
 from ava_core.rewards import RewardFunction
@@ -64,7 +64,7 @@ class AvaCoreRollout:
             traces = await self._generate(row, sampling_params=sampling_params, **replay)
             if any(
                 message.metadata["finish_reason"]["type"] == "abort"
-                for node in graph_nodes(traces)
+                for node in iter_trace_nodes(traces)
                 for message in (node.message,)
                 if "finish_reason" in message.metadata
             ):
@@ -76,7 +76,7 @@ class AvaCoreRollout:
             sample.status = Sample.Status.ABORTED
             return sample
 
-        assert traces and any(node.segments for node in graph_nodes(traces)), (
+        assert traces and any(node.segments for node in iter_trace_nodes(traces)), (
             "AvaCore rollouts must drive the policy through a token-level client"
         )
         if self.recording is not None:
@@ -161,11 +161,16 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     return GenerateFnOutput(samples=await rollout.generate(input.sample, input.sampling_params))
 
 
-def conversation_tips(traces: tuple[Trace, ...]) -> list[Trace]:
-    nodes = graph_nodes(traces)
-    parents = {node.prev for node in nodes}
+def conversation_tips(traces: tuple[Trace, ...]) -> Iterator[Trace]:
+    tips = {}
+    for node in iter_trace_nodes(traces):
+        tips.pop(node.prev, None)
+        tips[node] = None
     # Match the store's ownership order: listed traces first, source-only tips next.
-    return list(dict.fromkeys((*traces, *(node for node in nodes if node not in parents and node not in traces))))
+    for trace in dict.fromkeys(traces):
+        tips.pop(trace, None)
+        yield trace
+    yield from tips
 
 
 def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, *, owned: set[Trace] | None = None) -> Sample:
