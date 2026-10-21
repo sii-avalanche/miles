@@ -8,7 +8,6 @@ from miles.utils.audit_utils.event_logger.models import MetricEvent
 from miles.utils.perf_monitor import start_monitor, stop_monitors, wandb_runtime_enabled
 
 from .base import (
-    MilesDashboardBackend,
     MlflowBackend,
     PrometheusBackend,
     TensorboardBackend,
@@ -28,7 +27,6 @@ BACKEND_REGISTRY: dict[str, tuple[type[TrackingBackend], str]] = {
     "mlflow": (MlflowBackend, "use_mlflow"),
     "prometheus": (PrometheusBackend, "use_prometheus"),
     "ci_history": (CiHistoryBackend, "ci_enable_metrics_capture"),
-    "miles_dashboard": (MilesDashboardBackend, "use_miles_dashboard"),
 }
 
 logger = logging.getLogger(__name__)
@@ -37,12 +35,12 @@ _manager = TrackingManager(BACKEND_REGISTRY)
 
 def init_tracking(args, primary: bool = True, **kwargs):
     if wandb_runtime_enabled(args):
-        # W&B owns metric history; reuse only the fleet collector, without its
-        # old dashboard writer or a second tracking backend.
-        from miles.dashboard import backend
+        from miles.utils.fleet_monitor import init_fleet
 
-        args.use_miles_dashboard = False
-        backend.init_dashboard(args, primary=primary, **kwargs)
+        try:
+            init_fleet(args, primary=primary)
+        except Exception:
+            logger.warning("W&B fleet sampling unavailable; scalar tracking continues", exc_info=True)
     if primary and getattr(args, "perf_monitor_interval", 0) > 0:
         # One origin is serialized with args to every worker; wall-clock series
         # remain aligned even when rollout and trainer start minutes apart.
@@ -69,6 +67,6 @@ def log(args, metrics, step_key: str):
 def finish_tracking():
     stop_monitors()
     _manager.finish()
-    from miles.dashboard import backend
+    from miles.utils.fleet_monitor import finish_fleet
 
-    backend.finish_dashboard()
+    finish_fleet()

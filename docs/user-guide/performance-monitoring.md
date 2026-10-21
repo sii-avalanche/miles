@@ -10,35 +10,29 @@ axes. Do not add rollout and training durations together when they overlap.
 In an AvaTrain TOML, add to `[train]`:
 
 ```toml
-use_miles_dashboard = true
+use_wandb = true
 perf_monitor_interval = 10.0
-dashboard_gpu_sample_interval = 2.0
-dashboard_sglang_scrape_interval = 5.0
-dashboard_flush_interval = 5.0
+perf_monitor_gpu_interval = 2.0
+perf_monitor_engine_interval = 5.0
 # Optional: existing routing replay is required. Layer numbers start at 1.
 perf_monitor_expert_layer = 9
 ```
 
-`avatrain rl train` supplies `dashboard_dir = <run>/logs/dashboard` unless an
-explicit location or `dump_details` was supplied. `dump_details` is unnecessary
-for telemetry and remains off; no large train/rollout tensors are dumped.
-Generic Miles launches must set `--dashboard-dir` or `--dump-details` explicitly.
-To only publish runtime metrics to W&B/local logs, omit `use_miles_dashboard`;
-fleet GPU/engine sampling requires the dashboard collector.
+W&B receives all numeric runtime snapshots and derived rates, including p50,
+p95, max, host resources, workload breakdowns and fleet coverage. Existing
+training, rollout and evaluation metrics retain their original logging paths;
+no metric-prefix allowlist removes them. Use `runtime/time_s` as the X axis.
 
-```bash
-./.venv/bin/python -m miles.dashboard.serve \
-  --dashboard-dir runs/xy1008/<run>/logs/dashboard \
-  --host 127.0.0.1 --port 7788 --follow --use-utilization-overview
-```
+The fleet sampler keeps only latest GPU and engine readings. It creates no
+HTTP service, dashboard files, phase-event buffers or trajectory-event sinks.
+Role-level fleet sampling requires Ray; Kubernetes runs still publish their
+process/rollout metrics and W&B's native system metrics.
 
-Open `http://127.0.0.1:7788/#/runtime` for **RL Bottlenecks** or `#/timeline`
-for per-GPU utilization and trainer phase lanes. The page refreshes every five
-seconds in follow mode and charts the most recent four hours of runtime gauges.
-The Metrics view and W&B retain the full scalar history. For a remote server,
-forward the port with SSH.
-W&B receives the same runtime counters through the existing shared run; use
-`runtime/time_s` as X and choose the fields below as Y.
+The old `--dashboard-gpu-sample-interval`, `--dashboard-sglang-scrape-interval`
+and `--dashboard-sglang-scrape-mode` remain aliases for the sampling options.
+Remove `--use-miles-dashboard`, `--dashboard-dir`, `--dashboard-flush-interval`,
+`--dashboard-forward-prometheus` and `--dashboard-sglang-metrics` from old
+launch configs: the service and its file writer have been removed.
 
 `rl submit` executes code installed in its selected image. It does not upload
 local source changes. Build/publish an image containing the modified `avatrain`
@@ -63,7 +57,7 @@ submit. Existing running jobs keep their original code/configuration.
 | CPU/container resources | Python generation/reward/serialization, native threads, host/cgroup memory | CPU seconds/s, event-loop lag, executor RSS, node memory available, cgroup usage/limit/OOM-kill counter |
 | Checkpoints, evaluation and startup | save/checkpoint storage, shared-fleet evaluation, model/engine initialization | driver spans, GPU lanes; eval dispatch is submission/blocking time, not the duration of a dedicated async eval job |
 
-For the present `xy1008.toml`, a batch is **16 groups × 16 = 256 samples**;
+For a configuration with these resource counts, a batch is **16 groups × 16 = 256 samples**;
 the default completed-group buffer holds **32 groups**. The client sample
 budget is **1024**, training has **32 GPUs with TP=1, PP=1, CP=32, EP=32**, and
 inference has **32 GPUs / 2 per engine = 16 engines**. Sample-backfill scheduling
@@ -127,7 +121,7 @@ internal waits require equivalent instrumentation in that implementation.
   are observed inference assignments (prompt plus generated positions) in the
   selected training batch. They cannot prove trainer-side router balance, nor
   the benefit of freezing a router without a controlled comparison. The driver
-  timeline records stage, rollout ID, start/end and exception class. An
+  event log (when W&B is disabled) records stage, rollout ID, start/end and exception class. An
   `ActorDiedError` during collection identifies the failure stage; distinguishing
   kernel OOM, signal, network failure and segfault still needs worker/kernel logs.
 * **Collection / workload share:** the default workload is `all`. For mixed
@@ -152,18 +146,16 @@ waits and connection health. The monitor does not run SQL probes or load tests.
 
 ## Artifacts and limits
 
-* `<run>/logs/dashboard/`: existing per-GPU phase and utilization streams, engine
-  series, metrics and `runtime_events.jsonl`; live/offline views share this data.
-* `<run>/logs/perf/<role>-<hostname>-<pid>.jsonl`: independent scalar snapshots
+* Without W&B, `<run>/logs/perf/<role>-<hostname>-<pid>.jsonl` holds scalar snapshots
   and stage events, useful even when W&B/database access fails. The writer
   emits on the configured cadence and on orderly shutdown. A hard kill can
   lose the final interval; an open span means its end was not observed.
 * Telemetry is off when `perf_monitor_interval=0`. Histories of durations and
   pending phase events are bounded. Monitoring failures are rate-limited and
-  do not abort training. GPU/engine sampling reuses the existing collector,
+  do not abort training. GPU/engine sampling uses latest-value readers,
   does not initialize a new CUDA context, and introduces no database writes.
 * GPU values older than the freshness window are omitted, not replaced with
-  zero. Sparse sampling can miss brief activity; use per-GPU lanes and profiler
+  zero. Sparse sampling can miss brief activity; use W&B system metrics and profiler
   traces for detailed claims. Clocks across nodes need normal synchronization.
 * Recording behavior, staleness policy, task concurrency and training losses
   are unchanged by enabling these fields. Monitor `telemetry/expert_counts`

@@ -46,7 +46,7 @@ def test_recipe_records_dashboard_traces_and_honors_gpu_count(args, monkeypatch)
 
     assert _value(argv, "--dump-details") == "/output/260101-example/details"
     assert _value(argv, "--num-gpus-per-node") == "8"
-    assert "--use-miles-dashboard" in argv
+    assert "--perf-monitor-interval" in argv
     assert "--use-rollout-entropy" in argv
     assert "--observe-training-entropy" in argv
     assert "--log-multi-turn" in argv

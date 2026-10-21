@@ -52,12 +52,10 @@ class WandbBackend(TrackingBackend):
     def __init__(self) -> None:
         self._defined_step_key_groups: set[tuple[str, str]] = set()
         self._active_alerts: set[str] = set()
-        self._selected_metrics = False
 
     def init(self, args, *, primary: bool = True, **kwargs) -> None:
         from . import wandb_utils
 
-        self._selected_metrics = getattr(args, "perf_monitor_interval", 0) > 0
         if primary:
             wandb_utils.init_wandb_primary(args, **kwargs)
         else:
@@ -66,10 +64,6 @@ class WandbBackend(TrackingBackend):
     def log(self, metrics: dict[str, Any], step: int | None = None, **kwargs) -> None:
         import wandb
 
-        if self._selected_metrics:
-            metrics = {
-                k: v for k, v in metrics.items() if k.startswith(("train/", "rollout/", "perf/", "moe/", "runtime/"))
-            }
         if not metrics:
             return
         wandb.log(metrics)
@@ -166,26 +160,6 @@ class PrometheusBackend(TrackingBackend):
 
     def finish(self) -> None:
         return
-
-
-class MilesDashboardBackend(TrackingBackend):
-    # Live dashboard collection (see miles/dashboard). Lazy imports keep the
-    # dashboard package out of processes that never enable it.
-
-    def init(self, args, *, primary: bool = True, **kwargs) -> None:
-        from miles.dashboard.backend import init_dashboard
-
-        init_dashboard(args, primary=primary, **kwargs)
-
-    def log(self, metrics: dict[str, Any], step: int | None = None, *, step_key: str | None = None, **kwargs) -> None:
-        from miles.dashboard.backend import dashboard_log
-
-        dashboard_log(metrics, step=step, step_key=step_key)
-
-    def finish(self) -> None:
-        from miles.dashboard.backend import finish_dashboard
-
-        finish_dashboard()
 
 
 class TrackingManager:

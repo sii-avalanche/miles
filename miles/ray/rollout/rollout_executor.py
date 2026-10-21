@@ -5,7 +5,6 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any
 
-from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, RolloutExecutorEvalFleet
 from miles.ray.rollout.metrics import log_eval_rollout_data, log_eval_skip, log_rollout_data
@@ -153,8 +152,6 @@ class RolloutExecutor:
         assert_weight_version_is_published(
             self.args, rollouts_since_publish=self._rollouts_since_publish_of_model_id[trainer_model_id]
         )
-        if (get_buffer_length := getattr(self.data_source, "get_buffer_length", None)) is not None:
-            dashboard_hooks.report_data_buffer(get_buffer_length())
         with (
             self._monitor.phase("collect_batch", rollout_id=rollout_id),
             timer("rollout" if trainer_model_id is None else f"{trainer_model_id}/rollout"),

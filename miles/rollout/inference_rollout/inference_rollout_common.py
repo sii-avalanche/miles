@@ -21,7 +21,6 @@ from miles.rollout.generate_hub.single_turn import generate
 from miles.rollout.generate_utils.generate_endpoint_utils import policy_uses_routing_key
 from miles.rollout.inference_rollout.compatibility import load_generate_function
 from miles.rollout.rm_hub import async_rm, batched_async_rm
-from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
@@ -75,11 +74,6 @@ async def generate_and_rm(
             assert sample.reward is not None
         return sample
 
-    # dashboard lifecycle probe: the semaphore wait is the queue; attempt_end fires before reward
-    sink = None if evaluation else TrajectoryLifecycle().sink
-    if sink is not None:
-        sink.attempt_start(sample)
-
     # generate
     log_prefix = f"[sample={getattr(sample, 'index', '?')}]"
     logger.debug(f"{log_prefix} Waiting for semaphore...")
@@ -90,8 +84,6 @@ async def generate_and_rm(
                 return sample
 
             logger.debug(f"{log_prefix} Acquired semaphore, calling generate_function")
-            if sink is not None:
-                sink.gen_start(sample)
             # per-sample override, e.g. an eval dataset naming its own generate function
             generate_fn = load_generate_function(sample.generate_function_path) or state.generate_function
             output = await generate_fn(
@@ -107,9 +99,6 @@ async def generate_and_rm(
     except asyncio.CancelledError:
         sample.status = Sample.Status.ABORTED
         raise
-    finally:
-        if sink is not None:
-            sink.attempt_end(sample)
 
     # TODO change to `if not args.group_rm: do reward model` for more clarity after the refactor below
     # for the rm that need the whole group, we will not do the rm here

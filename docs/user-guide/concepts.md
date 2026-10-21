@@ -81,7 +81,7 @@ Use this map when reading any launch script:
 | [`grpo_args`](/user-guide/argument-groups#grpo-args) | RL algorithm, KL, clipping, entropy bonus, advantage estimator |
 | [`optimizer_args`](/user-guide/argument-groups#optimizer-args) | Learning rate, schedule, weight decay, Adam betas |
 | [`sglang_args`](/user-guide/argument-groups#sglang-args) | Engine TP, memory fraction, log level, `--sglang-*` passthrough |
-| [`misc_args`](/user-guide/argument-groups#misc-args) | GPU layout, colocation, pinned Megatron numerics, dashboard |
+| [`misc_args`](/user-guide/argument-groups#misc-args) | GPU layout, colocation, pinned Megatron numerics, monitoring |
 
 ## Next
 

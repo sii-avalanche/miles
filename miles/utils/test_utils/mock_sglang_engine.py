@@ -107,10 +107,6 @@ class MockSGLangEngine:
         self._record("_is_port_available", (), {"port": port})
         return True
 
-    def _get_gpu_uuids(self, gpu_ids: list[int]):
-        self._record("_get_gpu_uuids", (gpu_ids,), {})
-        return [None] * len(gpu_ids)
-
     def _record(self, name: str, args: tuple, kwargs: dict) -> None:
         self.calls.append((name, args, kwargs))
 

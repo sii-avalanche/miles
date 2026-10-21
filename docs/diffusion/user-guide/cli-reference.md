@@ -339,8 +339,6 @@ Every one takes a dotted path.
 | `--disable-wandb-random-suffix` | flag | off | Run names include a random suffix by default; pass this flag to disable it. |
 | `--wandb-log-num-images` | int | `0` | Images/videos per rollout; `0` disables. |
 | `--wandb-log-image-interval` | int | `1` | Send media every N rollouts. |
-| `--use-miles-dashboard` | flag | off | Async phase/trajectory telemetry. |
-| `--miles-dashboard-workspace` | str | `./miles_dashboard` | |
 
 ### Fault tolerance
 

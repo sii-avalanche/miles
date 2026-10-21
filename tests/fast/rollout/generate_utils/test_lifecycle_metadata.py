@@ -1,11 +1,8 @@
-"""Pin for the dashboard lifecycle call site in
-``compute_samples_from_openai_records`` (design doc §18.3): sample assembly
-must keep chat-record timing on the Sample. If a session refactor moves the
-assembly and drops the one-line call, this fails loudly."""
+"""Sample assembly preserves chat-record timing across session boundaries."""
 
 from types import SimpleNamespace
 
-from miles.utils.lifecycle import TrajectoryLifecycle, attach_lifecycle_metadata
+from miles.utils.lifecycle import attach_lifecycle_metadata
 from miles.utils.types import Sample
 
 
@@ -32,8 +29,3 @@ def test_request_timestamp_bounds_the_agent_gap():
     attach_lifecycle_metadata(sample, record, prev, turn=2)
     # req_ts closes the agent gap at the server edge; [104, 120] is queueing
     assert sample.metadata["lifecycle"] == dict(t0=120.0, t1=130.0, turn=2, req_ts=104.0, prev_t1=100.0)
-
-
-def test_sink_defaults_to_none():
-    # without the dashboard installed every core probe is a guarded no-op
-    assert TrajectoryLifecycle().sink is None

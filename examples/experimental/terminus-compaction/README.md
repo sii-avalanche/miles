@@ -11,7 +11,7 @@ The default launcher is a one-node, 8-GPU, 100-step recipe:
 - 8 independent rollouts per prompt (32 rollouts per step);
 - 32,768 tokens per trajectory segment;
 - 8,192 generated tokens per model turn; and
-- Miles dashboard telemetry and rollout traces enabled.
+- Runtime telemetry and rollout traces enabled.
 
 The launcher reuses the Harbor request, reward, and metric adapters in
 `examples/swe-agent-harbor-docker`. Only the compaction-specific training recipe
@@ -143,15 +143,8 @@ local address. Use `--num-rollout 1` to stop after one step.
 
 ## 4. Verify compaction and training
 
-The trace root defaults to `<output-dir>/<run-id>/details`. View the live Miles
-dashboard with:
-
-```bash
-python -m miles.dashboard.serve \
-    --dump-details /path/to/output/<run-id>/details \
-    --follow \
-    --port 7788
-```
+The trace root defaults to `<output-dir>/<run-id>/details`. Inspect scalar
+histories in W&B; runtime telemetry is enabled at a 10-second interval.
 
 Useful per-step metrics are:
 
@@ -174,7 +167,7 @@ The per-rollout response-length metrics are not emitted for Multi-LoRA
 workloads because rollout identifiers are local to each adapter's data source.
 Multi-LoRA training itself is unaffected.
 
-Inspect `rollout_data/<step>.pt` or the dashboard's sample view to confirm that:
+Inspect `rollout_data/<step>.pt` to confirm that:
 
 - compacted siblings share a rollout ID and terminal reward;
 - shared prefix completions are loss-masked in all but one sibling; and

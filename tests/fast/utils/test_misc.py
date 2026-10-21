@@ -1,9 +1,7 @@
 import asyncio
 import logging
 import socket
-import sys
 from contextlib import ExitStack
-from dataclasses import dataclass
 
 import pytest
 
@@ -17,7 +15,6 @@ from miles.utils.misc import (
     filter_keys,
     get_current_node_ip,
     get_free_port,
-    get_gpu_uuids,
     merge_asserting_consistency,
 )
 
@@ -54,73 +51,6 @@ class TestFilterKeys:
             with pytest.raises(KeyError):
                 filter_keys(d, ["a", "missing"])
         assert any("filter_keys" in record.message for record in caplog.records)
-
-
-@dataclass(frozen=True)
-class _FakeGpuHandle:
-    index: int
-
-
-@dataclass(frozen=True)
-class _FakeNvmlUuid:
-    text: str
-
-    def __str__(self) -> str:
-        return self.text
-
-
-class _FakeNvml:
-    def __init__(
-        self,
-        *,
-        uuid_by_index: dict[int, str],
-        init_error: Exception | None = None,
-        uuid_error_indices: frozenset[int] = frozenset(),
-    ) -> None:
-        self._uuid_by_index = uuid_by_index
-        self._init_error = init_error
-        self._uuid_error_indices = uuid_error_indices
-
-    def nvmlInit(self) -> None:
-        if self._init_error is not None:
-            raise self._init_error
-
-    def nvmlDeviceGetHandleByIndex(self, index: int) -> _FakeGpuHandle:
-        return _FakeGpuHandle(index=index)
-
-    def nvmlDeviceGetUUID(self, handle: _FakeGpuHandle) -> _FakeNvmlUuid:
-        if handle.index in self._uuid_error_indices:
-            raise RuntimeError(f"nvml uuid lookup failed for {handle.index}")
-        return _FakeNvmlUuid(text=self._uuid_by_index[handle.index])
-
-
-class TestGetGpuUuids:
-    def test_get_gpu_uuids_returns_requested_nvml_uuids_in_order(self, monkeypatch) -> None:
-        """Each requested gpu index is resolved through NVML, coerced to str, and answered in request order."""
-        fake_nvml = _FakeNvml(uuid_by_index={0: "GPU-zero", 1: "GPU-one", 2: "GPU-two"})
-        monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
-
-        uuids = get_gpu_uuids([2, 0])
-
-        assert uuids == ["GPU-two", "GPU-zero"]
-        assert all(isinstance(uuid, str) for uuid in uuids)
-
-    def test_get_gpu_uuids_returns_none_per_gpu_when_nvml_fails(self, monkeypatch) -> None:
-        """A failing NVML init is swallowed and answered with exactly one None per requested gpu."""
-        fake_nvml = _FakeNvml(uuid_by_index={}, init_error=RuntimeError("nvml unavailable"))
-        monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
-
-        assert get_gpu_uuids([0, 1, 3]) == [None, None, None]
-
-    def test_get_gpu_uuids_returns_all_none_when_one_lookup_fails(self, monkeypatch) -> None:
-        """A single failing uuid lookup yields all-None rather than a partial or short list."""
-        fake_nvml = _FakeNvml(
-            uuid_by_index={0: "GPU-zero", 1: "GPU-one"},
-            uuid_error_indices=frozenset({1}),
-        )
-        monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
-
-        assert get_gpu_uuids([0, 1]) == [None, None]
 
 
 class TestNodeProbeMixin:
@@ -285,12 +215,6 @@ class TestNodeProbeMixin:
         monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
 
         assert NodeProbeMixin._to_local_gpu_ids(gpu_ids=[3]) == [3]
-
-    def test_get_gpu_uuids_returns_one_entry_per_gpu(self):
-        """The uuid probe is best-effort: without NVML it still answers per gpu."""
-        uuids = NodeProbeMixin._get_gpu_uuids([0, 1, 2])
-        assert len(uuids) == 3
-        assert all(uuid is None or isinstance(uuid, str) for uuid in uuids)
 
 
 async def _append(calls: list[int]) -> None:

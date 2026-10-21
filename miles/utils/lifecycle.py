@@ -1,18 +1,6 @@
-"""Trajectory-lifecycle seam callable from core rollout code.
-
-Core generation paths read ``TrajectoryLifecycle().sink`` unconditionally, so
-this module must never import from the dashboard extra. The dashboard installs
-the sink when enabled; while it is ``None`` every probe site is a no-op.
-"""
+"""Preserve chat-record timing in serialized rollout samples."""
 
 from __future__ import annotations
-
-from miles.utils.misc import SingletonMeta
-
-
-class TrajectoryLifecycle(metaclass=SingletonMeta):
-    def __init__(self):
-        self.sink = None  # the dashboard TrajectorySink (duck-typed); None = off
 
 
 def attach_lifecycle_metadata(sample, record, prev_record, turn: int) -> None:

@@ -21,7 +21,7 @@ out and how to override one, see [Launch Script](/user-guide/launch-script).
 | [`grpo_args`](#grpo-args) | RL objective, KL, clipping, entropy, advantage estimator | Recipe defaults |
 | [`optimizer_args`](#optimizer-args) | Learning rate, schedule, weight decay, Adam betas | Recipe defaults |
 | [`sglang_args`](#sglang-args) | Rollout engine topology and `--sglang-*` passthrough | Deployment shape |
-| [`misc_args`](#misc-args) | GPU layout, colocation, dropout, dashboard | Launch script |
+| [`misc_args`](#misc-args) | GPU layout, colocation, dropout, monitoring | Launch script |
 
 The names above are the local variables every launcher uses; a script that needs no eval
 simply leaves `eval_args` empty. Model args are the one group a launcher does not build:
@@ -178,7 +178,7 @@ SGLang parallelism is separate from trainer parallelism. For example,
 
 `misc_args` carries what the other groups do not: how many GPUs the actor gets, whether
 it shares them with the rollout engines, the Megatron knobs a recipe pins once and never
-tunes, and the optional dashboard.
+tunes, and the optional runtime telemetry.
 
 Common entries:
 
@@ -188,7 +188,7 @@ Common entries:
 | Colocation | `--colocate` |
 | Numerics pinned by the recipe | `--attention-dropout 0.0`, `--hidden-dropout 0.0`, `--attention-softmax-in-fp32`, `--accumulate-allreduce-grads-in-fp32` |
 | Attention kernel | `--attention-backend` |
-| Observability | `--use-miles-dashboard`, `--dump-details` |
+| Observability | `--use-wandb`, `--perf-monitor-interval`, `--dump-details` |
 
 Under `--colocate` the actor and the engines share the same GPUs and take turns, so
 `--rollout-num-gpus` is ignored; see
