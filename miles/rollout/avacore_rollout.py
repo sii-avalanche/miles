@@ -33,8 +33,6 @@ class AvaCoreRollout:
     def __init__(self, args: Namespace, config: Mapping[str, Any]) -> None:
         os.environ["SGLANG_ROUTER_URL"] = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
         os.environ["HF_CHECKPOINT"] = args.hf_checkpoint
-        # Bound the default native HTTP pool; explicit environment/model settings win.
-        os.environ.setdefault("TOKIO_WORKER_THREADS", "4")
         self.args = args
         self.config = config
         conv = launch_converter()
