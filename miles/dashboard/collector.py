@@ -84,7 +84,7 @@ def _default_list_gpu_nodes() -> list[tuple[str, str]]:
     ]
 
 
-def _default_spawn_sampler(node_id: str, node_ip: str, interval: float):
+def _default_spawn_sampler(node_id: str, node_ip: str, interval: float, *, processes: bool = True):
     """Spawn + start a GpuSampler pinned to one node; None when NVML is
     unavailable there (recorded so the node is not retried every tick)."""
     import ray
@@ -102,7 +102,7 @@ def _default_spawn_sampler(node_id: str, node_ip: str, interval: float):
             push=_SelfGpuPush(ray.get_runtime_context().current_actor),
             node=node_ip,
             interval=interval,
-            push_processes=_SelfGpuProcessPush(ray.get_runtime_context().current_actor),
+            push_processes=_SelfGpuProcessPush(ray.get_runtime_context().current_actor) if processes else None,
         )
     )
     if ray.get(handle.start.remote()):
@@ -125,7 +125,7 @@ _kill_sampler = _default_kill_sampler
 
 @dataclass
 class CollectorConfig:
-    dashboard_dir: str  # {dump_details}/dashboard
+    dashboard_dir: str | None  # None: latest gauges only, no files or history buffers
     run_name: str
     start_ts: float
     args_snapshot: dict[str, Any] = field(default_factory=dict)
@@ -150,8 +150,9 @@ class DashboardCollector:
         scraper_http_get=None,  # test hook, forwarded to SglangScraper
     ):
         self.config = config
-        self._store = MetricStore(config.dashboard_dir)
-        self._store.write_meta(Meta(run_name=config.run_name, start_ts=config.start_ts, args=config.args_snapshot))
+        self._store = MetricStore(config.dashboard_dir) if config.dashboard_dir is not None else None
+        if self._store is not None:
+            self._store.write_meta(Meta(run_name=config.run_name, start_ts=config.start_ts, args=config.args_snapshot))
         self._lock = threading.Lock()
         self._dropped_since_flush = 0
         self._last_topology: TopologySnapshot | None = None
@@ -165,6 +166,7 @@ class DashboardCollector:
         self._latest_phase_seconds: dict[str, float] = {}
         self._train_gpus: set[tuple[str, int]] = set()
         self._latest_engine_samples: dict[tuple, EngineSample] = {}
+        self._previous_engine_samples: dict[tuple, EngineSample] = {}
         self._scraped_engine_addrs: set[str] = set()
         self._actor_engine_addrs: set[str] = set()
         self._stop_event = threading.Event()
@@ -270,6 +272,7 @@ class DashboardCollector:
             "sglang_gen_throughput": ("generated_tokens_per_s", "sum"),
             "sglang_token_usage": ("kv_usage_mean", "mean"),
             "sglang_mamba_usage": ("mamba_usage_mean", "mean"),
+            "sglang_cache_hit_rate": ("cache_hit_rate_mean", "mean"),
         }
         for metric, (name, aggregation) in aggregations.items():
             fresh = [
@@ -283,6 +286,35 @@ class DashboardCollector:
                 result[f"inference/{name}"] = total / len(fresh) if aggregation == "mean" else total
                 if aggregation == "mean":
                     result[f"inference/{name.removesuffix('_mean')}_max"] = max(point.value for point in fresh)
+        current = {
+            (p.addr, tuple(sorted(p.labels.items())), p.metric): p
+            for p in engine_samples
+            if p.addr in active_addrs and now - p.ts <= engine_max_age
+        }
+        changes = {
+            key: (p.value - previous.value, p.ts - previous.ts)
+            for key, p in current.items()
+            if (previous := self._previous_engine_samples.get(key)) is not None
+            and p.ts > previous.ts
+            and p.value >= previous.value
+        }
+        self._previous_engine_samples = current
+        for stem in ("time_to_first_token", "inter_token_latency", "time_per_output_token", "e2e_request_latency"):
+            pairs = [
+                (delta, changes[(addr, labels, f"sglang_{stem}_seconds_count")][0])
+                for (addr, labels, metric), (delta, _) in changes.items()
+                if metric == f"sglang_{stem}_seconds_sum" and (addr, labels, f"sglang_{stem}_seconds_count") in changes
+            ]
+            if (count := sum(n for _, n in pairs)) > 0:
+                result[f"inference/{stem}_seconds"] = sum(total for total, _ in pairs) / count
+        for name in ("num_requests", "num_aborted_requests"):
+            rates = [
+                delta / elapsed
+                for (_, _, metric), (delta, elapsed) in changes.items()
+                if metric == f"sglang_{name}_total"
+            ]
+            if rates:
+                result[f"inference/{name}_per_s"] = sum(rates)
         return result
 
     def update_topology(self, snapshot: TopologySnapshot) -> None:
@@ -341,7 +373,17 @@ class DashboardCollector:
             router_addr=router_addr,
             engine_addrs=self._current_engine_addrs,
             interval=self.config.scrape_interval_seconds,
-            whitelist=self.config.metric_whitelist,
+            whitelist=(
+                self.config.metric_whitelist
+                if self._store is not None
+                else DEFAULT_METRIC_WHITELIST[:6]
+                + tuple(
+                    name
+                    for name in DEFAULT_METRIC_WHITELIST
+                    if name.endswith(("_sum", "_count"))
+                    or name in ("sglang_num_requests_total", "sglang_num_aborted_requests_total")
+                )
+            ),
         )
         if self._scraper_http_get is not None:
             kwargs["http_get"] = self._scraper_http_get
@@ -359,9 +401,10 @@ class DashboardCollector:
 
     def _append(self, record: Record) -> None:
         with self._lock:
-            if self._store.buffered_count(record.stream) >= self.MAX_BUFFERED_PER_STREAM:
-                self._dropped_since_flush += self._store.drop_oldest_buffered(record.stream)
-            self._store.append(record)
+            if self._store is not None:
+                if self._store.buffered_count(record.stream) >= self.MAX_BUFFERED_PER_STREAM:
+                    self._dropped_since_flush += self._store.drop_oldest_buffered(record.stream)
+                self._store.append(record)
             self._update_latest(record)
 
     def _update_latest(self, record: Record) -> None:
@@ -406,7 +449,10 @@ class DashboardCollector:
                 del self._samplers[node_id]  # node gone; actor died with it
         for node_id, node_ip in alive:
             if node_id not in self._samplers:
-                self._samplers[node_id] = _spawn_sampler(node_id, node_ip, self.config.gpu_sample_interval_seconds)
+                kwargs = {"processes": False} if self._store is None else {}
+                self._samplers[node_id] = _spawn_sampler(
+                    node_id, node_ip, self.config.gpu_sample_interval_seconds, **kwargs
+                )
 
     def flush(self) -> None:
         with self._lock:
@@ -418,7 +464,8 @@ class DashboardCollector:
                 )
                 self._dropped_since_flush = 0
             try:
-                self._store.flush()
+                if self._store is not None:
+                    self._store.flush()
             except OSError:
                 # deliberately loud on EVERY failed flush: a disk problem must
                 # surface, not be masked; buffers stay bounded via _append

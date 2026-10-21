@@ -51,10 +51,13 @@ class WandbBackend(TrackingBackend):
 
     def __init__(self) -> None:
         self._defined_step_key_groups: set[tuple[str, str]] = set()
+        self._active_alerts: set[str] = set()
+        self._selected_metrics = False
 
     def init(self, args, *, primary: bool = True, **kwargs) -> None:
         from . import wandb_utils
 
+        self._selected_metrics = getattr(args, "perf_monitor_interval", 0) > 0
         if primary:
             wandb_utils.init_wandb_primary(args, **kwargs)
         else:
@@ -63,7 +66,24 @@ class WandbBackend(TrackingBackend):
     def log(self, metrics: dict[str, Any], step: int | None = None, **kwargs) -> None:
         import wandb
 
+        if self._selected_metrics:
+            metrics = {
+                k: v for k, v in metrics.items() if k.startswith(("train/", "rollout/", "perf/", "moe/", "runtime/"))
+            }
+        if not metrics:
+            return
         wandb.log(metrics)
+        for key, active in metrics.items():
+            if not key.startswith("runtime/") or "/alerts/" not in key:
+                continue
+            if active and key not in self._active_alerts:
+                try:
+                    wandb.alert(title=key.rsplit("/", 1)[-1], text=f"{key} is active; see the Monitoring panels.")
+                    self._active_alerts.add(key)
+                except Exception:
+                    logger.warning("W&B alert delivery failed; the numeric alert remains logged", exc_info=True)
+            elif not active:
+                self._active_alerts.discard(key)
 
     def define_step_key_metric_group(self, prefix: str, step_key: str) -> None:
         # Call from the primary tracking process: definitions from secondary shared-mode writers are lost.
@@ -105,7 +125,6 @@ class TensorboardBackend(TrackingBackend):
 
 
 class MlflowBackend(TrackingBackend):
-
     def init(self, args, *, primary: bool = True, **kwargs) -> None:
         from . import mlflow_utils
 

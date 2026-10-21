@@ -68,12 +68,7 @@ def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None
         )
         ray.get(_handle.ping.remote())
         _handle.start.remote()
-        logger.info(
-            "miles dashboard: telemetry -> %s | view live: python -m miles.dashboard.serve "
-            "--dashboard-dir %s --follow --port 7788",
-            config.dashboard_dir,
-            config.dashboard_dir,
-        )
+        logger.info("Fleet telemetry: %s", config.dashboard_dir or "W&B only (no dashboard files)")
         return
 
     if resolve_collector() is None:
@@ -84,7 +79,8 @@ def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None
         # address is still "http://None:None" here — the real registration
         # happens via hooks.register_router once the router is up.
         hooks.attach_phase_sink(_handle, Role.ROLLOUT_MANAGER)
-        hooks.attach_trajectory_sink(_handle)
+        if args.use_miles_dashboard:
+            hooks.attach_trajectory_sink(_handle)
 
 
 def resolve_collector():

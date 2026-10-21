@@ -90,16 +90,19 @@ def add_dashboard_arguments(parser) -> None:
 
 
 def validate_dashboard_args(args) -> None:
-    if not args.use_miles_dashboard:
+    from miles.utils.perf_monitor import wandb_runtime_enabled
+
+    memory_only = wandb_runtime_enabled(args)
+    if not args.use_miles_dashboard and not memory_only:
         return
-    assert (
-        args.dump_details is not None or getattr(args, "dashboard_dir", None) is not None
-    ), "--use-miles-dashboard requires --dashboard-dir (telemetry only) or --dump-details (including sample dumps)"
+    assert memory_only or args.dump_details is not None or getattr(args, "dashboard_dir", None) is not None, (
+        "--use-miles-dashboard requires --dashboard-dir (telemetry only) or --dump-details (including sample dumps)"
+    )
     for name in ("dashboard_flush_interval", "dashboard_gpu_sample_interval", "dashboard_sglang_scrape_interval"):
-        assert (
-            math.isfinite(getattr(args, name)) and getattr(args, name) > 0
-        ), f"--{name.replace('_', '-')} must be finite and positive"
-    if args.dump_details is not None and not args.use_rollout_entropy:
+        assert math.isfinite(getattr(args, name)) and getattr(args, name) > 0, (
+            f"--{name.replace('_', '-')} must be finite and positive"
+        )
+    if not memory_only and args.dump_details is not None and not args.use_rollout_entropy:
         logger.warning(
             "--use-miles-dashboard without --use-rollout-entropy: per-token entropy "
             "will be missing from the dashboard token view"
@@ -116,7 +119,11 @@ def collector_config_from_args(args, *, start_ts: float) -> CollectorConfig:
     return CollectorConfig(
         # Explicit telemetry location wins; dump_details retains its existing
         # meaning and never gets enabled merely for performance monitoring.
-        dashboard_dir=getattr(args, "dashboard_dir", None) or f"{args.dump_details}/dashboard",
+        dashboard_dir=(
+            getattr(args, "dashboard_dir", None) or f"{args.dump_details}/dashboard"
+            if args.use_miles_dashboard
+            else None
+        ),
         run_name=args.wandb_group or "miles-run",
         start_ts=start_ts,
         args_snapshot=snapshot,

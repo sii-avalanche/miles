@@ -5,7 +5,7 @@ import torch
 
 from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
 from miles.utils.audit_utils.event_logger.models import MetricEvent
-from miles.utils.perf_monitor import start_monitor, stop_monitors
+from miles.utils.perf_monitor import start_monitor, stop_monitors, wandb_runtime_enabled
 
 from .base import (
     MilesDashboardBackend,
@@ -36,6 +36,13 @@ _manager = TrackingManager(BACKEND_REGISTRY)
 
 
 def init_tracking(args, primary: bool = True, **kwargs):
+    if wandb_runtime_enabled(args):
+        # W&B owns metric history; reuse only the fleet collector, without its
+        # old dashboard writer or a second tracking backend.
+        from miles.dashboard import backend
+
+        args.use_miles_dashboard = False
+        backend.init_dashboard(args, primary=primary, **kwargs)
     if primary and getattr(args, "perf_monitor_interval", 0) > 0:
         # One origin is serialized with args to every worker; wall-clock series
         # remain aligned even when rollout and trainer start minutes apart.
@@ -54,7 +61,7 @@ def log(args, metrics, step_key: str):
     step = metrics.get(step_key)
     _manager.log(metrics, step=step, step_key=step_key)
 
-    if is_event_logger_initialized():
+    if not getattr(args, "use_wandb", False) and is_event_logger_initialized():
         serializable_metrics = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in metrics.items()}
         get_event_logger().log(MetricEvent, {"metrics": serializable_metrics}, print_log=False)
 
@@ -62,3 +69,6 @@ def log(args, metrics, step_key: str):
 def finish_tracking():
     stop_monitors()
     _manager.finish()
+    from miles.dashboard import backend
+
+    backend.finish_dashboard()

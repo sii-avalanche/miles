@@ -287,7 +287,9 @@ def detach_and_flush() -> None:
 def register_train_actor(args) -> None:
     """Called by TrainActor.init on EVERY rank — init_tracking only runs on
     the megatron main rank, but per-GPU phase lanes need every rank's Timer."""
-    if not args.use_miles_dashboard:
+    from miles.utils.perf_monitor import wandb_runtime_enabled
+
+    if not args.use_miles_dashboard and not wandb_runtime_enabled(args):
         return
     from miles.dashboard import backend
 
@@ -301,7 +303,9 @@ def register_router(args) -> None:
     """Called by the rollout manager AFTER start_rollout_servers: only then are
     ``args.sglang_router_ip/port`` filled in. init_tracking runs earlier in
     __init__, so the backend cannot register the router at init time."""
-    if not args.use_miles_dashboard:
+    from miles.utils.perf_monitor import wandb_runtime_enabled
+
+    if not args.use_miles_dashboard and not wandb_runtime_enabled(args):
         return
     from miles.dashboard import backend
 

@@ -2,7 +2,7 @@
 
 Counters are cumulative; duration percentiles describe the last 256 completed
 operations. Live waits include operations that have not returned yet. Snapshots
-go through the existing tracking backends and to a bounded local event stream.
+go through the existing tracking backends. W&B runs do not write a second event stream.
 No sample text, exception messages, environment values or credentials are saved.
 """
 
@@ -20,12 +20,69 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from miles.utils.perf_monitor_io import append_records, host_memory_metrics
 
 logger = logging.getLogger(__name__)
 _monitors: dict[str, RuntimeMonitor] = {}
+
+# Only the selected dashboard functions. Training/reward/MFU metrics already
+# have their own tracking path; host/system metrics are supplied by W&B itself.
+WANDB_RUNTIME_KEYS = (
+    "runtime/time_s",
+    "runtime/driver/phase/*/waiting",
+    "runtime/driver/fleet/*/gpu_util_mean_pct",
+    "runtime/driver/fleet/*/gpu_memory_max_gb",
+    "runtime/driver/fleet/*/coverage_fraction",
+    "runtime/driver/fleet/inference/running_requests",
+    "runtime/driver/fleet/inference/queued_requests",
+    "runtime/driver/fleet/inference/generated_tokens_per_s",
+    "runtime/driver/fleet/inference/kv_usage_mean",
+    "runtime/driver/fleet/inference/mamba_usage_mean",
+    "runtime/driver/fleet/inference/cache_hit_rate_mean",
+    "runtime/driver/fleet/inference/*_seconds",
+    "runtime/driver/fleet/inference/num*_per_s",
+    "runtime/*/alerts/*",
+    "runtime/rollout/sample/*/waiting",
+    "runtime/rollout/sample/*/oldest_wait_seconds",
+    "runtime/rollout/sample/*/p95_seconds",
+    "runtime/rollout/sample/*/count_per_s",
+    "runtime/rollout/record/pending_writes",
+    "runtime/rollout/record/in_flight_writes",
+    "runtime/rollout/record/oldest_pending_seconds",
+    "runtime/rollout/record/end_to_end/p95_seconds",
+    "runtime/rollout/record/success_per_s",
+    "runtime/rollout/record/failed_per_s",
+    "runtime/rollout/record/pool/pool_size",
+    "runtime/rollout/record/pool/pool_available",
+    "runtime/rollout/record/pool/requests_waiting",
+    "runtime/rollout/producer/in_flight_groups",
+    "runtime/rollout/producer/oldest_in_flight_seconds",
+    "runtime/rollout/producer/paused",
+    "runtime/rollout/batch/active",
+    "runtime/rollout/batch/ready_groups",
+    "runtime/rollout/batch/target_groups",
+    "runtime/rollout/batch/pending_groups",
+    "runtime/rollout/batch/oldest_group_seconds",
+    "runtime/rollout/batch/aborted_groups_total",
+    "runtime/rollout/batch/groups*_per_s",
+    "runtime/rollout/buffer/*/versions/*",
+    "runtime/rollout/buffer/versions/*",
+    "runtime/rollout/buffer/*queued_groups",
+    "runtime/rollout/buffer/*capacity_groups",
+    "runtime/rollout/buffer/*rejected_groups_total",
+    "runtime/rollout/buffer/*aborted_groups_total",
+    "runtime/rollout/buffer/*groups_consumed_per_s",
+    "runtime/rollout/buffer/*groups_enqueued_per_s",
+    "runtime/rollout/buffer/*_wait/waiting",
+    "runtime/rollout/buffer/*residence/p95_seconds",
+    "runtime/rollout/buffer/*workload/*/queued_groups",
+    "runtime/rollout/workload/*/in_flight_group_fraction",
+    "runtime/rollout/workload/*/target_fraction",
+    "runtime/rollout/events/*/count_total",
+)
 
 
 def add_perf_monitor_arguments(parser) -> None:
@@ -34,7 +91,7 @@ def add_perf_monitor_arguments(parser) -> None:
         "--perf-monitor-interval",
         type=float,
         default=0.0,
-        help="Wall-clock telemetry interval (s); 0 disables it. Writes runtime/* to tracking and LOG_DIR/perf/.",
+        help="Wall-clock telemetry interval (s); 0 disables it. W&B uses selected runtime/* metrics without dashboard files.",
     )
     group.add_argument(
         "--perf-monitor-expert-layer",
@@ -76,6 +133,10 @@ def validate_perf_monitor_args(args) -> None:
         assert args.num_experts > 0, "expert telemetry requires num_experts > 0"
 
 
+def wandb_runtime_enabled(args) -> bool:
+    return getattr(args, "use_wandb", False) and getattr(args, "perf_monitor_interval", 0) > 0
+
+
 class RuntimeMonitor:
     """One process owns its state and background writer; providers only read gauges."""
 
@@ -100,11 +161,12 @@ class RuntimeMonitor:
         self._last_rate_time = time.monotonic()
         self._last_rate_values = {}
         self._closed = False
+        self._alert_since = {}
 
     def start(self) -> None:
         if not self.enabled or self._thread is not None:
             return
-        if self._path is None:
+        if self._path is None and not wandb_runtime_enabled(self.args):
             directory = os.environ.get("LOG_DIR") or getattr(self.args, "dashboard_dir", None)
             if directory is None and getattr(self.args, "dump_details", None):
                 directory = self.args.dump_details
@@ -146,6 +208,10 @@ class RuntimeMonitor:
             with self._lock:
                 self._providers[name] = provider
 
+    def unregister(self, name: str) -> None:
+        with self._lock:
+            self._providers.pop(name, None)
+
     @contextmanager
     def wait(self, name: str) -> Iterator[None]:
         """Time a real blocking wait, including cancellation; expose ongoing waits."""
@@ -184,6 +250,13 @@ class RuntimeMonitor:
 
     def _event(self, event: dict) -> None:
         with self._lock:
+            if wandb_runtime_enabled(self.args):
+                if event["name"] not in ("batch_ready", "buffer_reject", "abort"):
+                    return
+                name = f"events/{event['name']}"
+                if event["t1"] is not None:
+                    self._counters[f"{name}/count_total"] += 1
+                return
             if len(self._events) == self._events.maxlen:
                 self._counters["telemetry/events_dropped_total"] += 1
             self._events.append(event)
@@ -265,9 +338,32 @@ class RuntimeMonitor:
                 values.update({f"{name}/{key}" if name else key: value for key, value in provider().items()})
             except Exception:
                 self._warn("performance gauge provider failed; leaving a gap")
+        values.update(self._alerts(values))
         return {f"runtime/{self.role}/{key}": value for key, value in values.items()} | {
             "runtime/time_s": max(0.0, time.time() - self.start_ts)
         }
+
+    def _alerts(self, values: dict[str, float]) -> dict[str, float]:
+        # Same thresholds/hold times as the old Grafana rules, per owning role.
+        rules = {
+            "collector_unavailable": ("fleet/available", 0, 120),
+            "trainer_waiting": ("phase/wait_rollout/oldest_wait_seconds", 300, 300),
+            "reward_long_wait": ("sample/reward/oldest_wait_seconds", 900, 300),
+            "database_backlog": ("record/oldest_pending_seconds", 300, 300),
+        }
+        result = {}
+        now = time.monotonic()
+        for name, (key, threshold, hold) in rules.items():
+            if key not in values:
+                self._alert_since.pop(name, None)
+                continue
+            breached = values[key] == 0 if name == "collector_unavailable" else values[key] > threshold
+            if breached:
+                self._alert_since.setdefault(name, now)
+            else:
+                self._alert_since.pop(name, None)
+            result[f"alerts/{name}"] = int(breached and now - self._alert_since[name] >= hold)
+        return result
 
     def emit(self) -> None:
         if not self.enabled:
@@ -275,9 +371,17 @@ class RuntimeMonitor:
         try:
             metrics = self.snapshot()
             metrics.update(self._rates(metrics))
+            if wandb_runtime_enabled(self.args):
+                metrics = {
+                    key: value
+                    for key, value in metrics.items()
+                    if any(fnmatchcase(key, pattern) for pattern in WANDB_RUNTIME_KEYS)
+                }
+                if len(metrics) <= 1:
+                    return
             with self._lock:
                 events, self._events = list(self._events), deque(maxlen=2048)
-            if self._path is not None:
+            if self._path is not None and not wandb_runtime_enabled(self.args):
                 try:
                     append_records(self._path, [*events, dict(kind="metrics", ts=time.time(), metrics=metrics)])
                 except Exception:
@@ -342,12 +446,15 @@ def get_monitor(args, role: str = "rollout") -> RuntimeMonitor:
         return _disabled
     if role not in _monitors:
         monitor = _monitors[role] = RuntimeMonitor(args=args, role=role)
-        monitor.register("host", host_memory_metrics)
+        if not wandb_runtime_enabled(args):
+            monitor.register("host", host_memory_metrics)
     return _monitors[role]
 
 
 def start_monitor(args, *, primary: bool, router_addr: str | None = None) -> None:
     role = "driver" if primary else "rollout" if router_addr is not None else "train"
+    if role == "train" and wandb_runtime_enabled(args):
+        return  # W&B supplies host metrics; driver owns the fleet/phase aggregates.
     monitor = get_monitor(args, role)
     if primary and monitor.enabled:
         from miles.utils.tracking_utils import tracking  # tracking imports this module
@@ -355,7 +462,7 @@ def start_monitor(args, *, primary: bool, router_addr: str | None = None) -> Non
         tracking.define_step_key_metric_group("runtime", "runtime/time_s")
         if getattr(args, "perf_monitor_expert_layer", None) is not None:
             tracking.define_step_key_metric_group("moe", "rollout/step")
-        if getattr(args, "use_miles_dashboard", False):
+        if getattr(args, "use_miles_dashboard", False) or wandb_runtime_enabled(args):
             monitor.register("fleet", _fleet_snapshot)
     monitor.start()
 
@@ -365,9 +472,12 @@ def _fleet_snapshot() -> dict[str, float]:
 
     from miles.dashboard.backend import current_collector
 
-    if (handle := current_collector()) is None:
-        return {}
-    return ray.get(handle.runtime_snapshot.remote(), timeout=2)
+    try:
+        if (handle := current_collector()) is not None:
+            return ray.get(handle.runtime_snapshot.remote(), timeout=2) | {"available": 1}
+    except Exception:
+        logger.debug("Runtime collector unavailable", exc_info=True)
+    return {"available": 0}
 
 
 def stop_monitors() -> None:
