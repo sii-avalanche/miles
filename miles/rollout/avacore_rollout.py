@@ -40,16 +40,32 @@ class AvaCoreRollout:
         reward_config = interpolated(self.config["reward"])
         remote = generate_config.get("kind") == "remote"
         if remote:
-            # The service owns verification; the training process only reads the returned reward.
+            # Accept the previous scorer location; the sample carries it to the service once.
+            generate_config = dict(generate_config)
+            legacy_reward = generate_config.pop("reward", None)
             if reward_config.get("kind") != "remote_reward":
-                if "reward" in generate_config:
+                reward_config = {"kind": "remote_reward", "reward": reward_config}
+            if legacy_reward is not None:
+                if "reward" in reward_config:
                     raise ValueError("Set the remote scorer in either reward or generate.reward, not both")
-                generate_config = generate_config | {"reward": reward_config}
-            reward_config = {"kind": "remote_reward"}
+                reward_config = reward_config | {"reward": legacy_reward}
         self.generate_fn = conv.structure(generate_config, GenerateFunction)
         self._remote_generate = self.generate_fn if remote else None
         self._generate = self.generate_fn.send_sample if remote else self.generate_fn
+        if remote:
+            # Reward IDs belong to the generation service and run session.
+            reward_config = {
+                "settings": generate_config["settings"],
+                "run_id": self.generate_fn.run_id,
+                "concurrency": self.generate_fn.concurrency,
+            } | reward_config
         self.reward_fn = conv.structure(reward_config, RewardFunction)
+        self._remote_reward = self.reward_fn if reward_config.get("kind") == "remote_reward" else None
+        if remote and any(
+            getattr(self.reward_fn, key) != getattr(self.generate_fn, key)
+            for key in ("settings", "run_id", "concurrency")
+        ):
+            raise ValueError("Remote reward must use the same service settings, run_id and concurrency as generation")
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
@@ -57,8 +73,10 @@ class AvaCoreRollout:
         self.failed_writes = 0
 
     async def generate(self, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
-        # Send tests and per-sample generator/verifier configs alongside the question.
+        # Send the verifier once; scoring starts remotely while the Trace returns to training.
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
+        if self._remote_generate is not None and "reward" not in row and self.reward_fn.reward is not None:
+            row["reward"] = self.reward_fn.reward
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         try:
             traces = await self._generate(row, sampling_params=sampling_params, **replay)
@@ -92,11 +110,16 @@ class AvaCoreRollout:
         return samples[0] if len(samples) == 1 else samples
 
     async def close(self) -> None:
-        if self._remote_generate is not None:
-            await self._remote_generate.aclose()
+        for client in (self._remote_generate, self._remote_reward):
+            if client is not None:
+                await client.aclose()
 
     async def dispose(self) -> None:
-        loop = getattr(self._remote_generate, "loop", None) or asyncio.get_running_loop()
+        loop = (
+            getattr(self._remote_generate, "loop", None)
+            or getattr(self._remote_reward, "loop", None)
+            or asyncio.get_running_loop()
+        )
         if loop is asyncio.get_running_loop():
             await self.close()
         else:
