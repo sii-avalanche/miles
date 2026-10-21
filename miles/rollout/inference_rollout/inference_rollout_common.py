@@ -216,10 +216,6 @@ class InferenceRolloutFn(BaseRolloutFn):
         self.state = GenerateState(input.args)
         self.eval_prompt_dataset_cache = {}
 
-    async def dispose(self) -> None:
-        if (avacore := getattr(self.state, "avacore", None)) is not None:
-            await avacore.dispose()
-
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
             return await self._call_eval(input)

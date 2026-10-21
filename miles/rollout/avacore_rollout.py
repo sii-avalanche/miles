@@ -36,36 +36,8 @@ class AvaCoreRollout:
         self.args = args
         self.config = config
         conv = launch_converter()
-        generate_config = interpolated(self.config["generate"])
-        reward_config = interpolated(self.config["reward"])
-        remote = generate_config.get("kind") == "remote"
-        if remote:
-            # Accept the previous scorer location; the sample carries it to the service once.
-            generate_config = dict(generate_config)
-            legacy_reward = generate_config.pop("reward", None)
-            if reward_config.get("kind") != "remote_reward":
-                reward_config = {"kind": "remote_reward", "reward": reward_config}
-            if legacy_reward is not None:
-                if "reward" in reward_config:
-                    raise ValueError("Set the remote scorer in either reward or generate.reward, not both")
-                reward_config = reward_config | {"reward": legacy_reward}
-        self.generate_fn = conv.structure(generate_config, GenerateFunction)
-        self._remote_generate = self.generate_fn if remote else None
-        self._generate = self.generate_fn.send_sample if remote else self.generate_fn
-        if remote:
-            # Reward IDs belong to the generation service and run session.
-            reward_config = {
-                "settings": generate_config["settings"],
-                "run_id": self.generate_fn.run_id,
-                "concurrency": self.generate_fn.concurrency,
-            } | reward_config
-        self.reward_fn = conv.structure(reward_config, RewardFunction)
-        self._remote_reward = self.reward_fn if reward_config.get("kind") == "remote_reward" else None
-        if remote and any(
-            getattr(self.reward_fn, key) != getattr(self.generate_fn, key)
-            for key in ("settings", "run_id", "concurrency")
-        ):
-            raise ValueError("Remote reward must use the same service settings, run_id and concurrency as generation")
+        self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
+        self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
@@ -73,13 +45,10 @@ class AvaCoreRollout:
         self.failed_writes = 0
 
     async def generate(self, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
-        # Send the verifier once; scoring starts remotely while the Trace returns to training.
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
-        if self._remote_generate is not None and "reward" not in row and self.reward_fn.reward is not None:
-            row["reward"] = self.reward_fn.reward
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         try:
-            traces = await self._generate(row, sampling_params=sampling_params, **replay)
+            traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
             if any(
                 message.metadata["finish_reason"]["type"] == "abort"
                 for node in iter_trace_nodes(traces)
@@ -108,22 +77,6 @@ class AvaCoreRollout:
                 samples.append(filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned))
                 owned.update(generated)
         return samples[0] if len(samples) == 1 else samples
-
-    async def close(self) -> None:
-        for client in (self._remote_generate, self._remote_reward):
-            if client is not None:
-                await client.aclose()
-
-    async def dispose(self) -> None:
-        loop = (
-            getattr(self._remote_generate, "loop", None)
-            or getattr(self._remote_reward, "loop", None)
-            or asyncio.get_running_loop()
-        )
-        if loop is asyncio.get_running_loop():
-            await self.close()
-        else:
-            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.close(), loop))
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
