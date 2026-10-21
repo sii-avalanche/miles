@@ -33,6 +33,8 @@ class AvaCoreRollout:
     def __init__(self, args: Namespace, config: Mapping[str, Any]) -> None:
         os.environ["SGLANG_ROUTER_URL"] = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
         os.environ["HF_CHECKPOINT"] = args.hf_checkpoint
+        # Bound the default native HTTP pool; explicit environment/model settings win.
+        os.environ.setdefault("TOKIO_WORKER_THREADS", "4")
         self.args = args
         self.config = config
         conv = launch_converter()
@@ -144,8 +146,15 @@ class AvaCoreRollout:
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     state = input.state
+    if error := getattr(state, "avacore_init_error", None):
+        raise RuntimeError(error)
     if (rollout := getattr(state, "avacore", None)) is None:
-        rollout = state.avacore = AvaCoreRollout(input.args, input.args.avacore_config)
+        try:
+            rollout = state.avacore = AvaCoreRollout(input.args, input.args.avacore_config)
+        except Exception as error:
+            # Keep only text: a traceback would retain partially constructed clients.
+            state.avacore_init_error = f"AvaCore rollout initialization failed: {error}"
+            raise
     return GenerateFnOutput(samples=await rollout.generate(input.sample, input.sampling_params))
 
 
