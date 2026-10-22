@@ -1,8 +1,10 @@
 import argparse
 import json
 import logging
+import math
 import os
 import re
+import sys
 from string import Formatter
 from typing import Any
 
@@ -134,6 +136,130 @@ def reset_arg(parser, name, **kwargs):
 
 _FT_CHOICES = ["rollout", "train"]
 _DEFAULT_FT_API_SERVER_PORT = 18080
+
+
+def add_rl_algorithm_arguments(parser):
+    parser.add_argument("--grpo-std-normalization", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--rl-algorithm",
+        choices=["grpo_original", "dapo", "dr_grpo"],
+        default=None,
+        help="Optional recipe defaults; explicit component arguments override the recipe.",
+    )
+    parser.add_argument(
+        "--policy-loss-reduction",
+        choices=["response_mean", "token_mean", "group_token_mean", "fixed_token_sum"],
+        default=None,
+    )
+    parser.add_argument(
+        "--policy-loss-fixed-normalizer",
+        type=float,
+        default=None,
+        help="Fixed positive response-length divisor; defaults to rollout_max_response_len.",
+    )
+    parser.add_argument("--overlong-reward-mode", choices=["none", "mask_truncated", "soft_penalty"], default=None)
+    parser.add_argument("--overlong-buffer-length", type=int, default=None)
+    parser.add_argument("--overlong-penalty-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--dynamic-sampling-max-groups",
+        type=int,
+        default=None,
+        help="Completed-group budget per target batch; DAPO defaults to 10x rollout_batch_size, 0 disables.",
+    )
+    return parser
+
+
+def apply_rl_algorithm_defaults(parser, argv=None):
+    """Recipes supply defaults only; the existing CLI remains the override layer."""
+    argv = sys.argv[1:] if argv is None else argv
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument("--rl-algorithm", default=None)
+    name = selector.parse_known_args(argv)[0].rl_algorithm
+    if name is None:
+        return
+    recipes = {
+        "grpo_original": dict(
+            grpo_std_normalization=True,
+            eps_clip_high=0.2,
+            policy_loss_reduction="response_mean",
+            dynamic_sampling_filter_path=None,
+            overlong_reward_mode="none",
+        ),
+        "dapo": dict(
+            grpo_std_normalization=True,
+            eps_clip_high=0.28,
+            policy_loss_reduction="token_mean",
+            dynamic_sampling_filter_path="miles.rollout.filter_hub.common_filters.apply_reward_nonzero_std_filter",
+            overlong_reward_mode="soft_penalty",
+        ),
+        "dr_grpo": dict(
+            grpo_std_normalization=False,
+            eps_clip_high=0.2,
+            policy_loss_reduction="fixed_token_sum",
+            dynamic_sampling_filter_path=None,
+            overlong_reward_mode="none",
+        ),
+    }
+    if name not in recipes:
+        parser.error(f"Unknown RL algorithm: {name}")
+    defaults = dict(advantage_estimator="grpo", rewards_normalization=True, eps_clip=0.2, **recipes[name])
+    explicit = {word.split("=", 1)[0] for word in argv if word.startswith("--")}
+    destinations = {action.dest for action in parser._actions if explicit.intersection(action.option_strings)}
+    # The old per-token switch and custom reducer are still explicit component overrides.
+    if "calculate_per_token_loss" in destinations and "policy_loss_reduction" not in destinations:
+        defaults["policy_loss_reduction"] = "token_mean"
+    if "custom_pg_loss_reducer_function_path" in destinations:
+        defaults.pop("policy_loss_reduction", None)
+    parser.set_defaults(**{key: value for key, value in defaults.items() if key not in destinations})
+
+
+def validate_rl_algorithm_args(args):
+    mode = getattr(args, "policy_loss_reduction", None)
+    if mode is not None:
+        if args.train_backend != "megatron":
+            raise ValueError("Named policy reductions currently require the Megatron backend")
+        if args.loss_type != "policy_loss" or args.advantage_estimator != "grpo":
+            raise ValueError("RL policy reduction modes require policy_loss and the grpo advantage estimator")
+        if args.custom_pg_loss_reducer_function_path is not None:
+            raise ValueError("Choose policy_loss_reduction or a custom PG reducer, not both")
+        if args.calculate_per_token_loss and mode != "token_mean":
+            raise ValueError("calculate_per_token_loss conflicts with the selected policy_loss_reduction")
+        args.calculate_per_token_loss = mode == "token_mean"
+        if mode == "fixed_token_sum":
+            value = args.policy_loss_fixed_normalizer
+            if value is None:
+                value = args.rollout_max_response_len
+            if value is None or not math.isfinite(value) or value <= 0:
+                raise ValueError("fixed_token_sum requires a finite positive fixed normalizer or generation budget")
+            args.policy_loss_fixed_normalizer = float(value)
+        if mode == "group_token_mean" and (args.num_steps_per_rollout != 1 or args.use_dynamic_global_batch_size):
+            raise ValueError("group_token_mean requires one optimizer step over the complete rollout batch")
+        if getattr(args, "multi_lora", False):
+            raise ValueError("RL recipe reductions are not supported with multi-LoRA client losses")
+    shaping = getattr(args, "overlong_reward_mode", None)
+    if shaping == "soft_penalty":
+        limit = args.rollout_max_response_len
+        buffer = args.overlong_buffer_length
+        if buffer is None and limit is not None:
+            # The default is a budget-relative recipe, not a tuned optimum for this model.
+            buffer = max(1, limit // 5)
+        if limit is None or buffer is None or not 0 < buffer <= limit:
+            raise ValueError("soft_penalty requires 0 < overlong_buffer_length <= rollout_max_response_len")
+        if not math.isfinite(args.overlong_penalty_strength) or args.overlong_penalty_strength < 0:
+            raise ValueError("overlong_penalty_strength must be finite and nonnegative")
+        args.overlong_buffer_length = buffer
+    budget = args.dynamic_sampling_max_groups
+    if budget is None:
+        budget = 10 * args.rollout_batch_size if args.rl_algorithm == "dapo" else 0
+    if budget < 0 or (budget and budget < args.rollout_batch_size):
+        raise ValueError("dynamic_sampling_max_groups must be 0 or at least rollout_batch_size")
+    args.dynamic_sampling_max_groups = budget
+    if (mode is not None or shaping not in (None, "none")) and (
+        args.custom_reward_post_process_path or args.custom_convert_samples_to_train_data_path
+    ):
+        raise ValueError("RL recipes cannot be combined with custom reward/data conversion hooks")
+    if (mode is not None or shaping not in (None, "none")) and use_legacy_rollout_v1():
+        raise ValueError("RL recipes require the class-based rollout API")
 
 
 def get_miles_extra_args_provider(add_custom_arguments=None):
@@ -2836,6 +2962,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_data_arguments(parser)
         parser = add_eval_arguments(parser)
         parser = add_algo_arguments(parser)
+        parser = add_rl_algorithm_arguments(parser)
         parser = add_on_policy_distillation_arguments(parser)
         parser = add_wandb_arguments(parser)
         parser = add_mlflow_arguments(parser)
@@ -2854,6 +2981,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_prefill_decode_disaggregation_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        apply_rl_algorithm_defaults(parser)
         parser = add_user_provided_function_arguments(parser)
 
         reset_arg(
@@ -2948,6 +3076,7 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
     args.entry = entry
     if preprocess_args is not None:
         preprocess_args(args)
+    validate_rl_algorithm_args(args)
     miles_validate_args(args)
 
     if backend == "megatron":

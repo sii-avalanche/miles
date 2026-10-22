@@ -583,7 +583,10 @@ def log_train_step(
         cnt = loss_dict.get(f"lld_{sign}_kl_cnt")
         if num is not None and cnt is not None and float(cnt) != 0.0:
             log_dict_out[f"train/{role_tag}lld_ppo_kl_{sign}"] = float(num) / float(cnt)
-        for raw in (f"lld_{sign}_kl_sum", f"lld_{sign}_kl_cnt"):
+        clipped = loss_dict.get(f"{sign}_clip_sum")
+        if clipped is not None and cnt is not None:
+            log_dict_out[f"train/{role_tag}pg_clipfrac_{sign}"] = float(clipped) / max(float(cnt), 1e-12)
+        for raw in (f"lld_{sign}_kl_sum", f"lld_{sign}_kl_cnt", f"{sign}_clip_sum"):
             log_dict_out.pop(f"train/{role_tag}{raw}", None)
 
     log_dict_out, step_key = namespace_metrics(

@@ -6,6 +6,7 @@ import torch
 
 from miles.backends.training_utils.data.context_parallel import (
     all_gather_with_cp,
+    get_drgrpo_pgloss_reducer,
     get_local_response_loss_masks,
     get_sum_of_sample_mean,
 )
@@ -310,6 +311,29 @@ def policy_loss_function(
             args.qkv_format,
             max_seq_lens,
         )
+    elif getattr(args, "policy_loss_reduction", None) == "fixed_token_sum":
+        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        pg_loss_reducer = get_drgrpo_pgloss_reducer(
+            total_lengths,
+            response_lengths,
+            pg_loss_masks,
+            False,
+            args.qkv_format,
+            max_seq_lens,
+            fixed_normalizer=args.policy_loss_fixed_normalizer,
+        )
+    elif getattr(args, "policy_loss_reduction", None) == "group_token_mean":
+        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        pg_loss_reducer = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            pg_loss_masks,
+            False,
+            args.qkv_format,
+            max_seq_lens,
+            denominators=batch["policy_loss_denominators"],
+            min_denominator=1e-12,
+        )
     else:
         pg_loss_reducer = sum_of_sample_mean
 
@@ -326,6 +350,8 @@ def policy_loss_function(
         calculate_per_token_loss=args.calculate_per_token_loss,
     )
 
+    pos_clip_sum = pg_clipfrac[lld_pos].detach().sum()
+    neg_clip_sum = pg_clipfrac[lld_neg].detach().sum()
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     if pg_clipfrac_lower is not None:
@@ -404,6 +430,8 @@ def policy_loss_function(
         "ess_ratio": ess_ratio_sum.squeeze(),
         # LLD: (sum, count) of per-token ppo_kl split by advantage sign; log_train_step turns
         # each pair into the exact conditional mean train/lld_ppo_kl_{pos,neg}.
+        "pos_clip_sum": pos_clip_sum,
+        "neg_clip_sum": neg_clip_sum,
         "lld_pos_kl_sum": lld_pos_kl_sum,
         "lld_pos_kl_cnt": lld_pos_kl_cnt,
         "lld_neg_kl_sum": lld_neg_kl_sum,
