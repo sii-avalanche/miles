@@ -55,7 +55,7 @@ class AvaCoreRollout:
 
     async def generate(
         self, sample: Sample, sampling_params: dict[str, Any], *, evaluation: bool = False
-    ) -> Sample | list[Sample]:
+    ) -> list[Sample]:
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         if getattr(self.args, "rollout_top_logprobs_num", 0) and not evaluation:
@@ -80,12 +80,12 @@ class AvaCoreRollout:
                 if "finish_reason" in message.metadata
             ):
                 sample.status = Sample.Status.ABORTED
-                return sample
+                return [sample]
             reward = await self.reward_fn(traces[0], row)
         except RECOVERABLE_ERRORS as error:
             logger.warning("AvaCore rollout of sample %s aborted: %r", sample.index, error)
             sample.status = Sample.Status.ABORTED
-            return sample
+            return [sample]
 
         assert any(node.segments for node in iter_trace_nodes(traces)), (
             "AvaCore rollouts must drive the policy through a token-level client"
@@ -115,7 +115,13 @@ class AvaCoreRollout:
             write = asyncio.create_task(self.record(row, sample, traces, reward, sampling_params))
             self.writes.add(write)
             write.add_done_callback(self.writes.discard)
-        return samples[0] if len(samples) == 1 else samples
+        if len(samples) > 1:
+            rollout_id = sample.rollout_id if sample.rollout_id is not None else sample.index
+            if rollout_id is None:
+                raise ValueError("A compact AvaCore rollout needs an input index or rollout_id")
+            for output in samples:
+                output.rollout_id = rollout_id
+        return samples
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
