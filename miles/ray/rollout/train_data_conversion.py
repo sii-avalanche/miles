@@ -13,6 +13,7 @@ from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from miles.utils.timer import Timer
 from miles.utils.types import Sample
 
+
 logger = logging.getLogger(__name__)
 
 ROLLOUT_DATA_TENSOR_DTYPES = {
@@ -52,6 +53,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "num_microbatches": ValueSpec(codec="auto"),
     "micro_batch_indices": ValueSpec(codec="auto"),
     "num_rollouts": ValueSpec(codec="auto"),
+    "group_stream": ValueSpec(codec="auto"),
 }
 
 
@@ -472,6 +474,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
         # keys that need to be splited at train side
         for key in [
             "raw_reward",
+            "group_stream",
             "total_lengths",
             "dynamic_global_batch_size",
             "prompt_group_sizes",

@@ -48,6 +48,8 @@ from miles.utils.workers.naming import DEPLOY_INSTANCE_ID_MAX_LENGTH, DNS_LABEL_
 from miles.utils.workers.types import ClusterBackend, DeployComponent, WorkerCommBackend, resolve_worker_comm_backend
 from miles.utils.workers.worker_provider.static import parse_host_and_port
 
+from miles.utils.group_packing_config import add_group_packing_arguments, validate_group_packing
+
 logger = logging.getLogger(__name__)
 
 FULLY_ASYNC_ROLLOUT_PATH = "miles.rollout.fully_async_rollout.FullyAsyncRolloutFn"
@@ -2853,6 +2855,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_mtp_training_arguments(parser)
         parser = add_prefill_decode_disaggregation_arguments(parser)
         parser = add_ci_arguments(parser)
+        add_group_packing_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
         parser = add_user_provided_function_arguments(parser)
 
@@ -2978,6 +2981,7 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
         validate_kernel_backend_args(args)
 
     sglang_validate_args(args)
+    validate_group_packing(args)
 
     return args
 
