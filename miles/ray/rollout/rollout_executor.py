@@ -43,6 +43,8 @@ from miles.utils.tracking_utils.tracking import init_tracking
 from miles.utils.weight_version import assert_samples_weight_version_sane, assert_weight_version_is_published
 from miles.utils.workers.worker_provider.base import BaseWorkerProvider
 
+from miles.ray.rollout.group_publisher import GroupPublisher
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -118,6 +120,9 @@ class RolloutExecutor:
             logger.info(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
 
         self.rollout_id = -1
+        self._group_publishers = []
+        self._group_producer = None
+        self._group_publisher = None
         self._eval_lock = asyncio.Lock()
         self._eval_fleet: RolloutExecutorEvalFleet | None = None
 
@@ -129,6 +134,15 @@ class RolloutExecutor:
     # -------------------------- lifecycle -----------------------------
 
     async def dispose(self) -> None:
+        if self._group_producer is not None and not self._group_producer.done():
+            self._group_publisher.stream.fail(RuntimeError("Rollout executor disposed"))
+        if self._group_producer is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._group_producer), timeout=30)
+            except (Exception, asyncio.CancelledError):
+                logger.exception("Group producer stopped or did not drain during disposal")
+        for publisher in self._group_publishers:
+            publisher.release()
         if not self.use_legacy_rollout_v1 and self.generate_rollout is not None:
             await maybe_await(self.generate_rollout.dispose())
         if (close := getattr(self.data_source, "close", None)) is not None:
@@ -143,6 +157,8 @@ class RolloutExecutor:
 
     @event_logger_context(lambda _self, rollout_id, trainer_model_id=None: dict(rollout_id=rollout_id))
     async def get(self, rollout_id: int, trainer_model_id: str | None = None) -> RolloutDataPack:
+        if self.args.streaming_group_packing:
+            return await self._get_streaming(rollout_id, trainer_model_id)
         start_time = time.time()
         self.rollout_id = rollout_id
         self._rollouts_since_publish_of_model_id[trainer_model_id] += 1
@@ -254,7 +270,7 @@ class RolloutExecutor:
         if self.args.ci_test:
             raise RuntimeError(f"CI eval {rollout_id} skipped: {reason}")
 
-    async def _get_rollout_data(self, rollout_id, trainer_model_id: str | None = None):
+    async def _get_rollout_data(self, rollout_id, trainer_model_id: str | None = None, on_group_ready=None):
         if self.args.load_debug_rollout_data is not None:
             data, metadata = load_debug_rollout_data(self.args, rollout_id=rollout_id)
             metrics = None
@@ -267,6 +283,7 @@ class RolloutExecutor:
                         rollout_id=rollout_id,
                         weight_version=self._weight_versions_of_model_id.get(trainer_model_id),
                         trainer_model_id=trainer_model_id,
+                        on_group_ready=on_group_ready,
                     ),
                 )
             else:
@@ -289,6 +306,47 @@ class RolloutExecutor:
                 metrics = None
 
         return data, metadata, metrics
+
+    async def wait_for_group_producer(self):
+        """A first-group handle is not a generation barrier for weight publication."""
+        if self._group_producer is not None:
+            await self._group_producer
+
+    async def _get_streaming(self, rollout_id, trainer_model_id):
+        # One GenerateState is shared: finish its current batch before prefetching
+        # the next. Backward can already consume groups while this batch runs.
+        if self._group_producer is not None:
+            await self._group_producer
+        self.rollout_id = rollout_id
+        self._rollouts_since_publish_of_model_id[trainer_model_id] += 1
+        assert_weight_version_is_published(
+            self.args, rollouts_since_publish=self._rollouts_since_publish_of_model_id[trainer_model_id]
+        )
+        self._group_publishers = [p for p in self._group_publishers
+                                  if not (p.stream.directory / "released.json").exists()]
+        publisher = GroupPublisher(self.args, rollout_id)
+        self._group_publishers.append(publisher)
+        self._group_publisher = publisher
+        self._group_producer = asyncio.create_task(self._produce_groups(publisher, rollout_id, trainer_model_id))
+        try:
+            rows = await asyncio.to_thread(publisher.stream.wait, 0)
+            return RolloutDataPack.model_validate(rows[0]["pack"])
+        except BaseException as error:
+            publisher.stream.fail(error)
+            raise
+
+    async def _produce_groups(self, publisher, rollout_id, trainer_model_id):
+        started = time.monotonic()
+        try:
+            data, _, metrics = await self._get_rollout_data(
+                rollout_id, trainer_model_id, on_group_ready=publisher.publish
+            )
+            log_rollout_data(rollout_id, self.args, data, metrics, time.monotonic() - started,
+                             trainer_model_id=trainer_model_id)
+            publisher.finish(data)
+        except BaseException as error:
+            publisher.stream.fail(error)
+            raise
 
     # -------------------------- checkpointing -----------------------------
 

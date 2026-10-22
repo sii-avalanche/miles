@@ -20,6 +20,7 @@ from miles.utils.http_utils import get, post, router_worker_base_urls
 from miles.utils.misc import as_completed_async, call_agent_abort_hook
 from miles.utils.types import Sample
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,7 +92,8 @@ def submit_generate_tasks(
 
 
 async def generate_rollout_async(
-    state: GenerateState, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
+    state: GenerateState, rollout_id: int, data_source: Callable[[int], list[list[Sample]]],
+    *, on_group_ready: Callable[[list[Sample]], None] | None = None,
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     args = state.args
     assert args.rollout_global_dataset
@@ -153,6 +155,8 @@ async def generate_rollout_async(
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
+                if on_group_ready is not None:
+                    on_group_ready(group)
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
 
