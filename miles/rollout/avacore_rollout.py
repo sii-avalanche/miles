@@ -3,7 +3,7 @@ import copy
 import logging
 import os
 from argparse import Namespace
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import replace
 from math import isfinite
@@ -14,6 +14,7 @@ import numpy as np
 import pybase64
 from ava_core.config import interpolated, launch_converter
 from ava_core.core import Schema, Trace
+from ava_core.core.trace import iter_trace_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
 from ava_core.rewards import RewardFunction
@@ -74,8 +75,8 @@ class AvaCoreRollout:
                 raise TypeError("AvaCore generate must return a nonempty tuple of Trace objects")
             if any(
                 message.metadata["finish_reason"]["type"] == "abort"
-                for trace in traces
-                for message in trace.messages
+                for node in iter_trace_nodes(traces)
+                for message in (node.message,)
                 if "finish_reason" in message.metadata
             ):
                 sample.status = Sample.Status.ABORTED
@@ -86,14 +87,16 @@ class AvaCoreRollout:
             sample.status = Sample.Status.ABORTED
             return sample
 
-        # Match AvaCore's store: the first returned path owns a shared generated node.
+        assert any(node.segments for node in iter_trace_nodes(traces)), (
+            "AvaCore rollouts must drive the policy through a token-level client"
+        )
         owned: set[Trace] = set()
         samples = []
-        for trace in traces:
-            generated = [node for node in trace.prefixes if node.generated]
+        for trace in conversation_tips(traces):
+            generated = {node for node in trace.prefixes if node.generated}
             if any(not node.segments for node in generated):
                 raise ValueError("Training requires token-level segments for every generated turn")
-            if any(node not in owned for node in generated):
+            if generated - owned:
                 samples.append(
                     await asyncio.to_thread(
                         filled,
@@ -101,7 +104,7 @@ class AvaCoreRollout:
                         copy.deepcopy(sample),
                         trace,
                         reward.score,
-                        set(owned),
+                        owned=set(owned),
                         evaluation=evaluation,
                     )
                 )
@@ -190,13 +193,24 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     )
 
 
+def conversation_tips(traces: tuple[Trace, ...]) -> Iterator[Trace]:
+    tips = {}
+    for node in iter_trace_nodes(traces):
+        tips.pop(node.prev, None)
+        tips[node] = None
+    for trace in dict.fromkeys(traces):
+        tips.pop(trace, None)
+        yield trace
+    yield from tips
+
+
 def filled(
     args: Namespace,
     sample: Sample,
     trace: Trace,
     reward: float,
-    owned: set[Trace] | None = None,
     *,
+    owned: set[Trace] | None = None,
     evaluation: bool = False,
 ) -> Sample:
     owned = owned or set()
