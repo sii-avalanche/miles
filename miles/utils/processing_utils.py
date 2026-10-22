@@ -177,7 +177,21 @@ def process_vision_info(prompt, processor):
     else:
         logger.info(f"Using default patch size: {DEFAULT_PATCH_SIZE}")
         image_patch_size = DEFAULT_PATCH_SIZE
-    images, videos = qwen_process_vision_info(prompt, image_patch_size=image_patch_size)
+    # Qwen's loader expects a URL string; OpenAI messages wrap it in {"url": ...}.
+    # Keep the original messages intact for AvaCore's chat template and trace.
+    vision_prompt = []
+    for message in prompt:
+        content = message.get("content")
+        if isinstance(content, list):
+            content = [
+                {**part, "image_url": part["image_url"]["url"]}
+                if isinstance(part, dict) and isinstance(part.get("image_url"), dict)
+                else part
+                for part in content
+            ]
+            message = {**message, "content": content}
+        vision_prompt.append(message)
+    images, videos = qwen_process_vision_info(vision_prompt, image_patch_size=image_patch_size)
     multimodal_inputs = {"images": images, "videos": videos}
     return multimodal_inputs
 

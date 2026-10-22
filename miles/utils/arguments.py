@@ -423,6 +423,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_train_arguments(parser):
+            for component in ("model", "projection"):
+                parser.add_argument(
+                    f"--freeze-vision-{component}",
+                    action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help=f"Freeze the vision {component}; omitted preserves the Megatron Bridge provider default.",
+                )
+            for component in ("model", "projection"):
+                parser.add_argument(
+                    f"--vision-{component}-modules", nargs="+", default=None,
+                    help="Exact module paths on the Megatron model; supply both vision path lists to override Bridge.",
+                )
             parser.add_argument(
                 "--train-backend",
                 type=str,
@@ -2977,6 +2989,14 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
         validate_hybrid_shard_args(args)
         validate_kernel_backend_args(args)
 
+    vision_paths = (args.vision_model_modules, args.vision_projection_modules)
+    if any(paths is not None for paths in vision_paths) and not all(vision_paths):
+        raise ValueError("Supply both nonempty vision module lists so nested projection boundaries are explicit")
+    if any(paths is not None for paths in vision_paths) or any(
+        getattr(args, name, None) is not None for name in ("freeze_vision_model", "freeze_vision_projection")
+    ):
+        if args.train_backend != "megatron" or args.megatron_to_hf_mode != "bridge" or args.custom_model_provider_path:
+            raise ValueError("Vision freeze options require the built-in Megatron Bridge model provider")
     sglang_validate_args(args)
 
     return args
