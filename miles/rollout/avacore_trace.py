@@ -1,18 +1,53 @@
 """Lossless durable snapshots of AvaCore message DAGs and legacy rollout records."""
 
-from dataclasses import replace
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, cast
 
 from ava_core.core import ChatMessage, Trace, Tool
-from ava_core.core.training_trace import (
-    _segment,
-    graph_nodes as graph_nodes,
-    restore_traces as restore_traces,
-    snapshot_traces as snapshot_traces,
+from ava_core.core.segment import ChatSegment, Tokenizer
+from ava_core.core.trace import (
+    decode_traces as restore_traces,
+    encode_traces as snapshot_traces,
+    iter_trace_nodes,
 )
 from ava_core.generate.core import Sample as Row
 from ava_core.rewards.core import Reward
 from ava_core.store.core import STORED
+
+__all__ = ["conversation_tips", "graph_nodes", "restore_traces", "snapshot_traces", "write_record"]
+
+
+def graph_nodes(traces: tuple[Trace, ...]) -> list[Trace]:
+    return list(iter_trace_nodes(traces))
+
+
+@dataclass(frozen=True)
+class _StoredTokenizer:
+    """Keep legacy segment text available when dataclasses.replace clears caches."""
+
+    template: str
+
+    def decode(self, _tokens, **_kwargs):
+        return self.template
+
+
+def _segment(data: dict[str, Any]) -> ChatSegment:
+    """Restore a segment from a legacy flat rollout without retokenizing it."""
+    tokens, probs = data["tokens"], data["log_probs"]
+    if len(tokens) != len(probs):
+        raise ValueError("Stored token and log-probability lengths differ")
+    if any(p is None for p in probs) and any(p is not None for p in probs):
+        raise ValueError("A segment mixes prompt and generated log-probabilities")
+    segment = ChatSegment(
+        tokens=tuple(tokens),
+        _log_probs=tuple(probs) if probs and probs[0] is not None else None,
+        is_generated=data["is_generated"],
+        tokenizer=cast(Tokenizer, _StoredTokenizer(data["template"])),
+        metadata=data.get("metadata", {}),
+    )
+    object.__setattr__(segment, "template", data["template"])
+    object.__setattr__(segment, "metadata", data.get("metadata", {}))
+    return segment
 
 
 def conversation_tips(traces: tuple[Trace, ...]) -> list[Trace]:

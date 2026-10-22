@@ -181,6 +181,12 @@ class AvaCoreRollout:
             if generated - owned:
                 samples.append(filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned))
                 owned.update(generated)
+        if len(samples) > 1:
+            # Compaction and source branches are fragments of one sampled episode.
+            rollout_id = sample.rollout_id if sample.rollout_id is not None else sample.index
+            assert rollout_id is not None, "AvaCore multi-fragment rollouts require Sample.rollout_id or Sample.index"
+            for fragment in samples:
+                fragment.rollout_id = rollout_id
         return samples[0] if len(samples) == 1 else samples
 
     def _record_perf_snapshot(self) -> dict[str, float]:
