@@ -17,6 +17,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
+from miles.backends.megatron_utils.vision_freeze import freeze_vision_modules
 from miles.utils.audit_utils.witness.module import install_witness
 from miles.utils.function_registry import load_function
 from miles.utils.replay_base import routing_replay_manager
@@ -37,6 +38,14 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     parallelism, memory, and numerics settings that really come from args. Put
     new training flags here, not spread across the code.
     """
+    # Bridge owns module boundaries: projections may live inside the vision tower.
+    for name in ("freeze_vision_model", "freeze_vision_projection"):
+        value = getattr(args, name, None)
+        if value is not None and not getattr(args, "vision_model_modules", None):
+            if not hasattr(provider, name):
+                raise ValueError(f"{type(provider).__name__} does not support {name}")
+            setattr(provider, name, value)
+
     # parallelism / sharding
     provider.tensor_model_parallel_size = args.tensor_model_parallel_size
     provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
@@ -48,6 +57,10 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     # loss / sequence handling
     provider.calculate_per_token_loss = args.calculate_per_token_loss  # CP>1 VL models assert this
     provider.variable_seq_lengths = args.variable_seq_lengths
+
+    # An explicit zero disables draft layers for policy-only training.
+    if getattr(args, "mtp_num_layers", None) is not None:
+        provider.mtp_num_layers = args.mtp_num_layers
 
     # Match the non-bridge path: MTP must only train its own draft parameters.
     if getattr(args, "enable_mtp_training", False):
@@ -191,6 +204,23 @@ def get_model_provider_func(
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
             model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+            if getattr(args, "vision_model_modules", None):
+                # Explicit boundaries override provider freezing, before DDP/optimizer construction.
+                freeze_vision_modules(
+                    model,
+                    tower_paths=args.vision_model_modules,
+                    projection_paths=args.vision_projection_modules,
+                    freeze_tower=(
+                        args.freeze_vision_model
+                        if args.freeze_vision_model is not None
+                        else getattr(provider, "freeze_vision_model", True)
+                    ),
+                    freeze_projection=(
+                        args.freeze_vision_projection
+                        if args.freeze_vision_projection is not None
+                        else getattr(provider, "freeze_vision_projection", True)
+                    ),
+                )
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=1, config=model.config
