@@ -3,7 +3,7 @@ import copy
 import logging
 import os
 from argparse import Namespace
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -12,7 +12,7 @@ import numpy as np
 import pybase64
 from ava_core.config import interpolated, launch_converter
 from ava_core.core import Schema, Trace
-from ava_core.core.training_trace import graph_nodes
+from ava_core.core.trace import iter_trace_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
 from ava_core.rewards import RewardFunction
@@ -37,7 +37,6 @@ class AvaCoreRollout:
         self.config = config
         conv = launch_converter()
         self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
-        self._remote_generate = self.generate_fn if config["generate"].get("kind") == "remote" else None
         self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
@@ -52,7 +51,7 @@ class AvaCoreRollout:
             traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
             if any(
                 message.metadata["finish_reason"]["type"] == "abort"
-                for node in graph_nodes(traces)
+                for node in iter_trace_nodes(traces)
                 for message in (node.message,)
                 if "finish_reason" in message.metadata
             ):
@@ -64,7 +63,7 @@ class AvaCoreRollout:
             sample.status = Sample.Status.ABORTED
             return sample
 
-        assert traces and any(node.segments for node in graph_nodes(traces)), (
+        assert traces and any(node.segments for node in iter_trace_nodes(traces)), (
             "AvaCore rollouts must drive the policy through a token-level client"
         )
         if self.recording is not None:
@@ -78,17 +77,6 @@ class AvaCoreRollout:
                 samples.append(filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned))
                 owned.update(generated)
         return samples[0] if len(samples) == 1 else samples
-
-    async def close(self) -> None:
-        if self._remote_generate is not None:
-            await self._remote_generate.aclose()
-
-    async def dispose(self) -> None:
-        loop = getattr(self._remote_generate, "loop", None) or asyncio.get_running_loop()
-        if loop is asyncio.get_running_loop():
-            await self.close()
-        else:
-            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.close(), loop))
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
@@ -156,11 +144,16 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     return GenerateFnOutput(samples=await rollout.generate(input.sample, input.sampling_params))
 
 
-def conversation_tips(traces: tuple[Trace, ...]) -> list[Trace]:
-    nodes = graph_nodes(traces)
-    parents = {node.prev for node in nodes}
+def conversation_tips(traces: tuple[Trace, ...]) -> Iterator[Trace]:
+    tips = {}
+    for node in iter_trace_nodes(traces):
+        tips.pop(node.prev, None)
+        tips[node] = None
     # Match the store's ownership order: listed traces first, source-only tips next.
-    return list(dict.fromkeys((*traces, *(node for node in nodes if node not in parents and node not in traces))))
+    for trace in dict.fromkeys(traces):
+        tips.pop(trace, None)
+        yield trace
+    yield from tips
 
 
 def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, *, owned: set[Trace] | None = None) -> Sample:
