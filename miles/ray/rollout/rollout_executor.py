@@ -8,6 +8,7 @@ from typing import Any
 from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, RolloutExecutorEvalFleet
+from miles.ray.rollout.local_data import LocalRolloutData
 from miles.ray.rollout.metrics import log_eval_rollout_data, log_eval_skip, log_rollout_data
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
 from miles.ray.rollout.router_manager import resolve_router_addrs, wait_session_server_ready
@@ -66,6 +67,7 @@ class RolloutExecutor:
         configure_logger(args, source=SimpleProcessIdentity(component="rollout_executor"))
 
         self.args = args
+        self.local_data = LocalRolloutData(args)
         # set by the training actor after each weight update, keyed by trainer model id (None for one policy)
         self._weight_versions_of_model_id: dict[str | None, int] = {}
         self._rollouts_since_publish_of_model_id: dict[str | None, int] = defaultdict(int)
@@ -155,6 +157,7 @@ class RolloutExecutor:
             data, metadata, metrics = await self._get_rollout_data(
                 rollout_id=rollout_id, trainer_model_id=trainer_model_id
             )
+        self.local_data.save(data, metadata, rollout_id=rollout_id, trainer_model_id=trainer_model_id)
         save_debug_rollout_data(
             self.args,
             data,
@@ -255,7 +258,12 @@ class RolloutExecutor:
             raise RuntimeError(f"CI eval {rollout_id} skipped: {reason}")
 
     async def _get_rollout_data(self, rollout_id, trainer_model_id: str | None = None):
-        if self.args.load_debug_rollout_data is not None:
+        if self.local_data.load_path is not None:
+            data, metadata = self.local_data.load(
+                rollout_id, train_parallel_config=self._train_parallel_configs_of_model_id[trainer_model_id]
+            )
+            metrics = None
+        elif self.args.load_debug_rollout_data is not None:
             data, metadata = load_debug_rollout_data(self.args, rollout_id=rollout_id)
             metrics = None
         else:

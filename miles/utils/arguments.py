@@ -40,6 +40,7 @@ from miles.utils.object_store_config import (
     compute_mooncake_init_kwargs_vanilla,
 )
 from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_args
+from miles.utils.rollout_data_args import add_rollout_data_arguments, resolve_rollout_data_arguments
 from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
 from miles.utils.score_centering import validate_score_centering_args
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
@@ -2171,6 +2172,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         # debug
         def add_debug_arguments(parser):
+            add_rollout_data_arguments(parser)
             parser.add_argument(
                 "--save-debug-rollout-data",
                 type=str,
@@ -3630,6 +3632,7 @@ def miles_validate_args(args):
     if args.save_debug_event_data is None and args.save is not None:
         args.save_debug_event_data = f"{args.save}/{EVENTS_DIRNAME}"
 
+    resolve_rollout_data_arguments(args)
     if args.load_debug_rollout_data is not None:
         logger.info(
             f"load_debug_rollout_data {args.load_debug_rollout_data} is set, "
