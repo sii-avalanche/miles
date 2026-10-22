@@ -45,6 +45,9 @@ class AvaCoreRollout:
         self.failed_writes = 0
 
     async def generate(self, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
+        # Compact siblings of one episode share rollout_id (validate_compact_rollout_ids); every
+        # return below is a list, not a bare Sample, so the batch stays uniformly nested for the flatten.
+        sample.rollout_id = sample.index
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         try:
@@ -56,12 +59,12 @@ class AvaCoreRollout:
                 if "finish_reason" in message.metadata
             ):
                 sample.status = Sample.Status.ABORTED
-                return sample
+                return [sample]
             reward = await self.reward_fn(traces[0], row)
         except RECOVERABLE_ERRORS as error:
             logger.warning("AvaCore rollout of sample %s aborted: %r", sample.index, error)
             sample.status = Sample.Status.ABORTED
-            return sample
+            return [sample]
 
         assert traces and any(node.segments for node in iter_trace_nodes(traces)), (
             "AvaCore rollouts must drive the policy through a token-level client"
@@ -76,7 +79,7 @@ class AvaCoreRollout:
             if generated - owned:
                 samples.append(filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned))
                 owned.update(generated)
-        return samples[0] if len(samples) == 1 else samples
+        return samples
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
