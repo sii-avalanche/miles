@@ -3,7 +3,6 @@ import logging
 import time
 from collections import defaultdict
 from collections.abc import Sequence
-from statistics import pstdev
 from typing import Any
 
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
@@ -34,7 +33,6 @@ from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.data import RolloutDataPack
 from miles.utils.environ import use_legacy_rollout_v1
 from miles.utils.function_registry import load_function
-from miles.utils.metric_utils import compute_statistics
 from miles.utils.hf_utils.config import is_complete_hf_export
 from miles.utils.http_utils import init_http_client
 from miles.utils.init_once import InitOnce, init_once
@@ -175,7 +173,9 @@ class RolloutExecutor:
                     metrics.update(expert_load_metrics(data, layer=layer, num_experts=self.args.num_experts))
             except Exception:
                 logger.warning("Expert telemetry failed; this batch has no expert metrics", exc_info=True)
-        samples = data
+        log_rollout_data(
+            rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
+        )
         with self._monitor.phase("convert_batch", rollout_id=rollout_id):
             data = convert_samples_to_train_data(
                 self.args,
@@ -184,15 +184,6 @@ class RolloutExecutor:
                 custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
                 custom_reward_post_process_func=self.custom_reward_post_process_func,
             )
-        if getattr(self.args, "rl_algorithm", None):
-            metrics.update({f"rollout/group_advantage/{k}": v for k, v in compute_statistics(data["rewards"]).items()})
-            metrics["rollout/group_advantage/std"] = pstdev(data["rewards"])
-        for key in ("length_penalty", "shaped_reward"):
-            if key in data:
-                metrics.update({f"rollout/{key}/{k}": v for k, v in compute_statistics(data[key]).items()})
-        log_rollout_data(
-            rollout_id, self.args, samples, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
-        )
         sample_indices = data.get("sample_indices")
         with self._monitor.phase("object_store_put", rollout_id=rollout_id):
             if self.args.delay_split_train_data_by_dp:
