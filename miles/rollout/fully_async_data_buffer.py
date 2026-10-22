@@ -244,7 +244,9 @@ class DefaultDataBuffer(DataBuffer):
     async def put(self, input: DataBufferInput) -> None:
         self._monitor.increment(f"{self._perf_prefix}/groups_seen_total")
         self._monitor.increment(f"workload/{workload_of(input.prompt_group[0], self._args)}/groups_seen_total")
-        if not self._preput_filter(input):
+        keep = self._preput_filter(input)
+        self._metric_gatherer.on_filter_result(self._args, keep=keep)
+        if not keep:
             return
 
         async with self._cond:

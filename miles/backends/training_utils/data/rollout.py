@@ -56,6 +56,10 @@ def get_rollout_data(
         rollout_data["rollout_mask_sums"] = torch.tensor(
             rollout_data["rollout_mask_sums"], dtype=torch.float32, device=torch.cuda.current_device()
         )
+    if "policy_loss_denominators" in rollout_data:
+        rollout_data["policy_loss_denominators"] = torch.tensor(
+            rollout_data["policy_loss_denominators"], dtype=torch.float32, device=torch.cuda.current_device()
+        )
     if args.enable_witness:
         seq_witness_ids = rollout_data.pop("seq_witness_ids")
         rollout_data["witness_ids"] = [
@@ -207,6 +211,8 @@ def get_batch(
     # fetch it here so callers don't have to know. None for non-multi-LoRA runs.
     if "adapter_slots" not in keys:
         keys = [*keys, "adapter_slots"]
+    if "policy_loss_denominators" in data_iterator.rollout_data and "policy_loss_denominators" not in keys:
+        keys = [*keys, "policy_loss_denominators"]
     batch = data_iterator.get_next(keys)
 
     if "dynamic_global_batch_size" in data_iterator.rollout_data:

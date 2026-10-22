@@ -41,6 +41,8 @@ class MetricGatherer:
         self._dynamic_filter_drop_reason_count = defaultdict(lambda: 0)
         self._unfiltered_reward_sum = 0.0
         self._unfiltered_reward_count = 0
+        self._groups_seen = self._groups_kept = 0
+        self._budget_seen = self._budget_kept = 0
 
     def on_group_before_dynamic_filter(self, args: argparse.Namespace, group: list) -> None:
         for sample in _iter_group_samples(group):
@@ -58,11 +60,27 @@ class MetricGatherer:
             return
         self._dynamic_filter_drop_reason_count[reason] += 1
 
+    def on_filter_result(self, args, *, keep: bool):
+        self._groups_seen += 1
+        self._groups_kept += int(keep)
+        self._budget_seen += 1
+        self._budget_kept += int(keep)
+        if self._budget_kept >= args.rollout_batch_size:
+            self._budget_seen = self._budget_kept = 0
+        limit = getattr(args, "dynamic_sampling_max_groups", 0) or 0
+        if limit and self._budget_seen >= limit:
+            raise RuntimeError(
+                f"Dynamic sampling exhausted {limit} groups: accepted "
+                f"{self._budget_kept}/{args.rollout_batch_size}; check raw rewards and filter settings"
+            )
+
     def collect(self):
         metrics = {
             f"rollout/dynamic_filter_drop_{reason}": count
             for reason, count in self._dynamic_filter_drop_reason_count.items()
         }
+        if self._groups_seen:
+            metrics["rollout/group_acceptance_rate"] = self._groups_kept / self._groups_seen
         if self._unfiltered_reward_count:
             metrics["rollout/raw_reward_unfiltered"] = self._unfiltered_reward_sum / self._unfiltered_reward_count
         return metrics

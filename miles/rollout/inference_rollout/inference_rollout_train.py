@@ -177,6 +177,11 @@ async def _generate_rollout_async(
             all_data.append(group)
             metric_gatherer.on_group_before_dynamic_filter(args, group)
             filter_output = apply_preput_filters(args, dynamic_filter, group)
+            try:
+                metric_gatherer.on_filter_result(args, keep=filter_output.keep)
+            except RuntimeError:
+                await abort(state, pendings, rollout_id)
+                raise
             if not filter_output.keep:
                 monitor.increment("batch/groups_rejected_total")
                 monitor.event("buffer_reject", rollout_id=rollout_id)
