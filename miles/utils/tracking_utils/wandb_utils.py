@@ -9,6 +9,34 @@ from miles.utils.env_report.launcher_report import read_launcher_report
 
 logger = logging.getLogger(__name__)
 
+# Shared-mode workers do not upload the run's metric configuration. Globs only
+# expand after a local log call, so declare common worker metrics on the primary
+# even though it never logs their values. Keep globs below for custom metrics.
+_WORKER_METRICS = {
+    "train": """
+        loss pg_loss entropy_loss kl_loss grad_norm ppo_kl pg_clipfrac pg_clipfrac_lower
+        pg_clipfrac_pos pg_clipfrac_neg train_rollout_kl train_rollout_logprob_abs_diff
+        tis tis_abs tis_clipfrac ois ess_ratio opsm_clipfrac opd_reverse_kl
+        lld_ppo_kl_pos lld_ppo_kl_neg mtp_loss mtp_1_loss lr-pg_0 lr-pg_1 lr-pg_2
+        critic-loss critic-value_loss critic-value_clipfrac critic-grad_norm critic-lr-pg_0
+    """,
+    "rollout": """
+        raw_reward raw_reward_unfiltered rewards response_lengths total_lengths
+        repetition_frac truncated_ratio group_reward_variance_mean group_reward_variance_max
+        zero_std/all_zero_percentage zero_std/all_one_percentage
+        log_probs ref_log_probs rollout_log_probs teacher_log_probs entropy correct_entropy
+        advantages returns values logp_preferred logp_dispreferred frac_preferred
+        weight_version/mixed_version_ratio prefix_cache_hit_rate
+        dynamic_filter_drop_group_has_aborted dynamic_filter_drop_zero_std_0.0 dynamic_filter_drop_zero_std_1.0
+    """,
+    "perf": """
+        rollout_time actor_train_time train_time train_wait_time update_weights_time step_time wait_time_ratio
+        log_probs_time ref_log_probs_time log_probs_tflops ref_log_probs_tflops
+        tokens_per_gpu_per_sec effective_tokens_per_gpu_per_sec actor_train_tok_per_s
+        actor_train_mfu actor_train_tflops mfu_peak_tflops
+    """,
+}
+
 
 def _is_offline_mode(args) -> bool:
     """Detect whether W&B should run in offline mode.
@@ -171,3 +199,10 @@ def _init_wandb_common():
     wandb.define_metric("eval/step")
     wandb.define_metric("eval/*", step_metric="eval/step")
     wandb.define_metric("perf/*", step_metric="rollout/step")
+    for prefix, names in _WORKER_METRICS.items():
+        step_metric = "train/step" if prefix == "train" else "rollout/step"
+        for name in names.split():
+            wandb.define_metric(f"{prefix}/{name}", step_metric=step_metric, step_sync=False)
+    for prefix in ("response_len", "weight_version", "log_prob/token", "log_prob/sample_mean"):
+        for statistic in ("min", "mean", "median", "max"):
+            wandb.define_metric(f"rollout/{prefix}/{statistic}", step_metric="rollout/step", step_sync=False)
