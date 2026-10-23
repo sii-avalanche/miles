@@ -17,6 +17,8 @@ from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import Reward
+from ava_core.rewards.credit_resolution import build_credit_context, steps_from_dict
+from ava_core.rewards.feedback import as_reward, feedback_from_reward
 from ava_core.runner import RECOVERABLE_ERRORS
 from ava_core.store.core import STORED, Run
 from ava_core.store.postgres import PostgresBackend
@@ -24,6 +26,7 @@ from ava_core.store.postgres import PostgresBackend
 from miles.utils.recording.outbox import DurableRolloutOutbox, _atomic_json
 from miles.rollout.avacore_trace import conversation_tips, graph_nodes, snapshot_traces, write_record
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.rollout.credit_assignment import fill_credit_assignment
 from miles.rollout.generate_utils.sampling_mask import (
     append_forced_sampling_tokens,
     append_sampling_metadata,
@@ -121,7 +124,8 @@ class AvaCoreRollout:
         if self.recording is None:
             raise ValueError("Inherited rollouts require recording")
         identity = {
-            "model": self.recording["model"], "run": self.recording["run"],
+            "model": self.recording["model"],
+            "run": self.recording["run"],
             "collection": Path(self.args.prompt_data).stem,
         }
         reuse = self.recording.get("expected_run_id") is not None or any(
@@ -165,7 +169,7 @@ class AvaCoreRollout:
                 sample.status = Sample.Status.ABORTED
                 return sample
             with self._monitor.wait("sample/reward"):
-                reward = await self.reward_fn(traces[0], row)
+                reward = as_reward(await self.reward_fn(traces[0], row))
         except RECOVERABLE_ERRORS as error:
             self._monitor.increment("sample/recoverable_errors_total")
             logger.warning("AvaCore rollout of sample %s aborted: %r", sample.index, error)
@@ -184,19 +188,33 @@ class AvaCoreRollout:
             except asyncio.CancelledError:
                 await persist
                 raise
-        if getattr(self.args, "curriculum_enabled", False) and not evaluation and reward.metadata.get("grader_invalid"):
+        if (
+            getattr(self.args, "curriculum_enabled", False)
+            and not evaluation
+            and reward.metadata.get("grader_invalid")
+        ):
             # The judge's fallback zero is not an observed failure. Keep its audit
             # record, but exclude this group from SEC feedback and training.
             sample.status = Sample.Status.ABORTED
             sample.metadata = {**sample.metadata, "grader_invalid": True}
             return sample
         samples, owned = [], set()
+        feedback = feedback_from_reward(reward)
+        context = None
+        if (
+            feedback.credits
+            or "reward_feedback" in reward.metadata
+            or getattr(self.args, "credit_mode", "none") != "none"
+        ):
+            context = build_credit_context(traces, steps=steps_from_dict(feedback.metadata.get("credit_steps")))
         for tip in conversation_tips(traces):
             generated = {node for node in tip.prefixes if node.generated and node.segments}
             if generated - owned:
                 samples.append(
                     filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned, evaluation=evaluation)
                 )
+                if context is not None:
+                    fill_credit_assignment(samples[-1], tip, reward, context)
                 owned.update(generated)
         if len(samples) > 1:
             # Compaction and source branches are fragments of one sampled episode.
@@ -231,11 +249,20 @@ class AvaCoreRollout:
         if (expected_id := self.recording.get("expected_run_id")) is not None:
             existing = await store.get_run(expected_id)
             identity = (
-                existing.kind, existing.model, existing.run, existing.collection,
-                existing.model_step, existing.collection_version,
+                existing.kind,
+                existing.model,
+                existing.run,
+                existing.collection,
+                existing.model_step,
+                existing.collection_version,
             )
             if identity != (
-                "rl", self.recording["model"], self.recording["run"], Path(self.args.prompt_data).stem, None, None
+                "rl",
+                self.recording["model"],
+                self.recording["run"],
+                Path(self.args.prompt_data).stem,
+                None,
+                None,
             ):
                 raise ValueError("Recording identity differs from expected_run_id")
         run = await self.stack.enter_async_context(

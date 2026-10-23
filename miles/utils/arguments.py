@@ -25,6 +25,7 @@ from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
 from miles.rollout.curriculum_config import add_curriculum_arguments, uses_persistent_rollout, validate_curriculum_args
 from miles.utils.audit_utils.event_logger.logger import EVENTS_DIRNAME
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
+from miles.utils.credit_assignment import add_credit_arguments, validate_credit_args
 from miles.utils.env_report.launcher_report import LAUNCHER_REPORT_ENV_VAR
 from miles.utils.environ import use_legacy_rollout_v1
 from miles.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
@@ -2960,6 +2961,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_train_arguments(parser)
         parser = add_rollout_arguments(parser)
         parser = add_curriculum_arguments(parser)
+        parser = add_credit_arguments(parser)
         parser = add_fault_tolerance_arguments(parser)
         parser = add_data_arguments(parser)
         parser = add_eval_arguments(parser)
@@ -4014,6 +4016,7 @@ def miles_validate_args(args):
         )
 
     validate_curriculum_args(args)
+    validate_credit_args(args)
     _resolve_rollout_functions(args)
 
     # Both snapshot postures drive the same RolloutManager._eval_checkpoint path.

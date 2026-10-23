@@ -90,6 +90,8 @@ class Sample:
     response_length: int = 0
     label: str | None = None
     reward: float | dict[str, Any] | None = None
+    # JSON-safe post-rollout annotations and resolved response-relative token spans.
+    credit_assignment: dict[str, Any] | None = None
     loss_mask: list[int] | None = None
     weight_versions: list[WeightVersionsPerCall] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
@@ -357,6 +359,7 @@ class Sample:
         self.response = ""
         self.response_length = 0
         self.reward = None
+        self.credit_assignment = None
         self.loss_mask = None
         self.weight_versions = []
         self.rollout_log_probs = None

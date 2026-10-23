@@ -7,6 +7,7 @@ from miles.rollout.generate_utils.rollout_topk_logprobs import validate_rollout_
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
 from miles.utils.group_advantages import normalize_group_rewards
+from miles.utils.credit_assignment import token_fingerprint
 from miles.utils.lora.utils import is_multi_lora_enabled
 from miles.utils.object_store import ValueSpec
 from miles.utils.routed_experts import resolve_routed_experts
@@ -47,6 +48,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "multimodal_train_inputs": ValueSpec(codec="ragged_tensor_dict"),
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
+    "credit_assignment": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
     "raw_reward": ValueSpec(codec="auto"),
     "length_penalty": ValueSpec(codec="auto"),
@@ -109,13 +111,30 @@ def convert_samples_to_train_data(
         if sample.loss_mask is None:
             sample.loss_mask = [1] * sample.response_length
 
-        assert (
-            len(sample.loss_mask) == sample.response_length
-        ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+        assert len(sample.loss_mask) == sample.response_length, (
+            f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+        )
         if sample.remove_sample:
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
+    if (
+        any(sample.credit_assignment is not None for sample in samples)
+        or getattr(args, "credit_mode", "none") != "none"
+    ):
+        train_data["credit_assignment"] = [
+            sample.credit_assignment
+            or {
+                "version": 1,
+                "reward": raw_rewards[i],
+                "annotations": [],
+                "spans": [],
+                "ignored": [],
+                "token_hash": token_fingerprint(sample.tokens),
+                "response_length": sample.response_length,
+            }
+            for i, sample in enumerate(samples)
+        ]
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
     if getattr(args, "policy_loss_reduction", None) == "group_token_mean":
@@ -268,9 +287,9 @@ def _reward_group_segments(args: Any, samples: list[Sample], prompt_group_sizes:
     """Return the flattened row indices for each prompt reward group."""
     # Multi-LoRA records explicit prompt boundaries before flattening.
     if prompt_group_sizes is not None:
-        assert sum(prompt_group_sizes) == len(
-            samples
-        ), f"prompt group sizes sum to {sum(prompt_group_sizes)}, but got {len(samples)} rewards"
+        assert sum(prompt_group_sizes) == len(samples), (
+            f"prompt group sizes sum to {sum(prompt_group_sizes)}, but got {len(samples)} rewards"
+        )
         groups: list[list[int]] = []
         start = 0
         for size in prompt_group_sizes:
@@ -519,6 +538,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "adapter_slots",
             "loss_weights",
             "advantages",
+            "credit_assignment",
             "target_tokens",
         ]:
             if key not in data:

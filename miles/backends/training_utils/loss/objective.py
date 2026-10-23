@@ -4,6 +4,7 @@ from torch.utils.checkpoint import checkpoint
 
 from miles.backends.training_utils.data.context_parallel import get_local_response_loss_masks, get_sum_of_sample_mean
 from miles.backends.training_utils.loss.hub.advantages import compute_advantages, normalize_advantages
+from miles.backends.training_utils.loss.credit_shaping import shape_token_advantages
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values  # noqa: F401
 from miles.backends.training_utils.loss.hub.losses import get_loss_function
 from miles.backends.training_utils.loss.hub.math_utils import compute_approx_kl
@@ -121,6 +122,9 @@ def compute_advantages_and_returns(
     if args.normalize_advantages:
         advantages = normalize_advantages(args, advantages, loss_masks, total_lengths, response_lengths, max_seq_lens)
 
+    # Baseline whitening stays unchanged. Shaping afterward preserves coefficient
+    # mass in the actual optimizer input rather than only before normalization.
+    advantages = shape_token_advantages(args, rollout_data, advantages)
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
 
