@@ -20,6 +20,18 @@ fields depend on backend and config):
 When `--use-wandb` is set, metrics also go to wandb under the `train/`, `rollout/`,
 and `perf/` namespaces (see `miles/utils/tracking_utils/wandb_utils.py`).
 
+Use `train/step` for training curves such as `train/entropy_loss`, and `rollout/step`
+for rollout curves such as `rollout/entropy` and per-rollout `perf/` measurements.
+Runtime monitoring uses `runtime/time_s` (elapsed seconds). W&B's internal `_step`
+is not the optimizer step, especially when multiple processes share a run.
+
+Common worker metrics are explicitly defined during primary initialization: wildcard
+definitions alone only expand when that process logs a matching metric, while shared
+workers do not upload the run's metric configuration. Each metric and its custom step
+are logged together. For an existing run or saved chart, select `train/step` or
+`rollout/step` as its X axis; updating the code does not rewrite saved chart settings
+or historical run metadata.
+
 ## Enabling wandb
 
 ```bash
