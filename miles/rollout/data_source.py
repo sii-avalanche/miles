@@ -8,9 +8,12 @@ from pathlib import Path
 
 import torch
 
+from miles.rollout.continuous_sec import METADATA_KEY, ContinuousSEC, curriculum_records
+from miles.rollout.curriculum_config import SECConfig
 from miles.utils.data import Dataset
 from miles.utils.function_registry import load_function
 from miles.utils.processing_utils import load_processor, load_tokenizer
+from miles.utils.perf_monitor import get_monitor
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -83,6 +86,7 @@ class RolloutDataSource(DataSource):
         self.metadata = {}
         self.system_prompt = None
         self.tokenizer = None
+        self.curriculum = None
         if args.rollout_global_dataset:
             tokenizer = load_tokenizer(
                 args.hf_checkpoint, chat_template_path=args.chat_template_path, trust_remote_code=True
@@ -108,6 +112,13 @@ class RolloutDataSource(DataSource):
                         if prefilter_fn(args, record):
                             yield record
 
+            if getattr(args, "curriculum_enabled", False):
+                original_filter = data_filter
+
+                def data_filter(records):
+                    filtered = original_filter(records) if original_filter is not None else records
+                    return curriculum_records(args, filtered)
+
             self.dataset = Dataset(
                 args.prompt_data,
                 tokenizer=tokenizer,
@@ -127,6 +138,18 @@ class RolloutDataSource(DataSource):
                 self.dataset.shuffle(self.epoch_id)
 
             self.tokenizer = tokenizer
+            if getattr(args, "curriculum_enabled", False):
+                self.curriculum = ContinuousSEC(
+                    [sample.metadata[METADATA_KEY] for sample in self.dataset.origin_samples],
+                    config=SECConfig.from_args(args), seed=self.seed,
+                    standardize=args.grpo_std_normalization, quantile=args.quantile_k,
+                )
+                self._curriculum_prompts = {
+                    sample.metadata[METADATA_KEY]["question_id"]: sample for sample in self.dataset.origin_samples
+                }
+                if len(self._curriculum_prompts) < args.rollout_batch_size:
+                    raise ValueError("SEC needs at least rollout_batch_size distinct questions to form a batch")
+                get_monitor(args).register("curriculum", self.curriculum.metrics)
         else:
             self.dataset = None
 
@@ -136,7 +159,9 @@ class RolloutDataSource(DataSource):
 
     def get_samples(self, num_samples):
         # TODO further improve code
-        if self.dataset is not None:
+        if self.curriculum is not None:
+            prompt_samples = [self._curriculum_prompts[key] for key in self.curriculum.select(num_samples)]
+        elif self.dataset is not None:
             if self.sample_offset + num_samples <= len(self.dataset):
                 prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
                 self.sample_offset += num_samples
@@ -181,9 +206,13 @@ class RolloutDataSource(DataSource):
             "sample_index": self.sample_index,
             "metadata": self.metadata,
         }
+        if self.curriculum is not None:
+            state_dict["curriculum"] = self.curriculum.state_dict()
         path = compute_global_dataset_state_path(self.args.save, rollout_id=rollout_id)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(state_dict, path)
+        temporary = path + ".tmp"
+        torch.save(state_dict, temporary)
+        os.replace(temporary, path)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:
@@ -207,6 +236,10 @@ class RolloutDataSource(DataSource):
         self.sample_group_index = state_dict.get("sample_group_index", 0)
         self.sample_index = state_dict.get("sample_index", 0)
         self.metadata = state_dict.get("metadata", {})
+        if getattr(self, "curriculum", None) is not None:
+            if "curriculum" not in state_dict:
+                raise ValueError("Dataset checkpoint has no SEC state; refusing to silently reset curriculum")
+            self.curriculum.load_state_dict(state_dict["curriculum"])
 
         if self.args.rollout_global_dataset and self.args.rollout_shuffle:
             self.dataset.shuffle(self.epoch_id)
@@ -255,6 +288,8 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
                 len(samples[i]) == self.args.n_samples_per_prompt
             ), f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
             group = samples[i]  # type: ignore
+            if self.curriculum is not None:
+                self.curriculum.reserve(group[0].metadata[METADATA_KEY]["question_id"])
             self.buffer.append(group)
 
     # TODO remove

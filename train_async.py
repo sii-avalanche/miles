@@ -10,6 +10,7 @@ from miles.ray.placement_group import (
     update_weights,
 )
 from miles.ray.rollout.eval_dispatch import EvalDispatcher
+from miles.rollout.curriculum_config import uses_persistent_rollout
 from miles.utils.arguments import parse_args, validate_async_off_policy_correction
 from miles.utils.async_utils import Disposer, eager_create_task, with_disposer
 from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
@@ -87,7 +88,7 @@ async def train(args, *, disposer: Disposer):
 
         # A fully-async producer keeps generating without a pending get(). When
         # weights will change, defer the next drain so it uses the new version.
-        defer_next_drain = args.fully_async and has_next_rollout and weight_update_due
+        defer_next_drain = uses_persistent_rollout(args) and has_next_rollout and weight_update_due
         if has_next_rollout and not defer_next_drain:
             rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
@@ -121,7 +122,7 @@ async def train(args, *, disposer: Disposer):
                 os.remove(args.save_trigger_sentinel)
 
         if weight_update_due:
-            if not args.fully_async:
+            if not uses_persistent_rollout(args):
                 # sync generate before update weights to prevent update weight in the middle of generation
                 rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
                 rollout_data_next_future = None

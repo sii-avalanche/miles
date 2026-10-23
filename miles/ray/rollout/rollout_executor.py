@@ -26,7 +26,7 @@ from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
 from miles.rollout.moe_metrics import expert_load_metrics
 from miles.utils import object_store
-from miles.utils.async_utils import maybe_await
+from miles.utils.async_utils import maybe_await, run
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
 from miles.utils.audit_utils.event_logger import checkpoint as event_logger_checkpoint
 from miles.utils.audit_utils.event_logger.logger import event_logger_context
@@ -315,6 +315,17 @@ class RolloutExecutor:
 
     # TODO the train and eval rollout functions will become one object, so one save/load is enough here
     def save(self, rollout_id: int) -> None:
+        if getattr(self.args, "curriculum_enabled", False):
+            # Serialize on the producer loop so question feedback and source indices
+            # belong to one checkpoint instant, without pausing inference requests.
+            run(self._save_curriculum_checkpoint(rollout_id))
+            return
+        self._save(rollout_id)
+
+    async def _save_curriculum_checkpoint(self, rollout_id: int) -> None:
+        self._save(rollout_id)
+
+    def _save(self, rollout_id: int) -> None:
         self.data_source.save(rollout_id)
         if not self.use_legacy_rollout_v1:
             if self.generate_rollout is not None:
@@ -332,6 +343,12 @@ class RolloutExecutor:
                 eval_fn.load(rollout_id)
 
     # -------------------------- misc APIs -----------------------------
+
+    async def pause_for_weight_sync(self) -> None:
+        await self.generate_rollout.pause_for_weight_sync()
+
+    async def resume_after_weight_sync(self) -> None:
+        await self.generate_rollout.resume_after_weight_sync()
 
     def get_num_rollout_per_epoch(self) -> int:
         assert self.args.rollout_global_dataset

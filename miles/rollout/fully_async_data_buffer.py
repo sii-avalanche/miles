@@ -71,6 +71,7 @@ class DataBufferConstructorInput:
     args: Namespace
     unused_handler_fn: Callable[[list[Sample]], None]  # --async-unused-samples-handler, applied to unused groups
     trainer_model_id: str | None = None
+    group_observer: Callable[["DataBufferInput", str], None] | None = None
 
 
 @dataclass
@@ -146,6 +147,7 @@ class DefaultDataBuffer(DataBuffer):
         assert self._capacity >= 1
 
         self._unused_handler_fn = input.unused_handler_fn
+        self._group_observer = input.group_observer
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
         self._current_version: int | None = None
@@ -274,6 +276,7 @@ class DefaultDataBuffer(DataBuffer):
             self._metric_aborted_groups += 1
             self._monitor.increment(f"{self._perf_prefix}/aborted_groups_total")
             self._record_rejection(input, "aborted", reusable=True)
+            self._observe_group(input, "rejected")
             self._unused_handler_fn(input.prompt_group)
             return False
 
@@ -282,6 +285,7 @@ class DefaultDataBuffer(DataBuffer):
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
             self._monitor.increment(f"{self._perf_prefix}/missing_reward_groups_total")
             self._record_rejection(input, "missing_reward", reusable=False)
+            self._observe_group(input, "rejected")
             return False
 
         self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
@@ -290,8 +294,14 @@ class DefaultDataBuffer(DataBuffer):
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
             self._monitor.increment(f"{self._perf_prefix}/dynamic_rejected_groups_total")
             self._record_rejection(input, "dynamic_filter", reusable=False)
+            self._observe_group(input, "rejected")
             return False
+        self._observe_group(input, "accepted")
         return True
+
+    def _observe_group(self, entry: DataBufferInput, outcome: str) -> None:
+        if self._group_observer is not None:
+            self._group_observer(entry, outcome)
 
     async def get(self, current_version: int | None = None, **_) -> DataBufferInput:
         if current_version is not None:
@@ -332,6 +342,7 @@ class DefaultDataBuffer(DataBuffer):
                         self._metric_stale_groups += 1
                         self._monitor.increment(f"{self._perf_prefix}/stale_rejected_groups_total")
                         self._record_rejection(entry, "stale", reusable=True)
+                        self._observe_group(entry, "stale")
                         self._unused_handler_fn(entry.prompt_group)
                         continue
                     self._metric_consumed_staleness.append(staleness)

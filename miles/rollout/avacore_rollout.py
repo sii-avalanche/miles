@@ -24,6 +24,11 @@ from ava_core.store.postgres import PostgresBackend
 from miles.utils.recording.outbox import DurableRolloutOutbox, _atomic_json
 from miles.rollout.avacore_trace import conversation_tips, graph_nodes, snapshot_traces, write_record
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.rollout.generate_utils.sampling_mask import (
+    append_forced_sampling_tokens,
+    append_sampling_metadata,
+    should_return_sampling_mask,
+)
 from miles.rollout.screening_resume import inherit_records, validate_reused_recording
 from miles.utils.perf_monitor import get_monitor
 from miles.utils.types import Sample, WeightVersionsPerCall
@@ -144,6 +149,10 @@ class AvaCoreRollout:
             trial_id = await self._outbox.allocate_trial(sample, self.args.n_samples_per_prompt)
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
+        if getattr(self.args, "use_sampling_support_replay", False) and not evaluation:
+            should_return_sampling_mask(self.args, sampling_params)
+            # PPO needs the realized support and only the sampled token's normalized score.
+            replay.update(return_sampling_mask=True, sampling_logprobs_mode="selected")
         try:
             with self._monitor.wait("sample/generate"):
                 traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
@@ -175,11 +184,19 @@ class AvaCoreRollout:
             except asyncio.CancelledError:
                 await persist
                 raise
+        if getattr(self.args, "curriculum_enabled", False) and not evaluation and reward.metadata.get("grader_invalid"):
+            # The judge's fallback zero is not an observed failure. Keep its audit
+            # record, but exclude this group from SEC feedback and training.
+            sample.status = Sample.Status.ABORTED
+            sample.metadata = {**sample.metadata, "grader_invalid": True}
+            return sample
         samples, owned = [], set()
         for tip in conversation_tips(traces):
             generated = {node for node in tip.prefixes if node.generated and node.segments}
             if generated - owned:
-                samples.append(filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned))
+                samples.append(
+                    filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned, evaluation=evaluation)
+                )
                 owned.update(generated)
         if len(samples) > 1:
             # Compaction and source branches are fragments of one sampled episode.
@@ -345,7 +362,15 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     )
 
 
-def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, *, owned: set[Trace] | None = None) -> Sample:
+def filled(
+    args: Namespace,
+    sample: Sample,
+    trace: Trace,
+    reward: float,
+    *,
+    owned: set[Trace] | None = None,
+    evaluation: bool = False,
+) -> Sample:
     # Shared generated prefixes train only in the first listed branch, as in the result store.
     owned = owned or set()
     segments = trace.path_segments
@@ -369,6 +394,8 @@ def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, *, owne
             spans.append((offset, offset + len(segment.tokens)))
         offset += len(segment.tokens)
     finished = [node.message for node in trace.prefixes if node.generated and node.segments]
+    if getattr(args, "use_sampling_support_replay", False) and not evaluation:
+        _fill_sampling_metadata(sample, segments, finished)
     for message, (start, end) in zip(finished, spans, strict=True):
         # The trace keeps log probs per token, not per call: anchor the call's weight versions to its own segment.
         versioning = ("weight_version", "weight_versions")
@@ -389,3 +416,21 @@ def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, *, owne
         sample.rollout_routed_experts = routed.reshape(length - 1, args.num_layers, args.moe_router_topk)
     sample.reward = reward
     return sample
+
+
+def _fill_sampling_metadata(sample: Sample, segments, messages) -> None:
+    """Replay each generated turn's support; environment tokens have singleton support."""
+    replay = Sample()
+    log_probs = []
+    messages = iter(messages)
+    for segment in segments[1:]:
+        if segment.is_generated:
+            log_probs.extend(append_sampling_metadata(replay, segment.tokens, next(messages).metadata))
+        else:
+            append_forced_sampling_tokens(replay, segment.tokens)
+            log_probs.extend([0.0] * len(segment.tokens))
+        replay.response_length += len(segment.tokens)
+    if len(log_probs) != sample.response_length:
+        raise ValueError("AvaCore sampling metadata does not match the response length")
+    sample.rollout_sampling_mask = replay.rollout_sampling_mask
+    sample.rollout_log_probs = log_probs

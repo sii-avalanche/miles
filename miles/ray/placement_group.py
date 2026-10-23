@@ -305,6 +305,11 @@ async def update_weights(
     if rollout_id is not None:
         await orchestration_executor.run_after_step(rollout_id=rollout_id)
 
+    curriculum_enabled = getattr(args, "curriculum_enabled", False)
+    if curriculum_enabled:
+        # Drain whole groups BEFORE taking the engine-update lock. Completion feedback
+        # does not wait for the finished-group buffer, even when training has filled it.
+        await rollout_executor.pause_for_weight_sync()
     info: UpdatableEngines = await inference_controller.start_update_weights(model_id=trainer_model_id)
     try:
         weight_version = await actor_model.update_weights(info=info, rollout_id=rollout_id)
@@ -317,8 +322,14 @@ async def update_weights(
         args, inference_controller=inference_controller, rollout_id=rollout_id, trainer_model_id=trainer_model_id
     )
 
+    if curriculum_enabled and weight_version is None:
+        raise RuntimeError("SEC weight synchronization did not return a policy version; dispatch remains paused")
     if weight_version is not None:
         await rollout_executor.set_weight_version(weight_version, trainer_model_id=trainer_model_id)
+    if curriculum_enabled:
+        # On an update error we deliberately remain paused: the served policy may be
+        # partially replaced. Only a successful publish makes further dispatch safe.
+        await rollout_executor.resume_after_weight_sync()
 
 
 async def _maybe_log_inference_engine_weight_checksums(

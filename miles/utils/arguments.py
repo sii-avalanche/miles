@@ -22,6 +22,7 @@ from miles.backends.sglang_utils.arguments import validate_args as sglang_valida
 from miles.utils.perf_monitor import add_perf_monitor_arguments, validate_perf_monitor_args
 from miles.ray.specs.train import compute_trainer_ids, external_trainer_controller_addrs
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
+from miles.rollout.curriculum_config import add_curriculum_arguments, uses_persistent_rollout, validate_curriculum_args
 from miles.utils.audit_utils.event_logger.logger import EVENTS_DIRNAME
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
 from miles.utils.env_report.launcher_report import LAUNCHER_REPORT_ENV_VAR
@@ -62,7 +63,7 @@ def resolve_rollout_function_paths(args) -> tuple[str, str]:
     else:
         standard_path = "miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn"
     rollout_path = args.rollout_function_path or standard_path
-    if args.fully_async:
+    if uses_persistent_rollout(args):
         rollout_path = FULLY_ASYNC_ROLLOUT_PATH
     # Resolved after the override: shared-engine eval must reach the producer it pauses.
     eval_path = args.eval_function_path or rollout_path
@@ -81,7 +82,7 @@ def _resolve_rollout_functions(args) -> None:
             "--mask-offpolicy-in-partial-rollout does not re-extend the loss mask on the "
             "class-based rollout path yet; set MILES_USE_LEGACY_ROLLOUT_V1=1"
         )
-    if args.fully_async:
+    if uses_persistent_rollout(args):
         assert (
             not use_legacy_rollout_v1()
         ), "--fully-async needs the class-based rollout API; unset MILES_USE_LEGACY_ROLLOUT_V1"
@@ -2958,6 +2959,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_cluster_arguments(parser)
         parser = add_train_arguments(parser)
         parser = add_rollout_arguments(parser)
+        parser = add_curriculum_arguments(parser)
         parser = add_fault_tolerance_arguments(parser)
         parser = add_data_arguments(parser)
         parser = add_eval_arguments(parser)
@@ -3534,6 +3536,8 @@ def miles_validate_args(args):
     ) and not args.disable_sampling_support_replay
     args.rollout_sampling_logprobs_mode = "support" if args.use_sampling_support_replay else "selected"
     if args.use_sampling_support_replay:
+        if getattr(args, "sglang_speculative_algorithm", None):
+            raise ValueError("sampling-support replay requires disabling SGLang speculative decoding")
         if args.rollout_top_k == -1:
             raise ValueError(
                 "--rollout-top-p below 1 requires a positive --rollout-top-k; "
@@ -4009,6 +4013,7 @@ def miles_validate_args(args):
             f"so one group already puts n_samples_per_prompt trajectories in flight"
         )
 
+    validate_curriculum_args(args)
     _resolve_rollout_functions(args)
 
     # Both snapshot postures drive the same RolloutManager._eval_checkpoint path.
