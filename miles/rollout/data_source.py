@@ -210,9 +210,7 @@ class RolloutDataSource(DataSource):
             state_dict["curriculum"] = self.curriculum.state_dict()
         path = compute_global_dataset_state_path(self.args.save, rollout_id=rollout_id)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        temporary = path + ".tmp"
-        torch.save(state_dict, temporary)
-        os.replace(temporary, path)
+        torch.save(state_dict, path)
 
     def load(self, rollout_id=None):
         if not self.args.rollout_global_dataset:

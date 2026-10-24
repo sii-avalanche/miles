@@ -11,7 +11,6 @@ from miles.ray.placement_group import (
     update_weights,
 )
 from miles.ray.rollout.eval_dispatch import EvalDispatcher
-from miles.rollout.curriculum_config import uses_persistent_rollout
 from miles.utils.arguments import parse_args
 from miles.utils.async_utils import Disposer, with_disposer
 from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
@@ -24,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 async def train(args, *, disposer: Disposer):
-    assert not uses_persistent_rollout(args), "Fully async / SEC requires the async driver: run train_async.py"
+    assert not args.fully_async, "--fully-async requires the async driver: run train_async.py"
     _worker_manager = init_orchestration_script(args, disposer=disposer)
 
     if args.colocate_memory_peak_device == "gpu":

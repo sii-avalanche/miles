@@ -76,7 +76,7 @@ def submit_generate_tasks(
     samples: list[list[Sample]],
     sample_done_callback: Callable[[], None] | None = None,
 ):
-    return [
+    tasks = [
         asyncio.create_task(
             # submit a group of samples as a single task.
             generate_and_rm_group(
@@ -89,6 +89,10 @@ def submit_generate_tasks(
         )
         for group in samples
     ]
+    if (observer := getattr(state, "curriculum_observer", None)) is not None:
+        for task, group in zip(tasks, samples, strict=True):
+            observer.watch(task, group)
+    return tasks
 
 
 async def generate_rollout_async(

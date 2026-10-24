@@ -58,7 +58,10 @@ def binary_group_rewards(group, reward_key):
     rewards = []
     for episode in group:
         fragments = episode if isinstance(episode, list) else [episode]
-        if not fragments or any(s.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED) for s in fragments):
+        if not fragments or any(
+            s.status not in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED) or s.metadata.get("grader_invalid")
+            for s in fragments
+        ):
             return None
         values = [s.reward.get(reward_key) if isinstance(s.reward, dict) else s.reward for s in fragments]
         if any(value not in (0, 1) for value in values) or any(value != values[0] for value in values):
@@ -103,7 +106,7 @@ class ContinuousSEC:
         self.policy_version = None
         self._counts = Counter()
         self._windows = {
-            name: deque(maxlen=4096) for name in ("sampled", "completed", "accepted", "pass_rate", "signal")
+            name: deque(maxlen=4096) for name in ("sampled", "completed", "pass_rate", "signal")
         }
         self._distribution = {}
 
@@ -173,12 +176,6 @@ class ContinuousSEC:
             self._counts["dispatched"] += 1
             self._windows["sampled"].append(row["p"])
 
-    def sample_done(self, prompt_group):
-        with self._lock:
-            event_id = prompt_group[0].metadata[METADATA_KEY]["group_id"]
-            if event_id in self._inflight:
-                self._inflight[event_id] = max(0, self._inflight[event_id] - 1)
-
     def complete(self, prompt_group, group, *, reward_key=None):
         stamp = prompt_group[0].metadata[METADATA_KEY]
         rewards = binary_group_rewards(group, reward_key)
@@ -240,17 +237,6 @@ class ContinuousSEC:
             self._inflight.pop(event_id, None)
             self.release(prompt_group)
 
-    def observe_decision(self, entry, outcome):
-        with self._lock:
-            if outcome == "accepted":
-                self._counts["accepted"] += 1
-                self._windows["accepted"].append(
-                    entry.prompt_group[0].metadata[METADATA_KEY]["difficulty_at_dispatch"]
-                )
-            else:
-                self._counts["rejected" if outcome != "stale" else "stale"] += 1
-                self.release(entry.prompt_group)
-
     def release(self, prompt_group):
         with self._lock:
             event_id = prompt_group[0].metadata[METADATA_KEY]["group_id"]
@@ -274,7 +260,7 @@ class ContinuousSEC:
                 "q/max": float(self.q.max()),
                 **{
                     f"groups/{key}_total": self._counts[key]
-                    for key in ("dispatched", "complete", "accepted", "rejected", "invalid", "stale")
+                    for key in ("dispatched", "complete", "invalid")
                 },
                 **{f"distribution/{key}": value for key, value in self._distribution.items()},
             }
@@ -333,7 +319,7 @@ class ContinuousSEC:
             self._seen = set(state["seen"])
             self._rng.setstate(state["rng"])
             self._counts = Counter(state["counts"])
-            self._windows = {key: deque(values, maxlen=4096) for key, values in state["windows"].items()}
+            self._windows = {key: deque(state["windows"].get(key, []), maxlen=4096) for key in self._windows}
             # Network requests / finished-group buffers do not survive a process restart.
             # Keep feedback already checkpointed; release their reservations for fresh generation.
             self._reserved.clear()

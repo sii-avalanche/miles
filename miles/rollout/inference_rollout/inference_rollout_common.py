@@ -21,6 +21,7 @@ from miles.rollout.generate_hub.single_turn import generate
 from miles.rollout.generate_utils.generate_endpoint_utils import policy_uses_routing_key
 from miles.rollout.inference_rollout.compatibility import load_generate_function
 from miles.rollout.rm_hub import async_rm, batched_async_rm
+from miles.rollout.sec_observer import SECBatchObserver
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
@@ -223,10 +224,24 @@ class InferenceRolloutFn(BaseRolloutFn):
     async def _call_train(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
         from miles.rollout.inference_rollout.inference_rollout_train import generate_rollout_async
 
-        output, aborted_samples = await generate_rollout_async(
-            self.state, input.rollout_id, self.data_source.get_samples
-        )
+        curriculum = getattr(self.data_source, "curriculum", None)
+        observer = SECBatchObserver(curriculum, input.weight_version, self.state.args.reward_key) if curriculum else None
+        if observer is not None:
+            self.state.curriculum_observer = observer
+        try:
+            output, aborted_samples = await generate_rollout_async(
+                self.state, input.rollout_id, self.data_source.get_samples
+            )
+        finally:
+            if observer is not None:
+                observer.close()
+                del self.state.curriculum_observer
         self.data_source.add_samples(aborted_samples)
+        if curriculum is not None:
+            output.metrics = {
+                **(output.metrics or {}),
+                **{f"rollout/curriculum/{key}": value for key, value in curriculum.metrics().items()},
+            }
         return output
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnEvalOutput:
