@@ -1,4 +1,3 @@
-import itertools
 import logging
 
 from miles.rollout.filter_hub.snr_filter import group_reward_variance, snr_aware_filter, variance_metrics
@@ -19,9 +18,7 @@ def postprocess_rollout_data(args, data, train_parallel_config):
         metrics = metrics | snr_metrics
     metadata["metrics"] = metrics
 
-    # flatten the data if it is a list of lists
-    while isinstance(data[0], list):
-        data = list(itertools.chain.from_iterable(data))
+    data = list(_iter_nested_samples(data))
 
     # Compact rollouts must not be trimmed by sample count; the schedule drops
     # whole trailing rollouts instead.
@@ -55,7 +52,7 @@ def validate_compact_rollout_ids(node, depth=0):
     if isinstance(node, Sample):
         return
     assert isinstance(node, list), f"unexpected rollout output node type: {type(node).__name__}"
-    if node and isinstance(node[0], Sample):
+    if node and all(isinstance(item, Sample) for item in node):
         if depth >= 2 and len(node) > 1:
             rids = [s.rollout_id for s in node]
             missing = [i for i, r in enumerate(rids) if r is None]
@@ -68,6 +65,15 @@ def validate_compact_rollout_ids(node, depth=0):
         return
     for item in node:
         validate_compact_rollout_ids(item, depth + 1)
+
+
+def _iter_nested_samples(node):
+    if isinstance(node, Sample):
+        yield node
+        return
+    assert isinstance(node, list), f"unexpected rollout output node type: {type(node).__name__}"
+    for item in node:
+        yield from _iter_nested_samples(item)
 
 
 def _first_sample(group):

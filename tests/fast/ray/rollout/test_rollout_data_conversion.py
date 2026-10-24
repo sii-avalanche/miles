@@ -77,6 +77,17 @@ class TestPostprocessRolloutData:
         out, _meta = postprocess_rollout_data(args, nested, train_parallel_config={"dp_size": 1})
         assert len(out) == 3
 
+    def test_flattens_mixed_regular_and_compact_samples(self):
+        """A prompt group may mix one-sample episodes with a later compact episode."""
+        args = make_args(global_batch_size=2, disable_rollout_trim_samples=True, use_dynamic_global_batch_size=False)
+        regular = make_sample(index=0)
+        compact = [make_sample(index=1, rollout_id=1), make_sample(index=1, rollout_id=1)]
+        tail = make_sample(index=2)
+
+        out, _meta = postprocess_rollout_data(args, [[regular, compact, tail]], train_parallel_config={"dp_size": 1})
+
+        assert out == [regular, *compact, tail]
+
 
 class TestValidateRolloutIdAnnotated:
     def test_flat_list_skips_validation(self):
@@ -107,3 +118,10 @@ class TestValidateRolloutIdAnnotated:
     def test_compact_singleton_leaf_needs_no_annotation(self):
         """A single-sample leaf at depth >= 2 is unambiguous — no rollout_id required."""
         validate_compact_rollout_ids([[[make_sample(index=0)]]])
+
+    def test_compact_leaf_after_a_regular_sample_is_still_validated(self):
+        """Validation must inspect every sibling rather than infer shape from the first one."""
+        mixed = [[make_sample(index=0), [make_sample(index=1), make_sample(index=1)]]]
+
+        with pytest.raises(AssertionError, match="rollout_id is unset"):
+            validate_compact_rollout_ids(mixed)

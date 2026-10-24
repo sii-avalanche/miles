@@ -76,6 +76,12 @@ class AvaCoreRollout:
             if generated - owned:
                 samples.append(filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned))
                 owned.update(generated)
+        if len(samples) > 1:
+            rollout_id = sample.rollout_id if sample.rollout_id is not None else sample.index
+            if rollout_id is None:
+                raise ValueError("A multi-sample AvaCore rollout needs an input sample index or rollout_id")
+            for output in samples:
+                output.rollout_id = rollout_id
         return samples[0] if len(samples) == 1 else samples
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
