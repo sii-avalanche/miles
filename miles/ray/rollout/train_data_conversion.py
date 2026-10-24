@@ -155,7 +155,7 @@ def convert_samples_to_train_data(
         train_data["rollout_topk_log_probs"] = [sample.rollout_topk_log_probs for sample in samples]
 
     has_sampling_mask = any(sample.rollout_sampling_mask is not None for sample in samples)
-    if has_sampling_mask:
+    if has_sampling_mask or getattr(args, "use_sampling_support_replay", False):
         sampling_mask_ids = []
         sampling_mask_offsets = []
         for position, sample in enumerate(samples):
