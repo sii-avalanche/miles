@@ -28,14 +28,10 @@ class SECConfig:
         return cls(**{name: getattr(args, f"curriculum_{name}") for name in cls.__dataclass_fields__})
 
 
-def uses_persistent_rollout(args) -> bool:
-    return args.fully_async or getattr(args, "curriculum_enabled", False)
-
-
 def add_curriculum_arguments(parser):
     group = parser.add_argument_group("Continuous SEC curriculum")
     group.add_argument(
-        "--curriculum-enabled", action="store_true", help="Use continuous SEC and the persistent async producer."
+        "--curriculum-enabled", action="store_true", help="Use continuous SEC; rollout cadence follows --fully-async."
     )
     group.add_argument("--curriculum-strategy", choices=["continuous_sec"], default="continuous_sec")
     for name, default in (("alpha", 0.02), ("bandwidth", 0.10), ("temperature", 0.5), ("exploration", 0.10)):
@@ -57,6 +53,8 @@ def add_curriculum_arguments(parser):
 def validate_curriculum_args(args):
     if not getattr(args, "curriculum_enabled", False):
         return
+    if args.fully_async:
+        raise ValueError("Minimal SEC uses the original batch rollout; set fully_async=false")
     SECConfig.from_args(args)
     if args.curriculum_strategy != "continuous_sec":
         raise ValueError("Only continuous_sec is supported")
@@ -65,12 +63,6 @@ def validate_curriculum_args(args):
         raise ValueError("curriculum_initial_probability_scale must be finite and positive")
     if args.n_samples_per_prompt != 16:
         raise ValueError("Continuous SEC requires complete 16-sample groups")
-    if (getattr(args, "over_sampling_batch_size", None) or 0) > (
-        args.rollout_batch_size or 0
-    ) and args.async_max_concurrent_samples is None:
-        raise ValueError(
-            "SEC uses the persistent producer: set async_max_concurrent_samples for oversampling; over_sampling_batch_size is a one-shot dispatch chunk"
-        )
     if args.advantage_estimator != "grpo" or not args.rewards_normalization:
         raise ValueError("Continuous SEC requires GRPO with rewards_normalization")
     if args.normalize_advantages or args.use_opd or getattr(args, "overlong_reward_mode", None) not in (None, "none"):
@@ -95,6 +87,6 @@ def validate_curriculum_args(args):
         if getattr(args, name, None):
             raise ValueError(f"Continuous SEC does not support {name}")
     if use_legacy_rollout_v1() or not args.rollout_global_dataset or resolve_megatron_config(args).is_multi_policy:
-        raise ValueError("Continuous SEC requires the class-based single-policy global-dataset async pipeline")
+        raise ValueError("Continuous SEC requires the class-based single-policy global-dataset pipeline")
     if args.data_source_path != "miles.rollout.data_source.RolloutDataSourceWithBuffer":
         raise ValueError("Continuous SEC requires the built-in RolloutDataSourceWithBuffer")

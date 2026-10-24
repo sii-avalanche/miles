@@ -6,7 +6,6 @@ import torch
 from miles.rollout.generate_utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sample
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
-from miles.utils.group_advantages import normalize_group_rewards
 from miles.utils.credit_assignment import token_fingerprint
 from miles.utils.lora.utils import is_multi_lora_enabled
 from miles.utils.object_store import ValueSpec
@@ -175,7 +174,7 @@ def convert_samples_to_train_data(
         train_data["rollout_topk_log_probs"] = [sample.rollout_topk_log_probs for sample in samples]
 
     has_sampling_mask = any(sample.rollout_sampling_mask is not None for sample in samples)
-    if has_sampling_mask:
+    if has_sampling_mask or getattr(args, "use_sampling_support_replay", False):
         sampling_mask_ids = []
         sampling_mask_offsets = []
         for position, sample in enumerate(samples):
@@ -355,11 +354,16 @@ def _normalize_rewards_by_rollout(
             shared_rewards.append(sibling_rewards[0])
 
         rollout_rewards = torch.tensor(shared_rewards, dtype=torch.float)
-        normalized_rollout_rewards = normalize_group_rewards(
-            rollout_rewards,
-            standardize=args.advantage_estimator in ["grpo", "gspo", "cispo"] and args.grpo_std_normalization,
-            quantile=args.quantile_k,
-        )
+        baseline = rollout_rewards.mean() if args.quantile_k is None else rollout_rewards.quantile(args.quantile_k)
+        normalized_rollout_rewards = rollout_rewards - baseline
+        if (
+            args.advantage_estimator in ["grpo", "gspo", "cispo"]
+            and args.grpo_std_normalization
+            and len(rollout_rewards) > 1
+        ):
+            rollout_std = rollout_rewards.std()
+            if rollout_std > 0:
+                normalized_rollout_rewards = normalized_rollout_rewards / (rollout_std + 1e-6)
 
         for (_, rollout_segments), normalized_reward in zip(
             rollout_segment_groups, normalized_rollout_rewards.tolist(), strict=True

@@ -188,16 +188,6 @@ class AvaCoreRollout:
             except asyncio.CancelledError:
                 await persist
                 raise
-        if (
-            getattr(self.args, "curriculum_enabled", False)
-            and not evaluation
-            and reward.metadata.get("grader_invalid")
-        ):
-            # The judge's fallback zero is not an observed failure. Keep its audit
-            # record, but exclude this group from SEC feedback and training.
-            sample.status = Sample.Status.ABORTED
-            sample.metadata = {**sample.metadata, "grader_invalid": True}
-            return sample
         samples, owned = [], set()
         feedback = feedback_from_reward(reward)
         context = None
@@ -216,6 +206,10 @@ class AvaCoreRollout:
                 if context is not None:
                     fill_credit_assignment(samples[-1], tip, reward, context)
                 owned.update(generated)
+        if getattr(self.args, "curriculum_enabled", False) and not evaluation and reward.metadata.get("grader_invalid"):
+            # Skip invalid judge verdicts in SEC feedback without changing the base reward/filter path.
+            for result in samples:
+                result.metadata = {**result.metadata, "grader_invalid": True}
         if len(samples) > 1:
             # Compaction and source branches are fragments of one sampled episode.
             rollout_id = sample.rollout_id if sample.rollout_id is not None else sample.index

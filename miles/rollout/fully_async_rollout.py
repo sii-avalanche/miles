@@ -44,7 +44,6 @@ from miles.rollout.fully_async_data_buffer import (
     first_sample,
 )
 from miles.rollout.filter_hub.common_filters import group_weight_version_stats
-from miles.rollout.continuous_sec import METADATA_KEY
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
@@ -73,7 +72,6 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         super().__init__(input)
         self.args = input.args
         self.data_source = input.data_source
-        self.curriculum = getattr(input.data_source, "curriculum", None)
         self.state = GenerateState(input.args)
         # default to sample level backfill for fully async rollout
         self._scheduler = make_submission_scheduler(input.args, default="sample")
@@ -87,11 +85,6 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._eval_prompt_dataset_cache: dict = {}
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
-        self._sync_paused = False
-        self._eval_paused = False
-        self._generation_tasks: set[asyncio.Task] = set()
-        self._curriculum_available = asyncio.Event()
-        self._curriculum_available.set()
         self._output: DataBuffer | None = None
         self._monitor = get_monitor(input.args)
         self._pending_groups: dict[asyncio.Task, tuple[float, str]] = {}
@@ -116,10 +109,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             )
             buffer_cls = load_function(self.args.custom_async_data_buffer_path) or default_buffer_cls
             self._output = buffer_cls(
-                DataBufferConstructorInput(
-                    args=self.args, unused_handler_fn=self._handle_unused,
-                    group_observer=self._observe_curriculum_group if self.curriculum is not None else None,
-                )
+                DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
             )
             for model_id, version in self._published_versions.items():
                 self._output.set_weight_version(version, trainer_model_id=model_id)
@@ -183,49 +173,15 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             return RolloutFnEvalOutput(data=results)
 
         logger.info("Pausing fully-async producer submissions for shared-engine eval")
-        self._eval_paused = True
         self._producer_resumed.clear()
         try:
             results = await run_eval_datasets(self.state, self._eval_prompt_dataset_cache)
         finally:
-            self._eval_paused = False
-            if not self._sync_paused:
-                self._producer_resumed.set()
+            self._producer_resumed.set()
             logger.info("Resumed fully-async producer submissions after eval")
         return RolloutFnEvalOutput(data=results)
 
     # -------------------------- producer --------------------------
-
-    async def pause_for_weight_sync(self) -> None:
-        """Drain generation, not buffer delivery: a full buffer must not deadlock sync."""
-        await self._on_producer_loop(self._pause_for_weight_sync())
-
-    async def _pause_for_weight_sync(self) -> None:
-        self._sync_paused = True
-        self._producer_resumed.clear()
-        # Dispatch and this snapshot execute on the same loop, with no await between
-        # the gate check and registering a task. Every group's RM + SEC feedback is
-        # inside its generation task; buffer.put is deliberately outside it.
-        if self._generation_tasks:
-            await asyncio.gather(*tuple(self._generation_tasks))
-
-    async def resume_after_weight_sync(self) -> None:
-        await self._on_producer_loop(self._resume_after_weight_sync())
-
-    async def _resume_after_weight_sync(self) -> None:
-        self._sync_paused = False
-        if not self._eval_paused:
-            self._producer_resumed.set()
-
-    async def _on_producer_loop(self, coroutine):
-        loop = self._worker.get_loop() if self._worker is not None else asyncio.get_running_loop()
-        if loop is asyncio.get_running_loop():
-            return await coroutine
-        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coroutine, loop))
-
-    def _observe_curriculum_group(self, entry, outcome):
-        self.curriculum.observe_decision(entry, outcome)
-        self._curriculum_available.set()
 
     def _max_in_flight_groups(self) -> int:
         if (x := self.args.async_max_concurrent_samples) is not None:
@@ -233,45 +189,21 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             return max(1, x // self.args.n_samples_per_prompt)
         return self.args.rollout_batch_size
 
-    def _submit_one_group(self) -> tuple[asyncio.Task, list[Sample]] | None:
+    def _submit_one_group(self) -> tuple[asyncio.Task, list[Sample]]:
         samples = self.data_source.get_samples(1)
-        if not samples:
-            self._curriculum_available.clear()
-            return None
         self._scheduler.on_submit(samples)
         [prompt_group] = samples
-        if self.curriculum is not None:
-            self.curriculum.dispatch(prompt_group, self._published_versions.get(None))
-        task = asyncio.create_task(self._generate_group(prompt_group))
-        self._generation_tasks.add(task)
-        task.add_done_callback(self._generation_tasks.discard)
-        return task, prompt_group
+        return asyncio.create_task(self._generate_group(prompt_group)), prompt_group
 
     async def _generate_group(self, prompt_group: list[Sample]) -> DataBufferInput:
         started = time.monotonic()
-        sample_done = self._scheduler.sample_done_callback
-        if self.curriculum is not None:
-            def sample_done():
-                self.curriculum.sample_done(prompt_group)
-                if self._scheduler.sample_done_callback is not None:
-                    self._scheduler.sample_done_callback()
-
-        try:
-            result = await generate_and_rm_group(
-                self.state,
-                prompt_group,
-                sampling_params=self.state.sampling_params.copy(),
-                evaluation=False,
-                sample_done_callback=sample_done,
-            )
-            if self.curriculum is not None:
-                if self.curriculum.complete(prompt_group, result, reward_key=self.args.reward_key):
-                    self._monitor.event("curriculum_feedback", details=first_sample(result).metadata[METADATA_KEY])
-        except BaseException:
-            if self.curriculum is not None:
-                self.curriculum.failed(prompt_group)
-                self._curriculum_available.set()
-            raise
+        result = await generate_and_rm_group(
+            self.state,
+            prompt_group,
+            sampling_params=self.state.sampling_params.copy(),
+            evaluation=False,
+            sample_done_callback=self._scheduler.sample_done_callback,
+        )
         self._last_group_completed = time.monotonic()
         self._monitor.observe("producer/group_generation", self._last_group_completed - started)
         self._monitor.increment("producer/groups_completed_total")
@@ -290,32 +222,13 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
     async def _run_worker_loop(self, active: dict[asyncio.Task, list[Sample]]) -> None:
         while True:
             await self._producer_resumed.wait()
-            while self._producer_resumed.is_set() and self._scheduler.has_capacity(
-                pending_groups=len(active), group_budget=self._max_in_flight_groups()
-            ):
-                # SEC keeps completed oversampling work, so bound its pending groups
-                # as well as the existing sample-level concurrency budget.
-                if self.curriculum is not None and len(active) >= self._max_in_flight_groups():
-                    break
-                submission = self._submit_one_group()
-                if submission is None:
-                    break
-                task, prompt_group = submission
+            while self._scheduler.has_capacity(pending_groups=len(active), group_budget=self._max_in_flight_groups()):
+                task, prompt_group = self._submit_one_group()
                 active[task] = prompt_group
                 if self._monitor.enabled:
                     self._pending_groups[task] = (time.monotonic(), workload_of(prompt_group[0], self.args))
                 self._monitor.increment("producer/groups_submitted_total")
-                if self.curriculum is not None:
-                    await asyncio.sleep(0)
-            if not active:
-                await self._curriculum_available.wait()
-                continue
-            if self.curriculum is not None:
-                # SEC also bounds pending groups. A sample-completion wakeup cannot
-                # open a group slot; waiting on that already-set event would spin.
-                done, _ = await asyncio.wait(set(active), return_when=asyncio.FIRST_COMPLETED)
-            else:
-                done, _ = await self._scheduler.wait_for_progress(set(active))
+            done, _ = await self._scheduler.wait_for_progress(set(active))
             for task in done:
                 entry = self._collect_group_result(task, active.pop(task))
                 self._pending_groups.pop(task, None)
@@ -367,7 +280,6 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
         target_data_size = args.rollout_batch_size
         data: list[Group] = []
-        consumed_prompts = []
         do_print = True
         workload_counts: dict[str, int] = {}
         group_workloads: dict[int, str] = {}
@@ -399,7 +311,6 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                 do_print = False
 
             data.append(entry.group)
-            consumed_prompts.append(entry.prompt_group)
             workload = workload_of(entry.prompt_group[0], args)
             workload_counts[workload] = workload_counts.get(workload, 0) + 1
             if self._monitor.enabled:
@@ -458,13 +369,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                 ),
             )
 
-        metrics = self._output.get_metrics(input.trainer_model_id)
-        if self.curriculum is not None:
-            for prompt_group in consumed_prompts:
-                self.curriculum.release(prompt_group)
-            self._curriculum_available.set()
-            metrics.update({f"rollout/curriculum/{key}": value for key, value in self.curriculum.metrics().items()})
-        return RolloutFnTrainOutput(samples=data, metrics=metrics)
+        return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
         self._monitor.increment("producer/recycled_groups_total")
