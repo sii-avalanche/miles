@@ -120,7 +120,7 @@ class AvaCoreRollout:
                 traces=traces,
                 reward=reward,
                 status="completed",
-                metadata={"weight_version": int(traces[0].last_assistant().metadata["weight_version"])},
+                metadata={"weight_version": _weight_version(traces[0])},
             )
         except Exception as error:
             self.failed_writes += 1
@@ -128,6 +128,14 @@ class AvaCoreRollout:
                 logger.warning(
                     "Recording rollouts to Postgres failed %d times; last error: %r", self.failed_writes, error
                 )
+
+
+def _weight_version(trace: Trace) -> int:
+    """Return the version from the last token-level policy turn, even when a tool result ends the trace."""
+    for node in reversed(trace.prefixes):
+        if node.generated and node.segments and "weight_version" in node.message.metadata:
+            return int(node.message.metadata["weight_version"])
+    raise ValueError("AvaCore rollout trace has no generated weight_version")
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
