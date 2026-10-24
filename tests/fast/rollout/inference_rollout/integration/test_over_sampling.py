@@ -27,14 +27,14 @@ def _over_sampling_config(rollout_batch_size: int):
 
 
 @pytest.mark.parametrize(
-    "rollout_env,expected_rounds",
+    "rollout_env,expected_requests",
     [
-        pytest.param(_over_sampling_config(1), 1, id="one_round"),
-        pytest.param(_over_sampling_config(2), 2, id="two_rounds"),
+        pytest.param(_over_sampling_config(1), 4, id="initial_window_is_enough"),
+        pytest.param(_over_sampling_config(2), 6, id="refill_scales_with_remaining_gap"),
     ],
     indirect=["rollout_env"],
 )
-def test_over_sampling_rounds(rollout_env, expected_rounds):
+def test_over_sampling_rounds(rollout_env, expected_requests):
     env = rollout_env
 
     with function_registry.temporary("test:filter_by_reward", filter_by_reward):
@@ -44,5 +44,4 @@ def test_over_sampling_rounds(rollout_env, expected_rounds):
     assert all(group[0].reward == 1 for group in out.samples)
 
     requests_count = len(env.mock_server.request_log)
-    expected_requests = expected_rounds * env.args.over_sampling_batch_size
-    assert requests_count == expected_requests, f"Expected {expected_rounds} round(s) = {expected_requests} requests"
+    assert requests_count == expected_requests

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from argparse import Namespace
 from collections.abc import Callable
 
@@ -21,6 +22,21 @@ from miles.utils.misc import as_completed_async, call_agent_abort_hook
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+
+def _desired_pending_groups(*, target_groups: int, accepted_groups: int, max_window: int) -> int:
+    """Scale the oversampling window down with the remaining training-batch gap.
+
+    ``over_sampling_batch_size`` is a concurrency window, not a refill chunk.  Submitting the
+    full window for every single rejected group makes pending work grow in waves.  A proportional
+    window keeps the initial oversampling ratio while a nearly complete batch only replaces its
+    actual shortfall (plus the same bounded oversampling margin).
+    """
+    remaining = max(0, target_groups - accepted_groups)
+    if remaining == 0:
+        return 0
+    window = max(target_groups, max_window)
+    return min(window, math.ceil(remaining * window / target_groups))
 
 
 async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[list[Sample]]:
@@ -130,9 +146,19 @@ async def generate_rollout_async(
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
-        while scheduler.has_capacity(pending_groups=len(pendings), group_budget=target_data_size - len(data)):
+        desired_pending = _desired_pending_groups(
+            target_groups=target_data_size,
+            accepted_groups=len(data),
+            max_window=args.over_sampling_batch_size,
+        )
+        while (
+            capacity := scheduler.available_groups(
+                pending_groups=len(pendings),
+                group_budget=desired_pending,
+            )
+        ) > 0:
             # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
+            samples = data_source(min(args.over_sampling_batch_size, capacity))
             scheduler.on_submit(samples)
             pendings.update(submit_generate_tasks(state, samples, scheduler.sample_done_callback))
 

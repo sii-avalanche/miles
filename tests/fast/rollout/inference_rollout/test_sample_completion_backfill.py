@@ -10,6 +10,7 @@ import torch
 from tests.fast.ray.rollout.conftest import make_args as make_rollout_args
 
 import miles.rollout.inference_rollout.inference_rollout_train as train
+from miles.rollout.inference_rollout.inference_rollout_train import _desired_pending_groups
 from miles.ray.rollout.rollout_data_conversion import postprocess_rollout_data
 from miles.ray.rollout.train_data_conversion import convert_samples_to_train_data
 from miles.rollout.submission_scheduler import (
@@ -273,6 +274,12 @@ async def test_failed_sample_cancels_siblings_and_conserves_credits(monkeypatch)
 
 
 class TestSubmissionSchedulers:
+    def test_oversampling_window_shrinks_with_remaining_gap(self):
+        assert _desired_pending_groups(target_groups=64, accepted_groups=0, max_window=200) == 200
+        assert _desired_pending_groups(target_groups=64, accepted_groups=61, max_window=200) == 10
+        assert _desired_pending_groups(target_groups=64, accepted_groups=63, max_window=200) == 4
+        assert _desired_pending_groups(target_groups=64, accepted_groups=64, max_window=200) == 0
+
     @pytest.mark.parametrize(
         "granularity,default,expected",
         [
@@ -289,6 +296,7 @@ class TestSubmissionSchedulers:
     def test_group_level_counts_groups(self):
         scheduler = GroupLevelSubmission()
         assert scheduler.sample_done_callback is None
+        assert scheduler.available_groups(pending_groups=1, group_budget=4) == 3
         assert scheduler.has_capacity(pending_groups=1, group_budget=2)
         assert not scheduler.has_capacity(pending_groups=2, group_budget=2)
 
@@ -297,6 +305,7 @@ class TestSubmissionSchedulers:
 
         scheduler.on_submit([make_group(1), make_group(2)])
         assert scheduler.samples_in_flight == 2 * GROUP_SIZE
+        assert scheduler.available_groups(pending_groups=2, group_budget=3) == 1
         assert not scheduler.has_capacity(pending_groups=2, group_budget=2)
 
         for _ in range(GROUP_SIZE - 1):
