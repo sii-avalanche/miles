@@ -258,7 +258,17 @@ async def _cancel_and_settle(tasks: set[asyncio.Task]) -> None:
     for task in tasks:
         if not task.done() and not task.cancelling():
             task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    settlement = asyncio.gather(*tasks, return_exceptions=True)
+    cancelled = False
+    while not settlement.done():
+        try:
+            await asyncio.shield(settlement)
+        except asyncio.CancelledError:
+            # A parent abort must not inject a second cancellation into a
+            # candidate while it is releasing a sandbox or remote verifier.
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 def _restore_group_identities(selected: list[Sample | list[Sample]], original: list[Sample]) -> None:

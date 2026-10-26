@@ -111,6 +111,16 @@ def make_fn(monkeypatch, args, data_source, generate=None):
     return fully_async.FullyAsyncRolloutFn(RolloutFnConstructorInput(args=args, data_source=data_source))
 
 
+def test_in_flight_group_limit_counts_eager_candidates(monkeypatch):
+    args = make_args(
+        async_max_concurrent_samples=8,
+        group_oversampling_extra=2,
+    )
+    fn = make_fn(monkeypatch, args, FakeDataSource())
+
+    assert fn._max_in_flight_groups() == 2
+
+
 async def test_drain_collects_batch_sorted_with_metrics(monkeypatch):
     args = make_args(rollout_batch_size=3)
     fn = make_fn(monkeypatch, args, FakeDataSource())

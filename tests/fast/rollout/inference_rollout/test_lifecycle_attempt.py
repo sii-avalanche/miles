@@ -154,6 +154,7 @@ async def test_group_oversampling_returns_after_target_usable_candidates(lifecyc
     state = make_state(generate)
     state.args.group_rm = False
     state.args.group_oversampling_extra = 2
+    state.generate_fn_semaphore = asyncio.Semaphore(4)
     samples = [Sample(group_index=0, index=1, reward=1), Sample(group_index=0, index=2, reward=1)]
 
     result = await common.generate_and_rm_group(state, samples, sampling_params={})
@@ -163,3 +164,11 @@ async def test_group_oversampling_returns_after_target_usable_candidates(lifecyc
     assert len(result) == 2
     assert all(sample.status == Sample.Status.COMPLETED for sample in result)
     assert [sample.index for sample in result] == [1, 2]
+    candidate_ids = {1, 2, -1_000_001, -1_000_002}
+    assert {index for _, index in lifecycle_sink.events} == candidate_ids
+    for index in candidate_ids:
+        assert [kind for kind, observed in lifecycle_sink.events if observed == index] == [
+            "attempt_start",
+            "gen_start",
+            "attempt_end",
+        ]

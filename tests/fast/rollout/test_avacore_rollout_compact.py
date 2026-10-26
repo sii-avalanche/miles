@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 from argparse import Namespace
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ async def test_multi_tip_generation_assigns_one_compact_rollout_id(monkeypatch):
     adapter.generate_fn = generate
     adapter.reward_fn = reward
     adapter.recording = None
+    adapter.group_oversampling = avacore_rollout._GroupOversampling()
 
     monkeypatch.setattr(avacore_rollout, "iter_trace_nodes", lambda _traces: iter(nodes))
     monkeypatch.setattr(avacore_rollout, "conversation_tips", lambda _traces: iter(tips))
@@ -120,6 +122,64 @@ async def test_non_retryable_failure_does_not_oversample(monkeypatch):
     assert output is sample
     assert calls == 1
     assert output.status == Sample.Status.ABORTED
+
+
+async def test_abort_finish_reason_is_not_retried_as_infrastructure_failure(monkeypatch):
+    calls = 0
+
+    async def generate(_row, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return (tip,)
+
+    adapter, node, tip = _single_tip_adapter(generate)
+    node.message.metadata = {"finish_reason": {"type": "abort"}}
+    monkeypatch.setattr(avacore_rollout, "iter_trace_nodes", lambda _traces: iter((node,)))
+    sample = Sample(index=17, prompt="question")
+
+    output = await adapter.generate(sample, sampling_params={})
+
+    assert output is sample
+    assert calls == 1
+    assert output.status == Sample.Status.ABORTED
+
+
+async def test_record_uses_candidate_slot_for_stable_trial_identity():
+    class FakeRun:
+        def __init__(self):
+            self.calls = []
+
+        async def create_rollout(self, **kwargs):
+            self.calls.append(kwargs)
+
+    run = FakeRun()
+    adapter = object.__new__(avacore_rollout.AvaCoreRollout)
+    adapter.args = Namespace(n_samples_per_prompt=8)
+    adapter.run = asyncio.create_task(asyncio.sleep(0, result=run))
+    adapter.failed_writes = 0
+    node = SimpleNamespace(
+        generated=True,
+        segments=(object(),),
+        message=SimpleNamespace(metadata={"weight_version": 3}),
+    )
+    trace = SimpleNamespace(prefixes=(node,))
+    cases = [(0, 0), (0, 8), (0, 8), (1, 0), (1, 8)]
+
+    for epoch, slot in cases:
+        sample = Sample(
+            epoch=epoch,
+            index=slot,
+            metadata={
+                "_index": "prompt",
+                "_group_oversampling_candidate_slot": slot,
+                "_group_oversampling_candidate_width": 10,
+            },
+        )
+        await adapter.record(SimpleNamespace(), sample, (trace,), Reward(score=1.0), {})
+
+    assert [call["query_id"] for call in run.calls] == ["prompt"] * 5
+    assert [call["trial_id"] for call in run.calls] == [0, 8, 8, 10, 18]
+    assert [call["metadata"] for call in run.calls] == [{"weight_version": 3}] * 5
 
 
 @pytest.mark.parametrize(

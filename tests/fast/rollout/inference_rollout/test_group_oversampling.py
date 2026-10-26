@@ -25,9 +25,10 @@ def make_state(generate):
     )
 
 
-async def test_exhausted_candidates_never_return_an_unusable_training_group():
+@pytest.mark.parametrize("unusable", [Sample.Status.ABORTED, Sample.Status.PENDING])
+async def test_exhausted_candidates_never_return_an_unusable_training_group(unusable):
     async def generate(input):
-        input.sample.status = Sample.Status.COMPLETED if input.sample.index == 1 else Sample.Status.ABORTED
+        input.sample.status = Sample.Status.COMPLETED if input.sample.index == 1 else unusable
         return GenerateFnOutput(samples=input.sample)
 
     group = [
@@ -73,3 +74,35 @@ async def test_group_failure_observes_every_candidate_task(monkeypatch):
         await common.generate_and_rm_group(make_state(generate), group, sampling_params={})
 
     assert len(observed) == 3
+
+
+async def test_parent_cancellation_waits_for_surplus_cleanup_to_finish():
+    child_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def child() -> None:
+        child_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleanup_finished.set()
+            raise
+
+    child_task = asyncio.create_task(child())
+    await child_started.wait()
+    settlement = asyncio.create_task(common._cancel_and_settle({child_task}))
+    await cleanup_started.wait()
+
+    settlement.cancel()
+    await asyncio.sleep(0)
+    assert not settlement.done()
+    assert not cleanup_finished.is_set()
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await settlement
+    assert cleanup_finished.is_set()

@@ -315,6 +315,16 @@ class TestSubmissionSchedulers:
         scheduler.sample_done_callback()
         assert scheduler.has_capacity(pending_groups=2, group_budget=2)
 
+    def test_backfill_reserves_credits_for_eager_group_candidates(self):
+        args = make_args(rollout_submission_granularity="sample", group_oversampling_extra=2)
+        scheduler = make_submission_scheduler(args, default="group")
+
+        scheduler.on_submit([make_group(1)])
+
+        assert isinstance(scheduler, SampleBackfillSubmission)
+        assert scheduler.group_size == GROUP_SIZE + 2
+        assert scheduler.samples_in_flight == GROUP_SIZE + 2
+
     def test_orphaned_credits_resync_when_nothing_is_pending(self):
         scheduler = SampleBackfillSubmission(GROUP_SIZE)
         # credits whose sample tasks never spawned
