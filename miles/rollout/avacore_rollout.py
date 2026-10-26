@@ -5,6 +5,7 @@ import os
 from argparse import Namespace
 from collections.abc import Iterator, Mapping
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import Reward
-from ava_core.runner import RECOVERABLE_ERRORS
+from ava_core.runner import RECOVERABLE_ERRORS, Retry
 from ava_core.store.core import Run
 from ava_core.store.postgres import PostgresBackend
 
@@ -27,6 +28,46 @@ from miles.utils.types import Sample, WeightVersionsPerCall
 __all__ = ["AvaCoreRollout", "generate"]
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _GroupOversampling:
+    """Retry failed slots without increasing the group's live rollout width."""
+
+    max_extra_attempts_per_slot: int = 0
+    initial_backoff_seconds: float = 2.0
+    max_backoff_seconds: float = 20.0
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "_GroupOversampling":
+        raw = config.get("group_oversampling", {})
+        if not isinstance(raw, Mapping):
+            raise TypeError("group_oversampling must be a table")
+        unknown = set(raw) - {
+            "max_extra_attempts_per_slot",
+            "initial_backoff_seconds",
+            "max_backoff_seconds",
+        }
+        if unknown:
+            raise ValueError(f"unknown group_oversampling options: {sorted(unknown)}")
+        policy = cls(**raw)
+        if isinstance(policy.max_extra_attempts_per_slot, bool) or policy.max_extra_attempts_per_slot < 0:
+            raise ValueError("group_oversampling.max_extra_attempts_per_slot must be a non-negative integer")
+        if not isinstance(policy.max_extra_attempts_per_slot, int):
+            raise TypeError("group_oversampling.max_extra_attempts_per_slot must be an integer")
+        if policy.initial_backoff_seconds < 0 or policy.max_backoff_seconds < policy.initial_backoff_seconds:
+            raise ValueError("group_oversampling backoff must satisfy 0 <= initial <= max")
+        return policy
+
+    def backoff(self, failed_attempt: int) -> float:
+        return min(self.max_backoff_seconds, self.initial_backoff_seconds * 2 ** (failed_attempt - 1))
+
+
+def _retryable(error: BaseException) -> bool:
+    """Honor the remote service's classification, with local AvaCore as fallback."""
+
+    classified = getattr(error, "retryable", None)
+    return bool(classified) if classified is not None else Retry.should_retry(error)
 
 
 class AvaCoreRollout:
@@ -43,25 +84,48 @@ class AvaCoreRollout:
         self.stack = AsyncExitStack()
         self.writes: set[asyncio.Task[None]] = set()
         self.failed_writes = 0
+        self.group_oversampling = _GroupOversampling.from_config(config)
 
     async def generate(self, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
-        try:
-            traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
-            if any(
-                message.metadata["finish_reason"]["type"] == "abort"
-                for node in iter_trace_nodes(traces)
-                for message in (node.message,)
-                if "finish_reason" in message.metadata
-            ):
-                sample.status = Sample.Status.ABORTED
-                return sample
-            reward = await self.reward_fn(traces[0], row)
-        except RECOVERABLE_ERRORS as error:
-            logger.warning("AvaCore rollout of sample %s aborted: %r", sample.index, error)
-            sample.status = Sample.Status.ABORTED
-            return sample
+        policy = getattr(self, "group_oversampling", _GroupOversampling())
+        max_attempts = policy.max_extra_attempts_per_slot + 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
+                aborted = any(
+                    message.metadata["finish_reason"]["type"] == "abort"
+                    for node in iter_trace_nodes(traces)
+                    for message in (node.message,)
+                    if "finish_reason" in message.metadata
+                )
+                if aborted:
+                    if attempt == max_attempts:
+                        logger.warning(
+                            "AvaCore rollout slot exhausted after an abort: sample=%s attempts=%d",
+                            sample.index,
+                            attempt,
+                        )
+                        sample.status = Sample.Status.ABORTED
+                        return sample
+                    await self._retry_slot(sample, attempt, max_attempts, "finish_reason=abort")
+                    continue
+                reward = await self.reward_fn(traces[0], row)
+                break
+            except RECOVERABLE_ERRORS as error:
+                if attempt == max_attempts or not _retryable(error):
+                    logger.warning(
+                        "AvaCore rollout slot aborted: sample=%s attempts=%d/%d retryable=%s error=%r",
+                        sample.index,
+                        attempt,
+                        max_attempts,
+                        _retryable(error),
+                        error,
+                    )
+                    sample.status = Sample.Status.ABORTED
+                    return sample
+                await self._retry_slot(sample, attempt, max_attempts, type(error).__name__)
 
         assert traces and any(node.segments for node in iter_trace_nodes(traces)), (
             "AvaCore rollouts must drive the policy through a token-level client"
@@ -83,6 +147,22 @@ class AvaCoreRollout:
             for output in samples:
                 output.rollout_id = rollout_id
         return samples[0] if len(samples) == 1 else samples
+
+    async def _retry_slot(self, sample: Sample, failed_attempt: int, max_attempts: int, reason: str) -> None:
+        policy = getattr(self, "group_oversampling", _GroupOversampling())
+        delay = policy.backoff(failed_attempt)
+        logger.warning(
+            "AvaCore rollout slot retry: sample=%s next_attempt=%d/%d delay=%.1fs reason=%s",
+            sample.index,
+            failed_attempt + 1,
+            max_attempts,
+            delay,
+            reason,
+        )
+        sample.reset_for_retry()
+        sample.status = Sample.Status.PENDING
+        if delay:
+            await asyncio.sleep(delay)
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
@@ -115,7 +195,11 @@ class AvaCoreRollout:
             assert sample.epoch is not None and sample.index is not None
             n = self.args.n_samples_per_prompt
             query_id = str(sample.metadata["_index"])
-            trial_id = sample.epoch * n + sample.index % n
+            if (slot := sample.metadata.get("_group_oversampling_candidate_slot")) is not None:
+                width = int(sample.metadata["_group_oversampling_candidate_width"])
+                trial_id = sample.epoch * width + int(slot)
+            else:
+                trial_id = sample.epoch * n + sample.index % n
             if self.run is None:
                 self.run = asyncio.create_task(self.open(sampling_params))
             run = await self.run

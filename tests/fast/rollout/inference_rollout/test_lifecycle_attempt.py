@@ -36,6 +36,7 @@ def make_state(generate_function):
         partial_rollout=False,
         mask_offpolicy_in_partial_rollout=False,
         group_rm=True,
+        group_oversampling_extra=0,
         sglang_router_policy="round_robin",
     )
     return SimpleNamespace(
@@ -124,3 +125,41 @@ async def test_cancelled_group_sibling_ends_attempt(lifecycle_sink):
             "gen_start",
             "attempt_end",
         ]
+
+
+async def test_group_oversampling_returns_after_target_usable_candidates(lifecycle_sink):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    cancelled = []
+
+    async def generate(input):
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            started.set()
+        await started.wait()
+        if input.sample.index == 1:
+            input.sample.status = Sample.Status.ABORTED
+        elif input.sample.index == -1_000_002:
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.append(input.sample.index)
+                raise
+        else:
+            input.sample.status = Sample.Status.COMPLETED
+        return GenerateFnOutput(samples=input.sample)
+
+    state = make_state(generate)
+    state.args.group_rm = False
+    state.args.group_oversampling_extra = 2
+    samples = [Sample(group_index=0, index=1, reward=1), Sample(group_index=0, index=2, reward=1)]
+
+    result = await common.generate_and_rm_group(state, samples, sampling_params={})
+
+    assert calls == 4
+    assert cancelled == [-1_000_002]
+    assert len(result) == 2
+    assert all(sample.status == Sample.Status.COMPLETED for sample in result)
+    assert [sample.index for sample in result] == [1, 2]

@@ -150,15 +150,19 @@ async def generate_and_rm_group(
     if state.aborted:
         return group
 
+    target_size = len(group)
+    candidates = _oversampling_candidates(
+        group,
+        0 if evaluation else getattr(args, "group_oversampling_extra", 0),
+    )
     if policy_uses_routing_key(args):
-        for sample in group:
+        for sample in candidates:
             if sample.routing_key is None:
                 sample.routing_key = str(uuid.uuid4())
-
     log_prefix = f"[group indices={[getattr(s, 'index', '?') for s in group]}]"
-    logger.debug(f"{log_prefix} Starting group with {len(group)} samples")
+    logger.debug(f"{log_prefix} Starting group with {len(candidates)} candidates for {target_size} slots")
     tasks = []
-    for idx, sample in enumerate(group):
+    for idx, sample in enumerate(candidates):
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
             current_sampling_params["sampling_seed"] = args.rollout_seed + idx
@@ -168,19 +172,37 @@ async def generate_and_rm_group(
             task.add_done_callback(lambda _task: sample_done_callback())
         tasks.append(task)
 
+    pending = set(tasks)
+    order = {task: index for index, task in enumerate(tasks)}
+    usable: list[Sample | list[Sample]] = []
+    unusable: list[Sample | list[Sample]] = []
     try:
-        group = await asyncio.gather(*tasks)
+        while pending and len(usable) < target_size:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in sorted(done, key=order.__getitem__):
+                result = task.result()
+                (usable if _usable_candidate(result) else unusable).append(result)
     except BaseException:
-        # cancel siblings and let them settle: the group returns only after every
-        # sample task is done, so no orphan generation or in-flight credit outlives it
-        for task in tasks:
-            # Cancelling gather already cancelled its children. A second cancel could
-            # interrupt a child's shielded Trace persistence cleanup.
-            if not task.done() and not task.cancelling():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await _cancel_and_settle(pending)
         raise
-    logger.debug(f"{log_prefix} [group] All {len(group)} samples completed")
+
+    cancelled = len(pending)
+    await _cancel_and_settle(pending)
+    selected = (usable + unusable)[:target_size]
+    assert len(selected) == target_size
+    _restore_group_identities(selected, group)
+    if len(candidates) > target_size:
+        logger.info(
+            "%s Oversampling target=%d candidates=%d usable=%d unusable=%d cancelled=%d",
+            log_prefix,
+            target_size,
+            len(candidates),
+            len(usable),
+            len(unusable),
+            cancelled,
+        )
+    group = selected
+    logger.debug(f"{log_prefix} [group] Selected {len(group)} samples")
     if state.aborted:
         return group
 
@@ -188,6 +210,46 @@ async def generate_and_rm_group(
         await batched_async_rm(args, group, inplace_set_reward_field=True)
 
     return group
+
+
+def _oversampling_candidates(group: list[Sample], extra: int) -> list[Sample]:
+    if extra <= 0:
+        return group
+    if not group:
+        raise ValueError("cannot oversample an empty prompt group")
+    width = len(group) + extra
+    candidates = list(group)
+    for offset in range(extra):
+        candidate = deepcopy(group[offset % len(group)])
+        group_index = candidate.group_index or 0
+        candidate.index = -((group_index + 1) * 1_000_000 + offset + 1)
+        candidate.routing_key = None
+        candidates.append(candidate)
+    for slot, candidate in enumerate(candidates):
+        candidate.metadata["_group_oversampling_candidate_slot"] = slot
+        candidate.metadata["_group_oversampling_candidate_width"] = width
+    return candidates
+
+
+def _usable_candidate(candidate: Sample | list[Sample]) -> bool:
+    samples = candidate if isinstance(candidate, list) else [candidate]
+    return not any(sample.status == Sample.Status.ABORTED for sample in samples)
+
+
+async def _cancel_and_settle(tasks: set[asyncio.Task]) -> None:
+    for task in tasks:
+        if not task.done() and not task.cancelling():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _restore_group_identities(selected: list[Sample | list[Sample]], original: list[Sample]) -> None:
+    for candidate, identity in zip(selected, original, strict=True):
+        samples = candidate if isinstance(candidate, list) else [candidate]
+        for sample in samples:
+            sample.group_index = identity.group_index
+            sample.index = identity.index
+            sample.epoch = identity.epoch
 
 
 def compute_sampling_params(

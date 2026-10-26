@@ -13,6 +13,12 @@ from miles.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
+def effective_group_size(args: Namespace) -> int:
+    """Live candidate width, including eager within-group oversampling."""
+
+    return args.n_samples_per_prompt + getattr(args, "group_oversampling_extra", 0)
+
+
 class GroupLevelSubmission:
     """A submission slot frees only when the whole group task returns."""
 
@@ -60,7 +66,9 @@ class SampleBackfillSubmission:
         return self.available_groups(pending_groups=pending_groups, group_budget=group_budget) > 0
 
     def on_submit(self, groups: list[list[Sample]]) -> None:
-        self.samples_in_flight += sum(len(group) for group in groups)
+        # The extra candidates are materialized inside generate_and_rm_group,
+        # after the source hands the prompt group to the scheduler.
+        self.samples_in_flight += len(groups) * self.group_size
 
     async def wait_for_progress(self, pendings: set[asyncio.Task]) -> tuple[set[asyncio.Task], set[asyncio.Task]]:
         waiter = asyncio.create_task(self._sample_done.wait())
@@ -76,4 +84,4 @@ def make_submission_scheduler(args: Namespace, *, default: str) -> GroupLevelSub
     if granularity == "group":
         return GroupLevelSubmission()
     assert granularity == "sample", f"unknown submission granularity: {granularity}"
-    return SampleBackfillSubmission(args.n_samples_per_prompt)
+    return SampleBackfillSubmission(effective_group_size(args))

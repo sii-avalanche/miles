@@ -844,6 +844,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--group-oversampling-extra",
+                type=int,
+                default=0,
+                help=(
+                    "Number of extra trajectories launched eagerly inside each prompt group. "
+                    "The class-based rollout returns as soon as n_samples_per_prompt usable "
+                    "trajectories finish and cancels the remaining extras. This reduces abort "
+                    "and long-tail latency without changing the training group size."
+                ),
+            )
+            parser.add_argument(
                 "--dynamic-sampling-filter-path",
                 type=str,
                 default=None,
@@ -3874,11 +3885,18 @@ def miles_validate_args(args):
         )
 
     if args.async_max_concurrent_samples is not None:
-        assert args.async_max_concurrent_samples >= args.n_samples_per_prompt, (
+        effective_group_size = args.n_samples_per_prompt + args.group_oversampling_extra
+        assert args.async_max_concurrent_samples >= effective_group_size, (
             f"--async-max-concurrent-samples ({args.async_max_concurrent_samples}) must be at least "
-            f"--n-samples-per-prompt ({args.n_samples_per_prompt}): the worker submits whole groups, "
-            f"so one group already puts n_samples_per_prompt trajectories in flight"
+            f"the effective group size ({effective_group_size}): the worker submits whole groups, "
+            "including their eager oversampling candidates"
         )
+
+    assert args.group_oversampling_extra >= 0, "--group-oversampling-extra must be non-negative"
+    assert not args.group_oversampling_extra or not use_legacy_rollout_v1(), (
+        "--group-oversampling-extra requires the class-based rollout API; "
+        "unset MILES_USE_LEGACY_ROLLOUT_V1"
+    )
 
     _resolve_rollout_functions(args)
 
