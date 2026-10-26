@@ -95,9 +95,11 @@ async def test_retryable_failure_refills_only_the_failed_group_slot(monkeypatch)
 
     output = await adapter.generate(sample, sampling_params={})
 
-    assert output is sample
+    assert output is not sample
+    assert output.index == sample.index
     assert calls == 2
     assert output.reward == 1.0
+    assert sample.reward is None
 
 
 async def test_non_retryable_failure_does_not_oversample(monkeypatch):
