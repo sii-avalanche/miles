@@ -172,6 +172,19 @@ async def generate_and_rm_group(
             task.add_done_callback(lambda _task: sample_done_callback())
         tasks.append(task)
 
+    if len(candidates) == target_size:
+        try:
+            group = await asyncio.gather(*tasks)
+        except BaseException:
+            await _cancel_and_settle(set(tasks))
+            raise
+        logger.debug(f"{log_prefix} [group] All {len(group)} samples completed")
+        if state.aborted:
+            return group
+        if args.group_rm:
+            await batched_async_rm(args, group, inplace_set_reward_field=True)
+        return group
+
     pending = set(tasks)
     order = {task: index for index, task in enumerate(tasks)}
     usable: list[Sample | list[Sample]] = []
@@ -183,13 +196,17 @@ async def generate_and_rm_group(
                 result = task.result()
                 (usable if _usable_candidate(result) else unusable).append(result)
     except BaseException:
-        await _cancel_and_settle(pending)
+        await _cancel_and_settle(set(tasks))
         raise
 
     cancelled = len(pending)
     await _cancel_and_settle(pending)
-    selected = (usable + unusable)[:target_size]
-    assert len(selected) == target_size
+    if len(usable) < target_size:
+        raise RuntimeError(
+            f"group oversampling exhausted with only {len(usable)}/{target_size} usable candidates "
+            f"from {len(candidates)} attempts"
+        )
+    selected = usable[:target_size]
     _restore_group_identities(selected, group)
     if len(candidates) > target_size:
         logger.info(
@@ -233,7 +250,8 @@ def _oversampling_candidates(group: list[Sample], extra: int) -> list[Sample]:
 
 def _usable_candidate(candidate: Sample | list[Sample]) -> bool:
     samples = candidate if isinstance(candidate, list) else [candidate]
-    return not any(sample.status == Sample.Status.ABORTED for sample in samples)
+    usable = {Sample.Status.COMPLETED, Sample.Status.TRUNCATED, Sample.Status.REPEATED, Sample.Status.FAILED}
+    return all(sample.status in usable for sample in samples)
 
 
 async def _cancel_and_settle(tasks: set[asyncio.Task]) -> None:
@@ -244,12 +262,13 @@ async def _cancel_and_settle(tasks: set[asyncio.Task]) -> None:
 
 
 def _restore_group_identities(selected: list[Sample | list[Sample]], original: list[Sample]) -> None:
-    for candidate, identity in zip(selected, original, strict=True):
+    identities = [(sample.group_index, sample.index, sample.epoch) for sample in original]
+    for candidate, (group_index, index, epoch) in zip(selected, identities, strict=True):
         samples = candidate if isinstance(candidate, list) else [candidate]
         for sample in samples:
-            sample.group_index = identity.group_index
-            sample.index = identity.index
-            sample.epoch = identity.epoch
+            sample.group_index = group_index
+            sample.index = index
+            sample.epoch = epoch
 
 
 def compute_sampling_params(
