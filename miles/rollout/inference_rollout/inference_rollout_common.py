@@ -49,6 +49,11 @@ class GenerateState:
         )
 
         self.generate_function = load_generate_function(args.custom_generate_function_path) or generate
+        self.avacore = None
+        if (config := getattr(args, "avacore_config", None)) is not None:
+            from miles.rollout.avacore_rollout import AvaCoreRollout
+
+            self.avacore = AvaCoreRollout(args, config)
 
         self.reset()
 
@@ -151,10 +156,10 @@ async def generate_and_rm_group(
         return group
 
     target_size = len(group)
-    candidates = _oversampling_candidates(
-        group,
-        0 if evaluation else getattr(args, "group_oversampling_extra", 0),
-    )
+    # Evaluation keeps the dataset-requested group width exactly; eager extras
+    # are a training-only latency/failure hedge and would change eval counts.
+    extra_candidates = 0 if evaluation else getattr(args, "group_oversampling_extra", 0)
+    candidates = _oversampling_candidates(group, extra_candidates)
     if policy_uses_routing_key(args):
         for sample in candidates:
             if sample.routing_key is None:
@@ -202,6 +207,14 @@ async def generate_and_rm_group(
     cancelled = len(pending)
     await _cancel_and_settle(pending)
     if len(usable) < target_size:
+        if state.aborted:
+            # Partial-rollout abort deliberately lets every candidate return
+            # its continuation state. Preserve the original prompt-group
+            # width and identities instead of treating those partial results
+            # as normal oversampling exhaustion.
+            partial_group = [task.result() for task in tasks[:target_size]]
+            _restore_group_identities(partial_group, group)
+            return partial_group
         raise RuntimeError(
             f"group oversampling exhausted with only {len(usable)}/{target_size} usable candidates "
             f"from {len(candidates)} attempts"

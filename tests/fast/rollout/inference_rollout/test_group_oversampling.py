@@ -106,3 +106,35 @@ async def test_parent_cancellation_waits_for_surplus_cleanup_to_finish():
     with pytest.raises(asyncio.CancelledError):
         await settlement
     assert cleanup_finished.is_set()
+
+
+async def test_partial_rollout_abort_returns_original_group_when_extras_are_unusable():
+    all_started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def generate(input):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            all_started.set()
+        await all_started.wait()
+        await release.wait()
+        input.sample.status = Sample.Status.ABORTED
+        input.sample.response = "partial"
+        return GenerateFnOutput(samples=input.sample)
+
+    state = make_state(generate)
+    state.args.partial_rollout = True
+    group = [Sample(group_index=0, index=1), Sample(group_index=0, index=2)]
+
+    result_task = asyncio.create_task(common.generate_and_rm_group(state, group, sampling_params={}))
+    await all_started.wait()
+    state.aborted = True
+    release.set()
+    result = await result_task
+
+    assert calls == 3
+    assert [sample.index for sample in result] == [1, 2]
+    assert all(sample.status == Sample.Status.ABORTED for sample in result)
+    assert all(sample.response == "partial" for sample in result)
