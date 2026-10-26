@@ -21,8 +21,9 @@ _WORKER_METRICS = {
         critic-loss critic-value_loss critic-value_clipfrac critic-grad_norm critic-lr-pg_0
     """,
     "rollout": """
-        raw_reward raw_reward_unfiltered rewards response_lengths total_lengths
-        repetition_frac truncated_ratio group_reward_variance_mean group_reward_variance_max
+        raw_reward raw_reward_unfiltered episode_raw_reward rewards response_lengths total_lengths
+        num_training_samples episode_total_response_length/mean group_acceptance_rate
+        repetition_frac truncated_ratio group_reward_variance_min group_reward_variance_mean group_reward_variance_max
         zero_std/all_zero_percentage zero_std/all_one_percentage
         log_probs ref_log_probs rollout_log_probs teacher_log_probs entropy correct_entropy
         advantages returns values logp_preferred logp_dispreferred frac_preferred
@@ -203,6 +204,13 @@ def _init_wandb_common():
         step_metric = "train/step" if prefix == "train" else "rollout/step"
         for name in names.split():
             wandb.define_metric(f"{prefix}/{name}", step_metric=step_metric, step_sync=False)
-    for prefix in ("response_len", "weight_version", "log_prob/token", "log_prob/sample_mean"):
+    for prefix in (
+        "response_len",
+        "episode_response_length",
+        "length_penalty",
+        "weight_version",
+        "log_prob/token",
+        "log_prob/sample_mean",
+    ):
         for statistic in ("min", "mean", "median", "max"):
             wandb.define_metric(f"rollout/{prefix}/{statistic}", step_metric="rollout/step", step_sync=False)
