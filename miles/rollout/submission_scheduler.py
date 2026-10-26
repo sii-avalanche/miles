@@ -13,10 +13,10 @@ from miles.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
-def effective_group_size(args: Namespace) -> int:
+def candidate_group_size(n_samples_per_prompt: int, group_oversampling_extra: int = 0) -> int:
     """Live candidate width, including eager within-group oversampling."""
 
-    return args.n_samples_per_prompt + getattr(args, "group_oversampling_extra", 0)
+    return n_samples_per_prompt + group_oversampling_extra
 
 
 class GroupLevelSubmission:
@@ -84,4 +84,6 @@ def make_submission_scheduler(args: Namespace, *, default: str) -> GroupLevelSub
     if granularity == "group":
         return GroupLevelSubmission()
     assert granularity == "sample", f"unknown submission granularity: {granularity}"
-    return SampleBackfillSubmission(effective_group_size(args))
+    return SampleBackfillSubmission(
+        candidate_group_size(args.n_samples_per_prompt, getattr(args, "group_oversampling_extra", 0))
+    )

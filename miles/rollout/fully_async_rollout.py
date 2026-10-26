@@ -44,7 +44,7 @@ from miles.rollout.fully_async_data_buffer import (
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
-from miles.rollout.submission_scheduler import effective_group_size, make_submission_scheduler
+from miles.rollout.submission_scheduler import candidate_group_size, make_submission_scheduler
 from miles.utils.function_registry import load_function
 from miles.utils.types import Sample
 
@@ -69,6 +69,10 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self.args = input.args
         self.data_source = input.data_source
         self.state = GenerateState(input.args)
+        self._candidate_group_size = candidate_group_size(
+            input.args.n_samples_per_prompt,
+            getattr(input.args, "group_oversampling_extra", 0),
+        )
         # default to sample level backfill for fully async rollout
         self._scheduler = make_submission_scheduler(input.args, default="sample")
         assert input.args.async_unused_samples_handler in ("retry", "drop")
@@ -122,7 +126,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
     def _max_in_flight_groups(self) -> int:
         if (x := self.args.async_max_concurrent_samples) is not None:
             # Whole groups are submitted, so the sample budget floors to a group count.
-            return max(1, x // effective_group_size(self.args))
+            return max(1, x // self._candidate_group_size)
         return self.args.rollout_batch_size
 
     def _submit_one_group(self) -> tuple[asyncio.Task, list[Sample]]:

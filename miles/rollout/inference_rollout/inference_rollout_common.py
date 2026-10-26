@@ -51,6 +51,7 @@ class GenerateState:
         self.generate_function = load_generate_function(args.custom_generate_function_path) or generate
         self.avacore = None
         if (config := getattr(args, "avacore_config", None)) is not None:
+            # AvaCore is optional; avoid importing its dependency stack for ordinary rollouts.
             from miles.rollout.avacore_rollout import AvaCoreRollout
 
             self.avacore = AvaCoreRollout(args, config)
