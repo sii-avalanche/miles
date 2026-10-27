@@ -29,6 +29,9 @@ __all__ = ["AvaCoreRollout", "generate"]
 
 logger = logging.getLogger(__name__)
 
+_CANDIDATE_SLOT = "_group_oversampling_candidate_slot"
+_CANDIDATE_WIDTH = "_group_oversampling_candidate_width"
+
 
 @dataclass(frozen=True)
 class _GroupOversampling:
@@ -89,7 +92,10 @@ class AvaCoreRollout:
         self.group_oversampling = _GroupOversampling.from_config(config)
 
     async def generate(self, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
-        row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
+        metadata = {
+            key: value for key, value in sample.metadata.items() if key not in {_CANDIDATE_SLOT, _CANDIDATE_WIDTH}
+        }
+        row = Row({**metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         policy = self.group_oversampling
         max_attempts = policy.max_extra_attempts_per_slot + 1
@@ -190,9 +196,11 @@ class AvaCoreRollout:
             assert sample.epoch is not None and sample.index is not None
             n = self.args.n_samples_per_prompt
             query_id = str(sample.metadata["_index"])
-            if (slot := sample.metadata.get("_group_oversampling_candidate_slot")) is not None:
-                width = int(sample.metadata["_group_oversampling_candidate_width"])
+            metadata = {"weight_version": _weight_version(traces[0])}
+            if (slot := sample.metadata.get(_CANDIDATE_SLOT)) is not None:
+                width = int(sample.metadata[_CANDIDATE_WIDTH])
                 trial_id = sample.epoch * width + int(slot)
+                metadata |= {_CANDIDATE_SLOT: int(slot), _CANDIDATE_WIDTH: width}
             else:
                 trial_id = sample.epoch * n + sample.index % n
             if self.run is None:
@@ -205,7 +213,7 @@ class AvaCoreRollout:
                 traces=traces,
                 reward=reward,
                 status="completed",
-                metadata={"weight_version": _weight_version(traces[0])},
+                metadata=metadata,
             )
         except Exception as error:
             self.failed_writes += 1

@@ -73,6 +73,32 @@ def _single_tip_adapter(generate):
     return adapter, node, tip
 
 
+async def test_group_oversampling_metadata_does_not_change_recorded_instance(monkeypatch):
+    rows = []
+
+    async def generate(row, **_kwargs):
+        rows.append(dict(row))
+        return (tip,)
+
+    adapter, node, tip = _single_tip_adapter(generate)
+    monkeypatch.setattr(avacore_rollout, "iter_trace_nodes", lambda _traces: iter((node,)))
+    monkeypatch.setattr(avacore_rollout, "conversation_tips", lambda _traces: iter((tip,)))
+    monkeypatch.setattr(avacore_rollout, "filled", lambda _args, sample, *_args2, **_kwargs: sample)
+    sample = Sample(
+        index=17,
+        prompt="question",
+        metadata={
+            "_index": "prompt",
+            "_group_oversampling_candidate_slot": 8,
+            "_group_oversampling_candidate_width": 10,
+        },
+    )
+
+    await adapter.generate(sample, sampling_params={})
+
+    assert rows == [{"_index": "prompt", "prompt": "question", "label": None}]
+
+
 async def test_retryable_failure_refills_only_the_failed_group_slot(monkeypatch):
     calls = 0
 
@@ -180,7 +206,14 @@ async def test_record_uses_candidate_slot_for_stable_trial_identity():
 
     assert [call["query_id"] for call in run.calls] == ["prompt"] * 5
     assert [call["trial_id"] for call in run.calls] == [0, 8, 8, 10, 18]
-    assert [call["metadata"] for call in run.calls] == [{"weight_version": 3}] * 5
+    assert [call["metadata"] for call in run.calls] == [
+        {
+            "weight_version": 3,
+            "_group_oversampling_candidate_slot": slot,
+            "_group_oversampling_candidate_width": 10,
+        }
+        for _, slot in cases
+    ]
 
 
 def test_generate_state_constructs_avacore_adapter_at_startup(monkeypatch):
