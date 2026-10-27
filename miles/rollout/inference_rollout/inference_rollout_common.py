@@ -3,6 +3,7 @@ import logging
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import Any
 
@@ -82,9 +83,12 @@ async def generate_and_rm(
 
     # generate
     log_prefix = f"[sample={getattr(sample, 'index', '?')}]"
+    uses_avacore = getattr(args, "avacore_config", None) is not None or getattr(state, "avacore", None) is not None
+    # Miles already admits AvaCore training episodes.
+    admission = nullcontext() if uses_avacore and not evaluation else state.generate_fn_semaphore
     logger.debug(f"{log_prefix} Waiting for semaphore...")
     try:
-        async with state.generate_fn_semaphore:
+        async with admission:
             if state.aborted:
                 sample.status = Sample.Status.ABORTED
                 return sample
