@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 from argparse import Namespace
 from collections.abc import Callable
 
@@ -12,7 +13,11 @@ from miles.rollout.filter_hub.base_types import MetricGatherer
 from miles.rollout.filter_hub.common_filters import apply_preput_filters
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
-from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
+from miles.rollout.inference_rollout.inference_rollout_common import (
+    GenerateState,
+    cancel_and_settle,
+    generate_and_rm_group,
+)
 from miles.rollout.submission_scheduler import make_submission_scheduler
 from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
@@ -21,6 +26,15 @@ from miles.utils.misc import as_completed_async, call_agent_abort_hook
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+_REMOTE_ABORT_TIMEOUT = 20.0
+
+
+def _desired_pending_groups(*, target_groups: int, accepted_groups: int, max_window: int) -> int:
+    remaining = max(0, target_groups - accepted_groups)
+    if remaining == 0:
+        return 0
+    window = max(target_groups, max_window)
+    return min(window, math.ceil(remaining * window / target_groups))
 
 
 async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[list[Sample]]:
@@ -28,27 +42,21 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
 
     assert not state.aborted
     state.aborted = True
+    remote_abort = asyncio.create_task(_abort_remote(args))
 
-    urls = await get_worker_urls(args)
-    logger.info(f"Abort request for {urls}")
-    results = await asyncio.gather(
-        *[post(f"{url}/abort_request", {"abort_all": True}) for url in urls], return_exceptions=True
-    )
-    for url, result in zip(urls, results, strict=True):
-        if isinstance(result, Exception):
-            logger.warning(f"Failed to abort worker at {url}: {result}")
+    if not args.partial_rollout:
+        try:
+            for task in pendings:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            await cancel_and_settle(pendings)
+        finally:
+            await remote_abort
+        return []
 
-    # Let the agent integration tear down its in-flight trials so they stop hitting
-    # SGLang, instead of running on until their own max_seq_len / timeout.
-    await call_agent_abort_hook(args)
-
-    # make sure all the pending tasks are finished
+    await remote_abort
     aborted_samples = []
     async for group in as_completed_async(pendings):
-        if not args.partial_rollout:
-            continue
-
-        # for partial rollout, collect the partial samples into the data buffer
         for sample in group:
             if sample.response and "start_rollout_id" not in sample.metadata:
                 sample.metadata["start_rollout_id"] = rollout_id
@@ -58,6 +66,22 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
         logger.info(f"Collected {sum(len(x) for x in aborted_samples)} partial samples into the data buffer")
 
     return aborted_samples
+
+
+async def _abort_remote(args: Namespace) -> None:
+    try:
+        async with asyncio.timeout(_REMOTE_ABORT_TIMEOUT):
+            urls = await get_worker_urls(args)
+            logger.info(f"Abort request for {urls}")
+            results = await asyncio.gather(
+                *[post(f"{url}/abort_request", {"abort_all": True}) for url in urls], return_exceptions=True
+            )
+            for url, result in zip(urls, results, strict=True):
+                if isinstance(result, Exception):
+                    logger.warning(f"Failed to abort worker at {url}: {result}")
+            await call_agent_abort_hook(args)
+    except Exception as error:
+        logger.warning("Remote rollout abort did not finish: %r", error)
 
 
 async def get_worker_urls(args: Namespace):
@@ -115,9 +139,18 @@ async def generate_rollout_async(
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
-        while scheduler.has_capacity(pending_groups=len(pendings), group_budget=target_data_size - len(data)):
-            # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
+        desired_pending = _desired_pending_groups(
+            target_groups=target_data_size,
+            accepted_groups=len(data),
+            max_window=args.over_sampling_batch_size,
+        )
+        while (
+            capacity := scheduler.available_groups(
+                pending_groups=len(pendings),
+                group_budget=desired_pending,
+            )
+        ) > 0:
+            samples = data_source(min(args.over_sampling_batch_size, capacity))
             scheduler.on_submit(samples)
             pendings.update(submit_generate_tasks(state, samples, scheduler.sample_done_callback))
 
