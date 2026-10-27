@@ -63,7 +63,13 @@ class AvaCoreRollout:
             request = {"sampling_params": dict(sampling_params)}
             configure_rollout_topk_logprobs_request(self.args, request)
             sampling_params = request["sampling_params"]
-            replay["sampler_logprobs"] = _sampler_contract(self.args)
+            replay["sampler_logprobs"] = dict(
+                count=self.args.rollout_top_logprobs_num,
+                temperature=self.args.rollout_temperature,
+                top_p=self.args.rollout_top_p,
+                top_k=self.args.rollout_top_k,
+                mode=self.args.rollout_sampling_logprobs_mode,
+            )
         try:
             traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
             if not isinstance(traces, tuple) or not traces or not all(isinstance(t, Trace) for t in traces):
@@ -250,21 +256,17 @@ def filled(
     return sample
 
 
-def _sampler_contract(args: Namespace) -> dict[str, Any]:
-    return dict(
+def _fill_sampling_metadata(args: Namespace, sample: Sample, segments, messages) -> None:
+    """Use native collectors for each turn and native padding for observation tokens."""
+    k, mode = args.rollout_top_logprobs_num, args.rollout_sampling_logprobs_mode
+    support = mode == "support"
+    contract = dict(
         count=args.rollout_top_logprobs_num,
         temperature=args.rollout_temperature,
         top_p=args.rollout_top_p,
         top_k=args.rollout_top_k,
         mode=args.rollout_sampling_logprobs_mode,
     )
-
-
-def _fill_sampling_metadata(args: Namespace, sample: Sample, segments, messages) -> None:
-    """Use native collectors for each turn and native padding for observation tokens."""
-    k, mode = args.rollout_top_logprobs_num, args.rollout_sampling_logprobs_mode
-    support = mode == "support"
-    contract = _sampler_contract(args)
     collected = Sample()
     messages, log_probs = iter(messages), []
     append_rollout_topk_logprobs(collected, {}, k)  # Initialize padding even before the first generated segment.
