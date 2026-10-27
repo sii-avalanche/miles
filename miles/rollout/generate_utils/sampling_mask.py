@@ -98,27 +98,13 @@ def append_sampling_metadata(
     sampling_logprobs_mode: str = "selected",
 ) -> list[float]:
     """Append SGLang's realized support and return sampled-token log-probs."""
-    mask, log_probs = extract_sampling_metadata(
-        output_token_ids, meta_info, aborted=aborted, sampling_logprobs_mode=sampling_logprobs_mode
-    )
-    _append_sampling_mask(sample, mask)
-    return log_probs
-
-
-def extract_sampling_metadata(
-    output_token_ids: Sequence[int],
-    meta_info: dict,
-    *,
-    aborted: bool = False,
-    sampling_logprobs_mode: str = "selected",
-) -> tuple[RolloutSamplingMask, list[float]]:
-    """Return validated sampling support/logprobs without modifying a sample."""
     supports = meta_info.get("output_token_sampling_mask")
     log_probs = meta_info.get("output_token_sampling_logprobs")
     if supports is None or log_probs is None:
         finish_reason = meta_info.get("finish_reason") or {}
         if (aborted or finish_reason.get("type") == "abort") and not output_token_ids:
-            return RolloutSamplingMask.from_mask_list([]), []
+            _append_sampling_mask(sample, RolloutSamplingMask.from_mask_list([]))
+            return []
         raise ValueError(
             "SGLang response is missing output_token_sampling_mask or "
             "output_token_sampling_logprobs; use an SGLang build with the "
@@ -143,7 +129,8 @@ def extract_sampling_metadata(
         selected = [float(value) for value in log_probs]
     else:
         raise ValueError(f"Unsupported sampling logprobs mode: {sampling_logprobs_mode}")
-    return sampling_mask, selected
+    _append_sampling_mask(sample, sampling_mask)
+    return selected
 
 
 def append_forced_sampling_tokens(sample: Sample, token_ids: Sequence[int]) -> None:

@@ -51,16 +51,6 @@ def append_rollout_topk_logprobs(
     """
     if not k:
         return
-    ids, logps = extract_rollout_topk_logprobs(meta, k, sampling_logprobs_mode=sampling_logprobs_mode)
-    for name, values in (("rollout_topk_token_ids", ids), ("rollout_topk_log_probs", logps)):
-        previous = getattr(sample, name)
-        setattr(sample, name, values if previous is None else np.concatenate((previous, values)))
-
-
-def extract_rollout_topk_logprobs(
-    meta: Mapping[str, Any], k: int, *, sampling_logprobs_mode: str = "selected"
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return candidate IDs/logprobs without modifying a sample or response metadata."""
     n = len(meta.get("output_token_logprobs") or [])
     support_mode = sampling_logprobs_mode == "support"
     field = "output_token_sampling_logprobs" if support_mode else "output_top_logprobs"
@@ -79,7 +69,9 @@ def extract_rollout_topk_logprobs(
             probabilities = [entry[0] for entry in entries[:k]]
         ids[i, : len(token_ids)] = token_ids
         logps[i, : len(token_ids)] = probabilities
-    return ids, logps
+    for name, values in (("rollout_topk_token_ids", ids), ("rollout_topk_log_probs", logps)):
+        previous = getattr(sample, name)
+        setattr(sample, name, values if previous is None else np.concatenate((previous, values)))
 
 
 def _support_membership(ids: np.ndarray, support: RolloutSamplingMask) -> tuple[np.ndarray, np.ndarray]:
