@@ -6,6 +6,7 @@ import os
 from argparse import Namespace
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,12 @@ from ava_core.store.postgres import PostgresBackend
 
 from miles.utils.recording.outbox import DurableRolloutOutbox, _atomic_json
 from miles.rollout.avacore_trace import conversation_tips, graph_nodes, snapshot_traces, write_record
+from miles.rollout.generate_utils.rollout_topk_logprobs import (
+    append_rollout_topk_logprobs,
+    configure_rollout_topk_logprobs_request,
+    pad_rollout_topk_logprobs,
+    validate_rollout_topk_logprobs_sample,
+)
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.rollout.generate_utils.sampling_mask import (
     append_forced_sampling_tokens,
@@ -149,7 +156,18 @@ class AvaCoreRollout:
             trial_id = await self._outbox.allocate_trial(sample, self.args.n_samples_per_prompt)
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
-        if getattr(self.args, "use_sampling_support_replay", False) and not evaluation:
+        if getattr(self.args, "rollout_top_logprobs_num", 0) and not evaluation:
+            request = {"sampling_params": dict(sampling_params)}
+            configure_rollout_topk_logprobs_request(self.args, request)
+            sampling_params = request["sampling_params"]
+            replay["sampler_logprobs"] = dict(
+                count=self.args.rollout_top_logprobs_num,
+                temperature=self.args.rollout_temperature,
+                top_p=self.args.rollout_top_p,
+                top_k=self.args.rollout_top_k,
+                mode=self.args.rollout_sampling_logprobs_mode,
+            )
+        elif getattr(self.args, "use_sampling_support_replay", False) and not evaluation:
             should_return_sampling_mask(self.args, sampling_params)
             # PPO needs the realized support and only the sampled token's normalized score.
             replay.update(return_sampling_mask=True, sampling_logprobs_mode="selected")
@@ -392,7 +410,12 @@ def filled(
             spans.append((offset, offset + len(segment.tokens)))
         offset += len(segment.tokens)
     finished = [node.message for node in trace.prefixes if node.generated and node.segments]
-    if getattr(args, "use_sampling_support_replay", False) and not evaluation:
+    if not evaluation and getattr(args, "rollout_top_logprobs_num", 0):
+        sample = _with_sampling_metadata(args, sample, segments, finished)
+        sample.validate()
+        if getattr(args, "ci_test", False):
+            validate_rollout_topk_logprobs_sample(sample, args.rollout_top_logprobs_num)
+    elif getattr(args, "use_sampling_support_replay", False) and not evaluation:
         _fill_sampling_metadata(sample, segments, finished)
     for message, (start, end) in zip(finished, spans, strict=True):
         # The trace keeps log probs per token, not per call: anchor the call's weight versions to its own segment.
@@ -432,3 +455,46 @@ def _fill_sampling_metadata(sample: Sample, segments, messages) -> None:
         raise ValueError("AvaCore sampling metadata does not match the response length")
     sample.rollout_sampling_mask = replay.rollout_sampling_mask
     sample.rollout_log_probs = log_probs
+
+
+def _with_sampling_metadata(args: Namespace, sample: Sample, segments, messages) -> Sample:
+    """Return a sample with native sampling metadata, leaving the input sample untouched."""
+    k, mode = args.rollout_top_logprobs_num, args.rollout_sampling_logprobs_mode
+    support = mode == "support"
+    contract = dict(
+        count=args.rollout_top_logprobs_num,
+        temperature=args.rollout_temperature,
+        top_p=args.rollout_top_p,
+        top_k=args.rollout_top_k,
+        mode=args.rollout_sampling_logprobs_mode,
+    )
+    messages, log_probs = iter(messages), []
+    result = replace(
+        sample,
+        response_length=0,
+        rollout_log_probs=log_probs,
+        rollout_topk_token_ids=None,
+        rollout_topk_log_probs=None,
+        rollout_sampling_mask=None if support else sample.rollout_sampling_mask,
+    )
+    append_rollout_topk_logprobs(result, {}, k)
+    for segment in segments[1:]:
+        if segment.is_generated:
+            meta = next(messages).metadata
+            if meta.get("sampler_logprobs") != contract:
+                raise ValueError("AvaCore sampler logprobs contract missing or mismatched; update the policy client")
+            log_probs.extend(
+                append_sampling_metadata(result, segment.tokens, meta, sampling_logprobs_mode=mode)
+                if support
+                else segment.log_probs
+            )
+            append_rollout_topk_logprobs(
+                result, meta | {"output_token_logprobs": segment.log_probs}, k, sampling_logprobs_mode=mode
+            )
+        else:
+            if support:
+                append_forced_sampling_tokens(result, segment.tokens)
+            pad_rollout_topk_logprobs(result, len(segment.tokens))
+            log_probs.extend([0.0] * len(segment.tokens))
+        result.response_length += len(segment.tokens)
+    return result

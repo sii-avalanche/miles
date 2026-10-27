@@ -49,6 +49,10 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     provider.calculate_per_token_loss = args.calculate_per_token_loss  # CP>1 VL models assert this
     provider.variable_seq_lengths = args.variable_seq_lengths
 
+    # An explicit zero disables draft layers for policy-only training.
+    if getattr(args, "mtp_num_layers", None) is not None:
+        provider.mtp_num_layers = args.mtp_num_layers
+
     # Match the non-bridge path: MTP must only train its own draft parameters.
     if getattr(args, "enable_mtp_training", False):
         provider.mtp_detach_heads = True

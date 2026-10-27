@@ -118,3 +118,42 @@ def test_conversion_rejects_entire_missing_batch_only_when_replay_enabled(args, 
             convert(args, [sample])
     else:
         assert "rollout_sampling_mask_ids" not in convert(args, [sample])
+
+
+@pytest.mark.parametrize("mode", ["selected", "support"])
+async def test_score_centering_preserves_curriculum_and_shared_prefixes(args, mode):
+    args.rollout_top_logprobs_num = 2
+    args.rollout_sampling_logprobs_mode = mode
+    args.rollout_top_p = 1.0
+    args.rollout_top_k = 2 if mode == "support" else -1
+    args.curriculum_enabled = True
+    shared = turn()
+    tip = turn(shared, prompt=(5, 6), output=(7, 8))
+    contract = dict(count=2, temperature=1.0, top_p=1.0, top_k=args.rollout_top_k, mode=mode)
+    for node in (shared, tip):
+        metadata = node.message.metadata
+        metadata["sampler_logprobs"] = contract
+        tokens = node.segments[-1].tokens
+        metadata["output_top_logprobs"] = [[[-0.75, token], [-1.0, token + 10]] for token in tokens]
+        if mode == "support":
+            metadata["output_token_sampling_logprobs"] = [[-0.75, -1.0] for _ in tokens]
+    rollout = object.__new__(AvaCoreRollout)
+    rollout.args = args
+    rollout.recording = None
+    rollout._monitor = Mock()
+    rollout._monitor.wait.side_effect = lambda *_: nullcontext()
+    rollout.generate_fn = AsyncMock(return_value=(shared, tip))
+    rollout.reward_fn = AsyncMock(return_value=Reward(score=1, metadata={"grader_invalid": True}))
+    params = {"temperature": 1.0, "top_p": 1.0, "top_k": args.rollout_top_k}
+    original = params.copy()
+    samples = await rollout.generate(Sample(index=7, metadata={}), params)
+    assert params == original
+    assert rollout.generate_fn.await_args.kwargs["sampler_logprobs"] == contract
+    assert len(samples) == 2
+    assert all(sample.metadata["grader_invalid"] for sample in samples)
+    assert samples[0].rollout_id == samples[1].rollout_id == 7
+    assert samples[1].loss_mask == [0, 0, 0, 0, 1, 1]
+    assert samples[1].rollout_topk_token_ids.tolist() == [
+        [3, 13], [4, 14], [-1, -1], [-1, -1], [7, 17], [8, 18]
+    ]
+    assert samples[1].rollout_log_probs == [-0.75, -0.75, 0.0, 0.0, -0.75, -0.75]
