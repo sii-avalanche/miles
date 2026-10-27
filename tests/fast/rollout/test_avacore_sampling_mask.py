@@ -29,7 +29,7 @@ def args():
 
 
 def turn(prev=None, *, prompt=(1, 2), output=(3, 4), with_support=True):
-    metadata = {"finish_reason": {"type": "stop"}, "weight_version": 0}
+    metadata = {"finish_reason": {"type": "stop"}, "weight_version": "0"}
     if with_support:
         metadata.update(
             output_token_sampling_mask=[[token, token + 10] for token in output],
