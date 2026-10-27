@@ -21,6 +21,16 @@ from ava_core.runner import RECOVERABLE_ERRORS
 from ava_core.store.core import Run
 from ava_core.store.postgres import PostgresBackend
 
+from miles.rollout.generate_utils.rollout_topk_logprobs import (
+    append_rollout_topk_logprobs,
+    configure_rollout_topk_logprobs_request,
+    pad_rollout_topk_logprobs,
+    validate_rollout_topk_logprobs_sample,
+)
+from miles.rollout.generate_utils.sampling_mask import (
+    append_forced_sampling_tokens,
+    append_sampling_metadata,
+)
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.utils.types import Sample, WeightVersionsPerCall
 
@@ -44,9 +54,16 @@ class AvaCoreRollout:
         self.writes: set[asyncio.Task[None]] = set()
         self.failed_writes = 0
 
-    async def generate(self, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
+    async def generate(
+        self, sample: Sample, sampling_params: dict[str, Any], *, evaluation: bool = False
+    ) -> Sample | list[Sample]:
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
+        if getattr(self.args, "rollout_top_logprobs_num", 0) and not evaluation:
+            request = {"sampling_params": dict(sampling_params)}
+            configure_rollout_topk_logprobs_request(self.args, request)
+            sampling_params = request["sampling_params"]
+            replay["sampler_logprobs"] = _sampler_contract(self.args)
         try:
             traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
             if not isinstance(traces, tuple) or not traces or not all(isinstance(t, Trace) for t in traces):
@@ -74,7 +91,15 @@ class AvaCoreRollout:
                 raise ValueError("Training requires token-level segments for every generated turn")
             if any(node not in owned for node in generated):
                 samples.append(
-                    await asyncio.to_thread(filled, self.args, copy.deepcopy(sample), trace, reward.score, set(owned))
+                    await asyncio.to_thread(
+                        filled,
+                        self.args,
+                        copy.deepcopy(sample),
+                        trace,
+                        reward.score,
+                        set(owned),
+                        evaluation=evaluation,
+                    )
                 )
             owned.update(generated)
         if not samples:
@@ -156,10 +181,20 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     state = input.state
     if (rollout := getattr(state, "avacore", None)) is None:
         rollout = state.avacore = AvaCoreRollout(input.args, input.args.avacore_config)
-    return GenerateFnOutput(samples=await rollout.generate(input.sample, input.sampling_params))
+    return GenerateFnOutput(
+        samples=await rollout.generate(input.sample, input.sampling_params, evaluation=input.evaluation)
+    )
 
 
-def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, owned: set[Trace] | None = None) -> Sample:
+def filled(
+    args: Namespace,
+    sample: Sample,
+    trace: Trace,
+    reward: float,
+    owned: set[Trace] | None = None,
+    *,
+    evaluation: bool = False,
+) -> Sample:
     owned = owned or set()
     path = trace.path_segments
     # Tool observations after the last generated token train nothing.
@@ -191,6 +226,8 @@ def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, owned: 
             spans.append((offset, offset + len(segment.tokens)))
         offset += len(segment.tokens)
     finished = [node.message for node in trace.prefixes if node.generated and "finish_reason" in node.message.metadata]
+    if not evaluation and getattr(args, "rollout_top_logprobs_num", 0):
+        _fill_sampling_metadata(args, sample, segments, finished)
     for message, (start, end) in zip(finished, spans, strict=True):
         # The trace keeps log probs per token, not per call: anchor the call's weight versions to its own segment.
         versioning = ("weight_version", "weight_versions")
@@ -211,3 +248,50 @@ def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, owned: 
         sample.rollout_routed_experts = routed.reshape(length - 1, args.num_layers, args.moe_router_topk)
     sample.reward = reward
     return sample
+
+
+def _sampler_contract(args: Namespace) -> dict[str, Any]:
+    return dict(
+        count=args.rollout_top_logprobs_num,
+        temperature=args.rollout_temperature,
+        top_p=args.rollout_top_p,
+        top_k=args.rollout_top_k,
+        mode=args.rollout_sampling_logprobs_mode,
+    )
+
+
+def _fill_sampling_metadata(args: Namespace, sample: Sample, segments, messages) -> None:
+    """Use native collectors for each turn and native padding for observation tokens."""
+    k, mode = args.rollout_top_logprobs_num, args.rollout_sampling_logprobs_mode
+    support = mode == "support"
+    contract = _sampler_contract(args)
+    collected = Sample()
+    messages, log_probs = iter(messages), []
+    append_rollout_topk_logprobs(collected, {}, k)  # Initialize padding even before the first generated segment.
+    for segment in segments[1:]:
+        if segment.is_generated:
+            meta = next(messages).metadata
+            if meta.get("sampler_logprobs") != contract:
+                raise ValueError("AvaCore sampler logprobs contract missing or mismatched; update the policy client")
+            log_probs.extend(
+                append_sampling_metadata(collected, segment.tokens, meta, sampling_logprobs_mode=mode)
+                if support
+                else segment.log_probs
+            )
+            append_rollout_topk_logprobs(
+                collected, meta | {"output_token_logprobs": segment.log_probs}, k, sampling_logprobs_mode=mode
+            )
+        else:
+            if support:
+                append_forced_sampling_tokens(collected, segment.tokens)
+            pad_rollout_topk_logprobs(collected, len(segment.tokens))
+            log_probs.extend([0.0] * len(segment.tokens))
+        collected.response_length += len(segment.tokens)
+    sample.rollout_log_probs = log_probs
+    if support:
+        sample.rollout_sampling_mask = collected.rollout_sampling_mask
+    sample.rollout_topk_token_ids = collected.rollout_topk_token_ids
+    sample.rollout_topk_log_probs = collected.rollout_topk_log_probs
+    sample.validate()
+    if getattr(args, "ci_test", False):
+        validate_rollout_topk_logprobs_sample(sample, k)
