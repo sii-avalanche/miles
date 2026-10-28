@@ -5,7 +5,8 @@ import os
 from argparse import Namespace
 from collections.abc import Iterator, Mapping
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,13 @@ from ava_core.runner import RECOVERABLE_ERRORS, Retry
 from ava_core.store.core import Run
 from ava_core.store.postgres import PostgresBackend
 
+from miles.rollout.generate_utils.rollout_topk_logprobs import (
+    append_rollout_topk_logprobs,
+    configure_rollout_topk_logprobs_request,
+    pad_rollout_topk_logprobs,
+    validate_rollout_topk_logprobs_sample,
+)
+from miles.rollout.generate_utils.sampling_mask import append_forced_sampling_tokens, append_sampling_metadata
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.utils.types import Sample, WeightVersionsPerCall
 
@@ -91,17 +99,32 @@ class AvaCoreRollout:
         # initialized, so malformed run-wide config fails before requests.
         self.group_oversampling = _GroupOversampling.from_config(config)
 
-    async def generate(self, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
+    async def generate(
+        self, sample: Sample, sampling_params: dict[str, Any], *, evaluation: bool = False
+    ) -> Sample | list[Sample]:
         metadata = {
             key: value for key, value in sample.metadata.items() if key not in {_CANDIDATE_SLOT, _CANDIDATE_WIDTH}
         }
         row = Row({**metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
+        if getattr(self.args, "rollout_top_logprobs_num", 0) and not evaluation:
+            request = {"sampling_params": dict(sampling_params)}
+            configure_rollout_topk_logprobs_request(self.args, request)
+            sampling_params = request["sampling_params"]
+            replay["sampler_logprobs"] = dict(
+                count=self.args.rollout_top_logprobs_num,
+                temperature=self.args.rollout_temperature,
+                top_p=self.args.rollout_top_p,
+                top_k=self.args.rollout_top_k,
+                mode=self.args.rollout_sampling_logprobs_mode,
+            )
         policy = self.group_oversampling
         max_attempts = policy.max_extra_attempts_per_slot + 1
         for attempt in range(1, max_attempts + 1):
             try:
                 traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
+                if not isinstance(traces, tuple) or not traces or not all(isinstance(trace, Trace) for trace in traces):
+                    raise TypeError("AvaCore generate must return a nonempty tuple of Trace objects")
                 aborted = any(
                     message.metadata["finish_reason"]["type"] == "abort"
                     for node in iter_trace_nodes(traces)
@@ -139,8 +162,20 @@ class AvaCoreRollout:
         for tip in conversation_tips(traces):
             generated = {node for node in tip.prefixes if node.generated and node.segments}
             if generated - owned:
-                samples.append(filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned))
+                samples.append(
+                    await asyncio.to_thread(
+                        filled,
+                        self.args,
+                        copy.deepcopy(sample),
+                        tip,
+                        reward.score,
+                        owned=set(owned),
+                        evaluation=evaluation,
+                    )
+                )
                 owned.update(generated)
+        if not samples:
+            raise ValueError("AvaCore rollout contains no generated training tokens")
         if len(samples) > 1:
             rollout_id = sample.rollout_id if sample.rollout_id is not None else sample.index
             if rollout_id is None:
@@ -196,7 +231,15 @@ class AvaCoreRollout:
             assert sample.epoch is not None and sample.index is not None
             n = self.args.n_samples_per_prompt
             query_id = str(sample.metadata["_index"])
-            metadata = {"weight_version": _weight_version(traces[0])}
+            metadata = {
+                "weight_version": _weight_version(traces[0]),
+                "weight_versions": [
+                    version
+                    for trace in traces
+                    for node in trace.prefixes
+                    if node.generated and (version := node.message.metadata.get("weight_version")) is not None
+                ],
+            }
             if (slot := sample.metadata.get(_CANDIDATE_SLOT)) is not None:
                 width = int(sample.metadata[_CANDIDATE_WIDTH])
                 trial_id = sample.epoch * width + int(slot)
@@ -242,7 +285,9 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             # Keep only text: a traceback would retain partially constructed clients.
             state.avacore_init_error = f"AvaCore rollout initialization failed: {error}"
             raise
-    return GenerateFnOutput(samples=await rollout.generate(input.sample, input.sampling_params))
+    return GenerateFnOutput(
+        samples=await rollout.generate(input.sample, input.sampling_params, evaluation=input.evaluation)
+    )
 
 
 def conversation_tips(traces: tuple[Trace, ...]) -> Iterator[Trace]:
@@ -257,7 +302,15 @@ def conversation_tips(traces: tuple[Trace, ...]) -> Iterator[Trace]:
     yield from tips
 
 
-def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, *, owned: set[Trace] | None = None) -> Sample:
+def filled(
+    args: Namespace,
+    sample: Sample,
+    trace: Trace,
+    reward: float,
+    *,
+    owned: set[Trace] | None = None,
+    evaluation: bool = False,
+) -> Sample:
     # Shared generated prefixes train only in the first listed branch, as in the result store.
     owned = owned or set()
     segments = trace.path_segments
@@ -274,13 +327,26 @@ def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, *, owne
         for _ in segment.tokens
     ]
     sample.loss_mask = mask[prompt_length:length]
-    sample.rollout_log_probs = [log_prob or 0.0 for log_prob in trace.log_probs[prompt_length:length]]
+    for segment in segments:
+        if segment.is_generated and (
+            len(segment.log_probs) != len(segment.tokens)
+            or any(value is None or not isfinite(value) for value in segment.log_probs)
+        ):
+            raise ValueError("Generated tokens require finite, aligned rollout logprobs")
+    sample.rollout_log_probs = [
+        log_prob if log_prob is not None else 0.0 for log_prob in trace.log_probs[prompt_length:length]
+    ]
     spans, offset = [], 0
     for segment in segments:
         if segment.is_generated:
             spans.append((offset, offset + len(segment.tokens)))
         offset += len(segment.tokens)
     finished = [node.message for node in trace.prefixes if node.generated and node.segments]
+    if not evaluation and getattr(args, "rollout_top_logprobs_num", 0):
+        sample = _with_sampling_metadata(args, sample, segments, finished)
+        sample.validate()
+        if getattr(args, "ci_test", False):
+            validate_rollout_topk_logprobs_sample(sample, args.rollout_top_logprobs_num)
     for message, (start, end) in zip(finished, spans, strict=True):
         # The trace keeps log probs per token, not per call: anchor the call's weight versions to its own segment.
         versioning = ("weight_version", "weight_versions")
@@ -301,3 +367,45 @@ def filled(args: Namespace, sample: Sample, trace: Trace, reward: float, *, owne
         sample.rollout_routed_experts = routed.reshape(length - 1, args.num_layers, args.moe_router_topk)
     sample.reward = reward
     return sample
+
+
+def _with_sampling_metadata(args: Namespace, sample: Sample, segments, messages) -> Sample:
+    k, mode = args.rollout_top_logprobs_num, args.rollout_sampling_logprobs_mode
+    support = mode == "support"
+    contract = dict(
+        count=k,
+        temperature=args.rollout_temperature,
+        top_p=args.rollout_top_p,
+        top_k=args.rollout_top_k,
+        mode=mode,
+    )
+    messages, log_probs = iter(messages), []
+    result = replace(
+        sample,
+        response_length=0,
+        rollout_log_probs=log_probs,
+        rollout_topk_token_ids=None,
+        rollout_topk_log_probs=None,
+        rollout_sampling_mask=None if support else sample.rollout_sampling_mask,
+    )
+    append_rollout_topk_logprobs(result, {}, k)
+    for segment in segments[1:]:
+        if segment.is_generated:
+            meta = next(messages).metadata
+            if meta.get("sampler_logprobs") != contract:
+                raise ValueError("AvaCore sampler logprobs contract missing or mismatched; update the policy client")
+            log_probs.extend(
+                append_sampling_metadata(result, segment.tokens, meta, sampling_logprobs_mode=mode)
+                if support
+                else segment.log_probs
+            )
+            append_rollout_topk_logprobs(
+                result, meta | {"output_token_logprobs": segment.log_probs}, k, sampling_logprobs_mode=mode
+            )
+        else:
+            if support:
+                append_forced_sampling_tokens(result, segment.tokens)
+            pad_rollout_topk_logprobs(result, len(segment.tokens))
+            log_probs.extend([0.0] * len(segment.tokens))
+        result.response_length += len(segment.tokens)
+    return result
