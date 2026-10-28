@@ -289,10 +289,13 @@ def _restore_group_identities(selected: list[Sample | list[Sample]], original: l
     identities = [(sample.group_index, sample.index, sample.epoch) for sample in original]
     for candidate, (group_index, index, epoch) in zip(selected, identities, strict=True):
         samples = candidate if isinstance(candidate, list) else [candidate]
+        compact = len(samples) > 1 or any(sample.rollout_id is not None for sample in samples)
         for sample in samples:
             sample.group_index = group_index
             sample.index = index
             sample.epoch = epoch
+            if compact:
+                sample.rollout_id = index
 
 
 def compute_sampling_params(
