@@ -4,7 +4,7 @@ from sglang.srt.server_args import ServerArgs
 
 from miles.utils.args.utils import config_values
 from miles.utils.http_utils import wrap_ipv6
-
+from miles.utils.workers.argv_utils import _record_field_names
 
 _SKIPPED_SERVER_ARGS = [
     "model_path",
@@ -104,7 +104,7 @@ def _add_prefixed_server_args(parser, *, flag_prefix: str, dest_prefix: str, ski
 
     parser.add_argument = new_add_argument_wrapper
     ServerArgs.add_cli_args(parser)
-    if "attn_dp_size" not in ServerArgs.__dataclass_fields__:
+    if "attn_dp_size" not in _record_field_names(ServerArgs):
         # Older SGLang has no separate attention-DP dimension. Its only legal
         # value is one; register that capability constraint through the same
         # prefix wrapper so config extraction and validation share one owner.

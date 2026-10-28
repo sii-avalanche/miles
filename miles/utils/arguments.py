@@ -357,6 +357,7 @@ def parse_args_and_get_parser(
                 "mtp_detach_heads",
                 "mtp_loss_scaling_factor",
                 "mtp_num_layers",
+                "mtp_use_repeated_layer",
                 "no_load_optim",
                 "no_load_rng",
                 "no_save_optim",
@@ -1579,6 +1580,10 @@ def miles_validate_args(args):
     assert args.ppo_epochs >= 1, "ppo_epochs must be positive"
     if args.skip_update_grad_norm_threshold is not None or args.exclude_mtp_grad:
         assert args.train_backend == "megatron", "Gradient norm controls require the Megatron backend"
+
+    if args.mtp_use_repeated_layer:
+        assert args.train_backend == "megatron", "--mtp-use-repeated-layer requires Megatron"
+        assert args.enable_mtp_training, "--mtp-use-repeated-layer requires --enable-mtp-training"
 
     if args.enable_mtp_training:
         assert (

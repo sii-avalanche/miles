@@ -1,10 +1,10 @@
 import argparse
 
 import pytest
-from tests.fast.fixtures.args_fixtures import parse_megatron_test_config
 
 from miles.utils.args.runtime import AllConfig
 from miles.utils.arguments import _validate_argument_ownership
+from tests.fast.fixtures.args_fixtures import parse_megatron_test_config
 
 
 class TestArgumentOwnership:
@@ -124,3 +124,20 @@ class TestRouterSdkOwnership:
         _validate_argument_ownership(args, parser=parser, training_backend_arg_names=set())
 
         assert vars(args) == before
+
+
+def test_older_sglang_rejects_unsupported_separate_attention_dp():
+    """A missing ServerArgs field has a constrained compatibility value, not a silent no-op."""
+    import argparse
+
+    from sglang.srt.server_args import ServerArgs
+
+    from miles.backends.sglang_utils.arguments import add_sglang_arguments
+    from miles.utils.workers.argv_utils import _record_field_names
+
+    if "attn_dp_size" in _record_field_names(ServerArgs):
+        return
+    parser = add_sglang_arguments(argparse.ArgumentParser())
+    assert parser.parse_args([]).sglang_attn_dp_size == 1
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--sglang-attn-dp-size", "2"])
