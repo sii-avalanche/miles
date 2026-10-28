@@ -258,10 +258,10 @@ def _execute_train(args: ScriptArgs):
     if args.fp8_rollout and not balanced:
         sglang_args += "--sglang-moe-runner-backend flashinfer_trtllm_routed "
 
-    telemetry_args = (
+    dashboard_args = (
         f"--dump-details {args.output_dir}/{args.run_id}/dump_details "
         "--perf-monitor-interval 10 "
-        "--perf-monitor-engine-mode direct "
+        "--dashboard-sglang-scrape-mode direct "
     )
 
     misc_args = (
@@ -298,7 +298,7 @@ def _execute_train(args: ScriptArgs):
         f"{perf_args} "
         f"{eval_args} "
         f"{sglang_args} "
-        f"{telemetry_args} "
+        f"{dashboard_args} "
         f"{misc_args} "
         f"{args.extra_args} "
     )

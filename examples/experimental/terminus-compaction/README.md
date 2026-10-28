@@ -11,7 +11,7 @@ The default launcher is a one-node, 8-GPU, 100-step recipe:
 - 8 independent rollouts per prompt (32 rollouts per step);
 - 32,768 tokens per trajectory segment;
 - 8,192 generated tokens per model turn; and
-- Runtime telemetry and rollout traces enabled.
+- Miles dashboard telemetry and rollout traces enabled.
 
 The launcher reuses the Harbor request, reward, and metric adapters in
 `examples/swe-agent-harbor-docker`. Only the compaction-specific training recipe
@@ -143,8 +143,8 @@ local address. Use `--num-rollout 1` to stop after one step.
 
 ## 4. Verify compaction and training
 
-The trace root defaults to `<output-dir>/<run-id>/details`. Inspect scalar
-histories in W&B; runtime telemetry is enabled at a 10-second interval.
+The trace root defaults to `<output-dir>/<run-id>/details`. With W&B enabled,
+open **Overview → Notes → RL timeline** for the [run report](../../../docs/user-guide/rl-report.md).
 
 Useful per-step metrics are:
 

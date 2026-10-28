@@ -114,8 +114,8 @@ per engine restart.
 
 ## Watching it
 
-Debug dumps land under `$OUTPUT_DIR/<run_id>/dump_details`. W&B receives
-training and runtime metrics when enabled. Useful driver-log signals:
+Debug dumps land under `$OUTPUT_DIR/<run_id>/dump_details`. With W&B enabled,
+open **Overview → Notes → RL timeline** for runtime telemetry. Useful driver-log signals:
 
 ```bash
 grep -E "raw_reward|truncated_ratio" run.out      # learning signal

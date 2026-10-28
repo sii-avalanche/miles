@@ -152,7 +152,7 @@ $PYTHON $MILES_DIR/examples/experimental/nemo-gym-workspace-assistant/run_nemotr
 
 The launcher uses Miles' standard W&B configuration when `WANDB_API_KEY` is
 set in the environment; do not put credentials in the JSON or commit them.
-Runtime metrics are also reported to W&B. Checkpoints and full rollout
+Metrics are also available in the Miles dashboard. Checkpoints and full rollout
 traces go under `output_dir`. The launcher uses the usual Miles cleanup preamble;
 run it on dedicated training nodes, not alongside unrelated inference services.
 

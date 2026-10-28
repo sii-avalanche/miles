@@ -69,9 +69,9 @@ overlaps with generation and deserialization of the others.
 
 ## 4. Diagnosing the pipeline
 
-Use `--use-wandb --perf-monitor-interval 10` to view runtime stage durations,
-active waits and queue sizes alongside training metrics. These are aggregate
-time series; per-request overlap still requires a profiler trace.
+Use `--use-wandb --perf-monitor-interval 10` to enable the
+[per-run RL report](../../user-guide/rl-report.md). It shows orchestration stages
+and queue activity; per-request overlap still requires a profiler trace.
 
 For quick triage from `perf/*` metrics alone:
 
