@@ -150,7 +150,9 @@ class MegatronTrainRayActor(TrainRayActor):
         if self._is_first_replica_megatron_main_rank:
             init_tracking(args, primary=False)
 
-        fleet_monitor.register_train_actor(args)
+        fleet_monitor.register_train_actor(
+            args, engine_id=f"{role}-{args.trainer_id}-{indep_dp_info.cell_index:05d}", worker_id=self._rank
+        )
 
         unsupported = {"train_actor", "train_log_probs"} & set(args.profile_target)
         if unsupported and args.use_pytorch_profiler:

@@ -27,7 +27,7 @@ class FleetTelemetry:
         self._samplers = {}
         self._pending = {}
         self._gpu = {}
-        self._train = set()
+        self._train_workers = {}
         self._engines = []
         self._router = None
         self._samples = {}
@@ -54,9 +54,13 @@ class FleetTelemetry:
                     self._warned[name] = started
             self._stop.wait(max(0.1, interval - (time.monotonic() - started)))
 
-    def register_train(self, node, gpus):
+    def register_train(self, node, gpus, *, engine_id=None, worker_id=None):
+        devices = {(node, int(gpu)) for gpu in gpus}
+        engine_id = engine_id or node
+        worker_id = worker_id if worker_id is not None else tuple(sorted(devices))
         with self._lock:
-            self._train.update((node, int(gpu)) for gpu in gpus)
+            # Replace a worker's old assignment when it restarts on another GPU/node.
+            self._train_workers[(engine_id, worker_id)] = devices
 
     def set_router(self, router):
         with self._lock:
@@ -122,8 +126,12 @@ class FleetTelemetry:
     def snapshot(self):
         now = time.time()
         with self._lock:
-            train = set(self._train)
-            inference = {(node, int(gpu)) for e in self._engines for node, gpu in e["gpus"]}
+            train_engines = defaultdict(set)
+            for (engine_id, _), devices in self._train_workers.items():
+                train_engines[engine_id].update(devices)
+            engines = list(self._engines)
+            train = set().union(*train_engines.values()) if train_engines else set()
+            inference = {(node, int(gpu)) for e in engines for node, gpu in e["gpus"]}
             gpu = dict(self._gpu)
             current = {k: p for k, p in self._samples.items() if 0 <= now - p.ts <= max(10, 3 * self.engine_interval)}
             previous, self._previous = self._previous, current
@@ -132,6 +140,35 @@ class FleetTelemetry:
             fresh = [gpu[k] for k in mapped if k in gpu and 0 <= now - gpu[k][0] <= max(10, 3 * self.gpu_interval)]
             result.update(_gpu_metrics(role, mapped, fresh, expected=self.expected[role]))
         result.update(_engine_metrics(current, previous))
+        for engine_id, devices in train_engines.items():
+            result.update(self._device_metrics(f"engines/train/{engine_id}", devices, gpu, now))
+        for engine in engines:
+            prefix = f"engines/inference/{engine['id']}"
+            devices = {(node, int(device)) for node, device in engine["gpus"]}
+            result.update(self._device_metrics(prefix, devices, gpu, now))
+            samples = {key: point for key, point in current.items() if point.addr == engine["addr"]}
+            result.update(
+                {
+                    f"{prefix}/{key.removeprefix('inference/')}": value
+                    for key, value in _engine_metrics(samples, previous).items()
+                }
+            )
+        return result
+
+    def _device_metrics(self, prefix, devices, gpu, now):
+        fresh = {
+            key: gpu[key] for key in devices if key in gpu and 0 <= now - gpu[key][0] <= max(10, 3 * self.gpu_interval)
+        }
+        result = _gpu_metrics(prefix, devices, list(fresh.values()), expected=len(devices))
+        for node, device in devices:
+            sample = gpu.get((node, device))
+            device_prefix = f"{prefix}/devices/{node}/gpu_{device}"
+            result[f"{device_prefix}/available"] = int((node, device) in fresh)
+            if sample is not None:
+                result[f"{device_prefix}/sample_age_seconds"] = max(0.0, now - sample[0])
+            if (node, device) in fresh:
+                result[f"{device_prefix}/gpu_util_pct"] = sample[1]
+                result[f"{device_prefix}/gpu_memory_gb"] = sample[2] / 1024
         return result
 
     def shutdown(self):
@@ -263,14 +300,16 @@ def init_fleet(args, *, primary):
     ray.get(_handle.start.remote(), timeout=30)
 
 
-def register_train_actor(args):
+def register_train_actor(args, *, engine_id=None, worker_id=None):
     if not _enabled(args) or (handle := _resolve()) is None:
         return
     import ray
     from miles.utils.misc import get_current_node_ip
 
     try:
-        handle.register_train.remote(get_current_node_ip(), ray.get_gpu_ids())
+        handle.register_train.remote(
+            get_current_node_ip(), ray.get_gpu_ids(), engine_id=engine_id, worker_id=worker_id
+        )
     except Exception:
         logger.warning("Train GPU mapping unavailable; training continues", exc_info=True)
 
@@ -304,6 +343,7 @@ def _register_engines(servers, *, provider):
     infos = provider.get_worker_infos(cell_ids=[cell.meta.cell_id for cell in cells])
     engines = [
         {
+            "id": cell.meta.cell_id,
             "addr": cell.server_url,
             "gpus": [(info.self_addrs["primary"].host.strip("[]"), gpu) for info in workers for gpu in info.gpu_ids],
         }

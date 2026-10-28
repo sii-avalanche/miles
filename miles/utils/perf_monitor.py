@@ -130,6 +130,24 @@ class RuntimeMonitor:
         self._last_rate_values = {}
         self._closed = False
         self._alert_since = {}
+        # Emit inactive stages too, so a dashboard can distinguish idle from an
+        # absent series before the first training/weight-sync stage starts.
+        phases = {
+            "driver": (
+                "startup_rollout",
+                "startup_train",
+                "initial_weight_sync",
+                "wait_rollout",
+                "train",
+                "critic_train",
+                "checkpoint",
+                "update_weights",
+                "eval_dispatch",
+            ),
+            "rollout": ("collect_batch", "convert_batch", "object_store_put", "generate", "drain_batch"),
+        }
+        for name in phases.get(role, ()):
+            self._open[f"phase/{name}"] = []
 
     def start(self) -> None:
         if not self.enabled or self._thread is not None:
@@ -249,6 +267,7 @@ class RuntimeMonitor:
             return
         ended = time.time()
         self.increment("steps_completed_total")
+        self.update({"progress/completed_rollouts": rollout_id + 1})
         self.observe("step", ended - started)
         self._event(
             dict(
@@ -285,6 +304,13 @@ class RuntimeMonitor:
         now = time.monotonic()
         with self._lock:
             values = dict(self._counters) | self._gauges
+            if self.role == "driver" and (target := getattr(self.args, "num_rollout", None)) is not None:
+                completed = values.setdefault(
+                    "progress/completed_rollouts", getattr(self.args, "start_rollout_id", 0) or 0
+                )
+                values["progress/target_rollouts"] = target
+                if target > 0:
+                    values["progress/fraction"] = completed / target
             providers = dict(self._providers)
             for name, started in self._open.items():
                 values[f"{name}/waiting"] = len(started)

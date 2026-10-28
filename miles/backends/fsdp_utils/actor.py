@@ -12,6 +12,7 @@ from miles.backends.training_utils.metrics import train_dump
 from miles.backends.training_utils.parallel import get_parallel_state, set_parallel_state
 from miles.backends.training_utils.torch_native.actor import TorchNativeTrainRayActor
 from miles.backends.training_utils.torch_native.step_runner import LinearStepRunner, StepMetrics
+from miles.utils import fleet_monitor
 from miles.utils.context_utils import with_defer
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
@@ -75,6 +76,10 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
 
         if dist.get_rank() == 0:
             init_tracking(args, primary=False)
+
+        fleet_monitor.register_train_actor(
+            args, engine_id=f"{role}-{args.trainer_id}-{indep_dp_info.cell_index:05d}", worker_id=self._rank
+        )
 
         if getattr(self.args, "start_rollout_id", None) is None:
             self.args.start_rollout_id = 0
