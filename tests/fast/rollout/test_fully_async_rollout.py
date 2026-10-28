@@ -296,6 +296,29 @@ async def test_worker_error_propagates(monkeypatch):
         await fn(RolloutFnTrainInput(rollout_id=0))
 
 
+async def test_group_oversampling_exhaustion_does_not_stop_worker(monkeypatch):
+    exhausted = make_group(1)
+    data_source = FakeDataSource(scripted=[exhausted])
+
+    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
+        if group[0].group_index == 1:
+            raise RuntimeError("group oversampling exhausted with only 1/2 usable candidates from 3 attempts")
+        return group
+
+    fn = make_fn(
+        monkeypatch,
+        make_args(rollout_batch_size=1, async_unused_samples_handler="retry"),
+        data_source,
+        generate=generate,
+    )
+
+    output = await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=0)), timeout=2)
+
+    assert not fn._worker.done()
+    assert output.samples[0][0].group_index != 1
+    assert data_source.recycled == [exhausted]
+
+
 @pytest.mark.parametrize("handler", ["drop", "retry"])
 @pytest.mark.parametrize("granularity", ["sample", "group"])
 async def test_sample_cancellation_aborts_group_without_stopping_worker(
