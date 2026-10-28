@@ -8,7 +8,9 @@ from miles.utils.args.schema import A, Arg, BaseConfig
 # data
 class DataConfig(BaseConfig):
     system_prompt_path: A[str | None, Arg(help="JSON file containing system prompts and metadata.")] = None
-    data_prefilter_path: A[str | None, Arg(help="Callable prefilter(args, record) selecting training dataset records.")] = None
+    data_prefilter_path: A[
+        str | None, Arg(help="Callable prefilter(args, record) selecting training dataset records.")
+    ] = None
 
     _mutable_fields: ClassVar[frozenset[str]] = frozenset({"start_rollout_id", "num_rollout"})
 

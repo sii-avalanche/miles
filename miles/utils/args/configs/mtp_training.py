@@ -4,7 +4,9 @@ from miles.utils.args.schema import A, Arg, BaseConfig, reset_arg
 
 
 class MtpTrainingConfig(BaseConfig):
-    exclude_mtp_grad: A[bool, Arg(help="Exclude MTP-only parameters from main gradient clipping and the skip gate.")] = False
+    exclude_mtp_grad: A[
+        bool, Arg(help="Exclude MTP-only parameters from main gradient clipping and the skip gate.")
+    ] = False
 
     """Add MTP training specific arguments."""
 
@@ -31,6 +33,5 @@ class MtpTrainingConfig(BaseConfig):
             "--no-mtp-detach-heads",
             dest="mtp_detach_heads",
             action="store_false",
-            help="Let MTP loss gradients flow back into the main model's embedding, output layer and "
-            "hidden states.",
+            help="Let MTP loss gradients flow back into the main model's embedding, output layer and " "hidden states.",
         )

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import pytest
-from tests.fast.ray.rollout.conftest import make_args, make_sample
-from tests.fast.train_parallel_config_utils import make_train_parallel_config
 
 from miles.ray.rollout.rollout_data_conversion import (
     _compute_dynamic_global_batch_size,
     postprocess_rollout_data,
     validate_compact_rollout_ids,
 )
+from tests.fast.ray.rollout.conftest import make_args, make_sample
+from tests.fast.train_parallel_config_utils import make_train_parallel_config
 
 
 class TestComputeDynamicGlobalBatchSize:
@@ -46,7 +46,13 @@ class TestPostprocessRolloutData:
             args=args, data=data, train_parallel_config=make_train_parallel_config(dp_size=1)
         )
         assert len(out) == 8
-        assert meta == {"metrics": {"rollout/group_reward_variance_mean": 0.0, "rollout/group_reward_variance_max": 0.0, "rollout/group_reward_variance_min": 0.0}}
+        assert meta == {
+            "metrics": {
+                "rollout/group_reward_variance_mean": 0.0,
+                "rollout/group_reward_variance_max": 0.0,
+                "rollout/group_reward_variance_min": 0.0,
+            }
+        }
 
     def test_unaligned_input_is_trimmed_to_multiple(self):
         """len % gbs != 0 → trim down to multiple. Tail samples are dropped."""
@@ -56,7 +62,13 @@ class TestPostprocessRolloutData:
             args=args, data=data, train_parallel_config=make_train_parallel_config(dp_size=1)
         )
         assert len(out) == 8
-        assert meta == {"metrics": {"rollout/group_reward_variance_mean": 0.0, "rollout/group_reward_variance_max": 0.0, "rollout/group_reward_variance_min": 0.0}}
+        assert meta == {
+            "metrics": {
+                "rollout/group_reward_variance_mean": 0.0,
+                "rollout/group_reward_variance_max": 0.0,
+                "rollout/group_reward_variance_min": 0.0,
+            }
+        }
 
     def test_disable_rollout_trim_samples_keeps_unaligned_data(self):
         """With trim disabled, leave length as-is even if not divisible."""

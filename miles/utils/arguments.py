@@ -49,7 +49,6 @@ from miles.utils.object_store_config import (
     compute_mooncake_init_kwargs_from_env,
     compute_mooncake_init_kwargs_vanilla,
 )
-from miles.utils.output_store.config import check_output_store_args
 from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_args
 from miles.utils.run_uuid import generate_run_uuid, validate_run_uuid
 from miles.utils.score_centering import validate_score_centering_args
@@ -253,7 +252,6 @@ def parse_args_and_get_parser(
         previous_arg_names = set(vars(args))
         args.compress_ratios = None
         args.rollout_indexer_topk_num_streams = None
-        args.rollout_indexer_topk_width = None
         if args.hf_checkpoint:
             hf_config = load_hf_config(args.hf_checkpoint)
             args.compress_ratios = getattr(
@@ -279,8 +277,6 @@ def parse_args_and_get_parser(
                 args.rollout_indexer_topk_num_streams = text_config.num_hidden_layers - layer_types.count(
                     "linear_attention"
                 )
-                # ids per stream and token; sizes the output store buffer
-                args.rollout_indexer_topk_width = text_config.index_topk
 
         # TODO: unify this .rank and .world_size w/ indep_dp logics
         args.rank = 0
@@ -383,10 +379,8 @@ def parse_args_and_get_parser(
     backend_values = {name: value for name, value in vars(args).items() if name in training_backend_arg_names}
     _validate_argument_ownership(args, parser=parser, training_backend_arg_names=training_backend_arg_names)
     sglang, sglang_scaling = SglangConfig.parse_args(args)
-    raw_megatron = resolve_megatron_config(args, base_args=backend_values if backend == "megatron" else {})
-    check_output_store_args(args, sglang=sglang, megatron=raw_megatron)
     values = {name: value for name, value in vars(args).items() if name in AllConfig.model_fields} | {
-        "raw_megatron": raw_megatron,
+        "raw_megatron": resolve_megatron_config(args, base_args=backend_values if backend == "megatron" else {}),
         "raw_fsdp": FsdpArgsNamespace(**backend_values) if backend == "fsdp" else None,
         "raw_torchtitan": TorchtitanArgsNamespace(**backend_values) if backend == "torchtitan" else None,
         "sglang": sglang,
@@ -1617,10 +1611,6 @@ def miles_validate_args(args):
         assert (
             args.multi_lora_n_adapters == 0
         ), "--multi-lora-n-adapters drives RayWorkerManager, which --cluster-backend kubernetes does not use"
-        assert not args.use_output_store, (
-            "--use-output-store puts the store config in engine and session server commands, which --cluster-backend "
-            "kubernetes renders before it points Mooncake at the in-cluster master, with a 0.0.0.0 engine host"
-        )
         if ObjectStoreBackend(args.object_store_backend) != ObjectStoreBackend.MOONCAKE:
             logger.info(
                 f"Overriding --object-store-backend {args.object_store_backend} with "

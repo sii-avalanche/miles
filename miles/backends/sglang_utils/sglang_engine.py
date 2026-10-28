@@ -16,7 +16,6 @@ from miles.utils.lora.utils import (
     lora_base_cpu_backup_enabled,
     lora_rollout_enabled,
 )
-from miles.utils.output_store.config import sglang_output_store_server_args
 from miles.utils.workers.argv_utils import _record_field_names
 
 logger = logging.getLogger(__name__)
@@ -145,9 +144,6 @@ def _compute_server_args(
         kwargs["enable_return_routed_experts"] = True
     if args.use_rollout_indexer_replay:
         kwargs["enable_return_indexer_topk"] = True
-    if args.use_output_store:
-        # Every engine, eval included: an eval request never asks for the store.
-        kwargs.update(sglang_output_store_server_args(args, local_hostname=host.strip("[]")))
     if engine_info_bootstrap_port is not None:
         kwargs["engine_info_bootstrap_port"] = engine_info_bootstrap_port
 

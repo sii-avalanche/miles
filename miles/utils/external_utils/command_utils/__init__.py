@@ -16,7 +16,6 @@ from miles.utils.external_utils.command_utils.common import (
     get_default_wandb_args,
     get_env_enable_infinite_run,
     get_mooncake_object_store_args,
-    get_output_store_args,
     repo_base_dir,
     rsync_cmd,
 )
@@ -37,7 +36,6 @@ __all__ = [
     "get_default_wandb_args",
     "get_env_enable_infinite_run",
     "get_mooncake_object_store_args",
-    "get_output_store_args",
     "repo_base_dir",
     "resolve_extra_env_vars",
     "resolve_hardware",

@@ -13,9 +13,8 @@ import urllib.parse
 import aiohttp
 import httpx
 import msgspec
-
-from miles.utils.logging_utils import configure_logger_raw
 import numpy as np
+
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +141,8 @@ def router_worker_base_urls(urls: list[str]) -> list[str]:
 
 
 def run_router(args):
+    from miles.utils.logging_utils import configure_logger_raw
+
 
     # Spawned as a fresh interpreter, so it inherits no logging config.
     configure_logger_raw("router")
@@ -298,20 +299,11 @@ async def wait_http_ok(url: str, *, json_payload=None, timeout: float = 180.0, r
             await asyncio.sleep(5)
 
 
-class PostStatusError(RuntimeError):
-    """A non-2xx reply to ``post_buffer_no_retry``, with its status and body for the caller to map."""
-
-    def __init__(self, url: str, status: int, body: str):
-        super().__init__(f"POST {url} failed with {status}: {body}")
-        self.status = status
-        self.body = body
-
-
 async def post_buffer_no_retry(url: str, payload: dict, *, timeout: float) -> np.ndarray:
     """POST once and return a writable buffer; bound the whole operation by timeout.
 
     Plain HTTP only. Transport failures remain httpx.TransportError for the rollout
-    abort handler; non-2xx responses raise PostStatusError carrying the response body.
+    abort handler; non-2xx responses raise RuntimeError carrying the response body.
     """
     return await asyncio.wait_for(_post_buffer(url, payload), timeout=timeout)
 
@@ -331,7 +323,7 @@ async def _post_buffer(url: str, payload: dict) -> np.ndarray:
             ) as response:
                 if not (200 <= response.status < 300):
                     body = (await response.read()).decode(errors="replace")
-                    raise PostStatusError(url, response.status, body)
+                    raise RuntimeError(f"POST {url} failed with {response.status}: {body}")
                 length = response.content_length
                 if length is None:
                     raise httpx.RemoteProtocolError("reply without Content-Length")

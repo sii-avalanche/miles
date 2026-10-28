@@ -186,6 +186,7 @@ class TestPerTrainerHookOverrides:
 
 def test_avacore_configuration_is_owned_by_the_generate_hook():
     """Transport the AvaCore config through the typed hook, not mutable global args."""
+    pytest.importorskip("ava_core")  # Optional adapter dependency supplied by AvaTrain.
     from miles.rollout.avacore_rollout import AvaCoreGenerateConfig
 
     path = "miles.rollout.avacore_rollout.generate"
@@ -208,6 +209,7 @@ async def test_avacore_generate_reads_its_typed_configuration(monkeypatch):
     """The real generate entry point receives the hook's config after the parse boundary."""
     from unittest.mock import AsyncMock, Mock
 
+    pytest.importorskip("ava_core")  # Optional adapter dependency supplied by AvaTrain.
     import miles.rollout.avacore_rollout as adapter
     from miles.rollout.base_types import GenerateFnInput
     from miles.utils.args.custom_view import ImmutableNamespace

@@ -2,7 +2,9 @@ from miles.utils.args.schema import A, Arg, BaseConfig
 
 
 class RolloutBufferConfig(BaseConfig):
-    snr_filter_keep_ratio: A[float | None, Arg(help="Keep the top prompt groups covering this fraction of reward variance.")] = None
+    snr_filter_keep_ratio: A[
+        float | None, Arg(help="Keep the top prompt groups covering this fraction of reward variance.")
+    ] = None
 
     rollout_buffer_url: A[str | None, Arg(help="URL for the rollout buffer")] = None
     fetch_trajectory_retry_times: A[

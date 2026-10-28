@@ -45,7 +45,6 @@ CASE = CaseConfig(
     sglang_deepep_dispatcher_output_dtype="bf16",
     use_spec=False,
     use_r3=True,
-    use_output_store=True,
 )
 
 

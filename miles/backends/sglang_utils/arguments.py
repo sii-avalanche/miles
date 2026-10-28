@@ -4,7 +4,6 @@ from sglang.srt.server_args import ServerArgs
 
 from miles.utils.args.utils import config_values
 from miles.utils.http_utils import wrap_ipv6
-from miles.utils.output_store.config import SGLANG_OUTPUT_STORE_FIELDS
 
 
 _SKIPPED_SERVER_ARGS = [
@@ -28,7 +27,6 @@ _SKIPPED_SERVER_ARGS = [
     "skip_server_warmup",
     "enable_return_routed_experts",
     "enable_return_indexer_topk",
-    *SGLANG_OUTPUT_STORE_FIELDS,
 ]
 
 # tp_size comes from --eval-num-gpus-per-engine, which also places the engines.
@@ -106,6 +104,17 @@ def _add_prefixed_server_args(parser, *, flag_prefix: str, dest_prefix: str, ski
 
     parser.add_argument = new_add_argument_wrapper
     ServerArgs.add_cli_args(parser)
+    if "attn_dp_size" not in ServerArgs.__dataclass_fields__:
+        # Older SGLang has no separate attention-DP dimension. Its only legal
+        # value is one; register that capability constraint through the same
+        # prefix wrapper so config extraction and validation share one owner.
+        parser.add_argument(
+            "--attn-dp-size",
+            type=int,
+            choices=[1],
+            default=1,
+            help="This SGLang version supports only attn-dp-size=1; upgrade SGLang for separate attention DP.",
+        )
     del parser.add_argument
 
 

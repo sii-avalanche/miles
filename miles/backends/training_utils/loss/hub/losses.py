@@ -152,9 +152,7 @@ def policy_loss_function(
     if need_full_log_probs:
         full_log_probs = [
             all_gather_with_cp(log_prob, total_length, response_length)
-            for log_prob, total_length, response_length in zip(
-                log_probs, total_lengths, response_lengths, strict=False
-            )
+            for log_prob, total_length, response_length in zip(log_probs, total_lengths, response_lengths, strict=False)
         ]
         if args.skip_actor_forward_only and not args.use_rollout_logprobs:
             full_old_log_probs = [full_log_prob.detach() for full_log_prob in full_log_probs]

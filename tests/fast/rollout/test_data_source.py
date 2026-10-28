@@ -20,7 +20,14 @@ class TestReadOnlyDataSource:
 
 
 def _make_args(**overrides) -> SimpleNamespace:
-    defaults = dict(rollout_global_dataset=False, save=None, load=None, rollout_shuffle=False, rollout_seed=42, system_prompt_path=None)
+    defaults = dict(
+        rollout_global_dataset=False,
+        save=None,
+        load=None,
+        rollout_shuffle=False,
+        rollout_seed=42,
+        system_prompt_path=None,
+    )
     return SimpleNamespace(**{**defaults, **overrides})
 
 

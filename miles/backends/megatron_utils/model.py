@@ -713,7 +713,7 @@ def train_one_step(
             consumed_identities = SampleIdentityExtractor.gather_sample_identities(local_consumed_identities)
         if outcome == TrainStepOutcome.NORMAL:
             ModelCompanionSampleConsumptionUtils.record(
-                model=model, samples=consumed_identities, is_skipped=not valid_step
+                model=model, samples=consumed_identities, is_skipped=not valid_step or skip_update
             )
 
     _zero_grads(model, optimizer, disable_optimizer)

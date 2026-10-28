@@ -309,9 +309,7 @@ def get_sum_of_sample_mean(
             return sum(
                 [
                     (x_i * chunked_loss_mask).sum()
-                    for x_i, chunked_loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=True
-                    )
+                    for x_i, chunked_loss_mask in zip(x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=True)
                 ]
             )
 
@@ -378,9 +376,7 @@ def get_drgrpo_pgloss_reducer(
             return sum(
                 [
                     (x_i * chunked_loss_mask).sum()
-                    for x_i, chunked_loss_mask in zip(
-                        x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=True
-                    )
+                    for x_i, chunked_loss_mask in zip(x.split(cp_chunk_lengths, dim=0), chunked_loss_masks, strict=True)
                 ]
             )
 
