@@ -40,8 +40,13 @@ The fixed divisor applies to policy loss; entropy and KL retain their existing
 separate reducers and coefficients. The legacy custom reducer entrypoint still
 works with its original C=1000, now using the same CP-aware core reducer.
 
+Standard-deviation normalization uses only `--disable-grpo-std-normalization`
+(`disable_grpo_std_normalization = true` in TOML). Omit it to retain the
+default: enabled for legacy GRPO, `grpo_original`, and `dapo`; disabled for
+`dr_grpo`. The positive `--grpo-std-normalization` alias is not supported.
+
 Independent overrides reuse `eps_clip`, `eps_clip_high`,
-`disable_grpo_std_normalization` / `grpo_std_normalization`, and
+`disable_grpo_std_normalization`, and
 `dynamic_sampling_filter_path` (empty string disables it). New reduction choices
 are `response_mean`, `token_mean`, `group_token_mean`, and `fixed_token_sum`.
 `group_token_mean` averages per-prompt token means and currently requires one

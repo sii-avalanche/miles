@@ -139,7 +139,6 @@ _DEFAULT_FT_API_SERVER_PORT = 18080
 
 
 def add_rl_algorithm_arguments(parser):
-    parser.add_argument("--grpo-std-normalization", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument(
         "--rl-algorithm",
         choices=["grpo_original", "dapo", "dr_grpo"],
