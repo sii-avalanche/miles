@@ -13,7 +13,6 @@ Vision weights are also excluded (--check-weight-update-skip-list visual): miles
 VLM/vision implementation on the training side, so they are never synced.
 """
 
-import dataclasses
 import os
 
 from tests.ci.ci_register import register_cuda_ci, register_rocm_ci
@@ -22,7 +21,9 @@ from tests.e2e.megatron.test_qwen3_5_35B_A3B._common import CaseConfig, execute,
 
 # Hopper only until a B200 run of this case passes: on Blackwell, FP8 without DeepEP pairs UE8M0
 # linear scales with fp32 expert scales (quantizer_fp8.py).
-register_cuda_ci(est_time=2100, suite="stage-c-4-gpu-h200", labels=["megatron", "qwen35"], hardware=["hopper"])
+register_cuda_ci(
+    est_time=2100, suite="stage-c-4-gpu-h200", labels=["megatron", "qwen35"], hardware=["hopper"], num_gpus=4
+)
 register_rocm_ci(est_time=1600, suite="nightly-stage-c-4-gpu-mi350", labels=["megatron", "qwen35"])
 
 register_ci_gate(metric_key="train/grad_norm")
@@ -30,6 +31,7 @@ register_ci_gate(metric_key="train/ppo_kl")
 register_ci_gate(metric_key="train/train_rollout_logprob_abs_diff")
 register_ci_gate(metric_key="train/train_rollout_kl")
 register_ci_gate(metric_key="rollout/raw_reward")
+register_ci_gate(metric_key="perf/actor_train_mfu")
 
 CASE = CaseConfig(
     # tp2/cp2/ep4: TP=4 hits a Qwen3.5 attention-output-gate sharding bug, so stay at TP=2.
@@ -39,6 +41,7 @@ CASE = CaseConfig(
     pp_size=1,
     tp_size=2,
     ep_size=4,
+    megatron_dispatcher="alltoall" if os.getenv("MILES_HARDWARE_PLATFORM") == "rocm" else "flex",
     # 4096 (the CP=1 cases keep 8192): CP=2 routes the GatedDeltaNet backward through the heavier
     # fla CP kernel, whose Triton autotune OOMs at 8192 even with PP=2; halve the budget for headroom.
     max_tokens_per_gpu=4096,
@@ -48,7 +51,6 @@ CASE = CaseConfig(
     use_fp8_rollout=True,
     enable_mtp_training=False,
     use_r3=False,
-    check_weight_update_selector="target",
     # miles has no VLM/vision implementation on the training side, so vision weights are
     # never synced; exclude them from the weight-equality check.
     check_weight_update_skip_list=("visual",),
@@ -59,6 +61,4 @@ if __name__ == "__main__":
     for proxy_var in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
         os.environ.pop(proxy_var, None)
     prepare(CASE)
-    if os.getenv("MILES_HARDWARE_PLATFORM") == "rocm":
-        CASE = dataclasses.replace(CASE, megatron_dispatcher="alltoall")
     execute(CASE, wandb_file=__file__)

@@ -9,6 +9,7 @@ register_cuda_ci(
     suite="stage-c-8-gpu-h200",
     labels=["megatron", "model-scripts"],
     hardware=["hopper", "blackwell"],
+    num_gpus=8,
 )
 register_rocm_ci(
     est_time=1100,
@@ -21,6 +22,7 @@ register_ci_gate(metric_key="train/ppo_kl")
 register_ci_gate(metric_key="train/train_rollout_logprob_abs_diff")
 register_ci_gate(metric_key="train/train_rollout_kl")
 register_ci_gate(metric_key="rollout/raw_reward")
+register_ci_gate(metric_key="perf/actor_train_mfu")
 
 
 def _args() -> ScriptArgs:
@@ -36,9 +38,9 @@ def _args() -> ScriptArgs:
         num_nodes=1,
         num_gpus_per_node=8,
         num_rollout=2,
-        rollout_batch_size=8,
-        n_samples_per_prompt=8,
-        global_batch_size=64,
+        rollout_batch_size=4,
+        n_samples_per_prompt=4,
+        global_batch_size=16,
         rollout_max_response_len=256,
         rollout_max_concurrency=16,
         check_weight_update_equal=True,

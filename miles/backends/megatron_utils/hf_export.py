@@ -12,6 +12,7 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from miles.backends.megatron_utils.lora.native.merge import merge_lora_into_weights
 from miles.backends.megatron_utils.lora.utils import is_lora_model
 from miles.backends.megatron_utils.named_weights import named_params_and_buffers
 from miles.backends.training_utils.checkpoint.io import write_checkpoint_dir
@@ -50,11 +51,11 @@ def save_hf_model(
     path = Path(path if path is not None else args.save_hf.format(rollout_id=rollout_id))
 
     def write_weights(checkpoint_dir: Path):
-        if args.megatron_to_hf_mode == "raw" and not is_lora_model(model):
-            # LoRA needs Bridge to merge the adapter into the base weights
+        if args.megatron_to_hf_mode == "raw":
+            weights = dict(named_params_and_buffers(args, model, convert_to_global_name=True))
             publisher.write_model(
                 checkpoint_dir,
-                weights=dict(named_params_and_buffers(args, model, convert_to_global_name=True)),
+                weights=merge_lora_into_weights(model, weights) if is_lora_model(model) else weights,
                 hf_checkpoint=args.hf_checkpoint,
             )
             if torch.distributed.get_rank() == 0:

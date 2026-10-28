@@ -63,6 +63,8 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     enable_eval: bool = True
     enable_mtp: bool = False
     dsv4_impl: Literal["miles"] = "miles"
+    rollout_batch_size: int = 32
+    n_samples_per_prompt: int = 8
     cp_size: int | None = None
 
     hf_checkpoint: str | None = None
@@ -82,7 +84,7 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     actor_num_gpus_per_node: int = field(init=False)
     rollout_num_gpus: int = field(init=False)
     optimizer_offload: bool = True
-    use_fault_tolerance: bool = True
+    use_fault_tolerance: bool = False
 
     # debug configs
     dump_details: bool = False
@@ -322,8 +324,8 @@ def _train(args: ScriptArgs):
         "--rollout-shuffle "
         "--rm-type math "
         "--num-rollout 3000 "
-        "--rollout-batch-size 32 "
-        "--n-samples-per-prompt 8 "
+        f"--rollout-batch-size {args.rollout_batch_size} "
+        f"--n-samples-per-prompt {args.n_samples_per_prompt} "
         "--rollout-temperature 0.8 "
         "--num-steps-per-rollout 1 "
         "--balance-data "
@@ -459,7 +461,14 @@ def _train(args: ScriptArgs):
     if args.enable_mis:
         misc_args += (
             "--use-tis "
-            "--custom-config-path examples/infra_features/train_infer_mismatch_helper/mis.yaml "
+            "--use-rs "
+            "--tis-level token "
+            "--rs-level token "
+            "--tis-mode truncate "
+            "--tis-lower-bound 0.5 "
+            "--tis-upper-bound 2.0 "
+            "--rs-veto-threshold 1.0e-4 "
+            "--tis-batch-normalize "
             "--custom-tis-function-path examples.infra_features.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp "
         )
 

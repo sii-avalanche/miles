@@ -11,8 +11,7 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.module import MegatronModule
 from torch import Tensor
 
-from miles_plugins.models.qwen3_8_next.ops.kernel.qsa_block_sparse_attn import qsa_block_sparse_attention_triton
-from miles_plugins.models.qwen3_8_next.ops.kernel.qsa_sparse_attn import qsa_sparse_attention_triton
+from miles.kernels.attention.qsa import qsa_block_sparse_attention, qsa_sparse_attention
 from miles_plugins.models.qwen3_8_next.ops.qsa_indexer import PackedBlockLayout, Qwen38NextQSAIndexer
 
 
@@ -26,18 +25,22 @@ class Qwen38NextQSACoreAttention(MegatronModule):
         self.softmax_scale = config.kv_channels**-0.5
 
     def forward(self, query: Tensor, key: Tensor, value: Tensor, attention_mask=None, **kwargs):
-        selection = getattr(self._owner, "_qsa_selection", None)
+        selection = getattr(
+            self._owner, "_qsa_selection", None
+        )  # config-access-exempt: the owner attaches sparse-attention state only during its forward
         if selection is None:
             raise RuntimeError(
                 "QSA core attention ran with no selection published. "
                 "Qwen38NextAttention.forward sets it before delegating; reaching here "
                 "means core_attention was called out of band."
             )
-        block_form = getattr(self._owner, "_qsa_block_form", None)
+        block_form = getattr(
+            self._owner, "_qsa_block_form", None
+        )  # config-access-exempt: the owner attaches sparse-attention state only during its forward
         if query.dim() == 3:
             if block_form is not None:
                 sel_bitmap, lo, hi, blk_base, tok_base, block_first, block_last, blk = block_form
-                return qsa_block_sparse_attention_triton(
+                return qsa_block_sparse_attention(
                     query,
                     key,
                     value,
@@ -51,17 +54,14 @@ class Qwen38NextQSACoreAttention(MegatronModule):
                     self.softmax_scale,
                     blk,
                 ).reshape(query.shape[0], -1)
-            return qsa_sparse_attention_triton(query, key, value, selection, self.softmax_scale).reshape(
-                query.shape[0], -1
-            )
+            return qsa_sparse_attention(query, key, value, selection, self.softmax_scale).reshape(query.shape[0], -1)
 
         if query.dim() != 4:
             raise RuntimeError(f"QSA core attention expected a 3D (thd) or 4D (sbhd) query, got {tuple(query.shape)}")
 
         s, b, hq, d = query.shape
         out = [
-            qsa_sparse_attention_triton(query[:, i], key[:, i], value[:, i], selection, self.softmax_scale)
-            for i in range(b)
+            qsa_sparse_attention(query[:, i], key[:, i], value[:, i], selection, self.softmax_scale) for i in range(b)
         ]
         return torch.stack(out, dim=1).reshape(s, b, hq * d)
 
@@ -99,7 +99,9 @@ class Qwen38NextAttention(SelfAttention):
         packed = kwargs.get("packed_seq_params")
 
         indexer_states = hidden_states
-        if getattr(self.config, "sequence_parallel", False):
+        if getattr(
+            self.config, "sequence_parallel", False
+        ):  # config-access-exempt: model configs may omit sequence_parallel
             if get_tensor_model_parallel_world_size() > 1:
                 with torch.no_grad():
                     indexer_states = gather_from_sequence_parallel_region(
@@ -109,7 +111,9 @@ class Qwen38NextAttention(SelfAttention):
                     )
         seq = indexer_states.shape[0]
         if packed is not None:
-            cu = getattr(packed, "cu_seqlens_q", None)
+            cu = getattr(
+                packed, "cu_seqlens_q", None
+            )  # config-access-exempt: packed-sequence implementations may omit cumulative lengths
             if cu is None:
                 raise NotImplementedError(
                     "packed_seq_params without cu_seqlens_q: QSA needs the sequence "

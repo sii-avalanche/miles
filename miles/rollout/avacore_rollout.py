@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import json
 import logging
 import os
 from argparse import Namespace
@@ -30,6 +31,8 @@ from miles.rollout.generate_utils.rollout_topk_logprobs import (
 )
 from miles.rollout.generate_utils.sampling_mask import append_forced_sampling_tokens, append_sampling_metadata
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.utils.args.schema import A, Arg, BaseConfig
+from miles.utils.args.custom_view import compute_custom_function_config
 from miles.utils.types import Sample, WeightVersionsPerCall
 
 __all__ = ["AvaCoreRollout", "generate"]
@@ -181,13 +184,21 @@ class AvaCoreRollout:
                 )
 
 
+class AvaCoreGenerateConfig(BaseConfig):
+    avacore_config: A[dict[str, Any], Arg(type_parser=json.loads, help="AvaCore generation, reward and recording configuration.")]
+
+
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     state = input.state
     if (rollout := getattr(state, "avacore", None)) is None:
-        rollout = state.avacore = AvaCoreRollout(input.args, input.args.avacore_config)
+        fn_args = compute_custom_function_config(input.args, input.args.custom_generate_function_path)
+        rollout = state.avacore = AvaCoreRollout(fn_args, fn_args.avacore_config)
     return GenerateFnOutput(
         samples=await rollout.generate(input.sample, input.sampling_params, evaluation=input.evaluation)
     )
+
+
+generate.config_class = AvaCoreGenerateConfig
 
 
 def filled(

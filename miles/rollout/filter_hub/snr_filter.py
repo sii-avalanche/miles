@@ -8,6 +8,9 @@ logger = logging.getLogger(__name__)
 
 
 def _iter_samples(group):
+    if not isinstance(group, list):
+        yield group
+        return
     for s in group:
         if isinstance(s, list):
             yield from _iter_samples(s)
@@ -17,9 +20,10 @@ def _iter_samples(group):
 
 def group_reward_variance(args, group: list) -> float:
     """Sample variance (1/(G-1)) of the rewards within one prompt group."""
-    rewards = [s.get_reward_value(args) for s in _iter_samples(group)]
-    if len(rewards) < 2:
+    samples = list(_iter_samples(group))
+    if len(samples) < 2:
         return 0.0
+    rewards = [s.get_reward_value(args) for s in samples]
     return statistics.variance(rewards)
 
 

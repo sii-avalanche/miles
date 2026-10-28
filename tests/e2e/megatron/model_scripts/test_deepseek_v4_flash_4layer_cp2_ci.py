@@ -15,7 +15,11 @@ from tests.ci.metric_history import register_ci_gate
 from tests.e2e.megatron.model_scripts import test_deepseek_v4_flash_4layer_ci as base
 
 register_cuda_ci(
-    est_time=1900, suite="stage-c-4-gpu-h200", labels=["megatron", "model-scripts"], hardware=["hopper", "blackwell"]
+    est_time=1000,
+    suite="stage-c-4-gpu-h200",
+    labels=["megatron", "model-scripts"],
+    hardware=["hopper", "blackwell"],
+    num_gpus=4,
 )
 register_rocm_ci(est_time=700, suite="nightly-stage-c-4-gpu-mi350", labels=["megatron", "model-scripts"])
 
@@ -24,6 +28,7 @@ register_ci_gate(metric_key="train/ppo_kl")
 register_ci_gate(metric_key="train/train_rollout_logprob_abs_diff")
 register_ci_gate(metric_key="train/train_rollout_kl")
 register_ci_gate(metric_key="rollout/raw_reward")
+register_ci_gate(metric_key="perf/actor_train_mfu")
 
 prepare = base.prepare
 execute = base.execute

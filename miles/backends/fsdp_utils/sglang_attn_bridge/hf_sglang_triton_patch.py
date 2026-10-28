@@ -68,12 +68,12 @@ class TritonAttnFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Memory-efficient Triton backward for causal self-attention."""
-        from .triton_attn_bwd import triton_attention_backward
+        from miles.kernels.attention.dense.backward import dense_attention_backward
 
         q, k, v, o = ctx.saved_tensors
         B, S = ctx.B, ctx.S
 
-        dq, dk, dv = triton_attention_backward(q, k, v, o, grad_output, B, S)
+        dq, dk, dv = dense_attention_backward(q, k, v, o, grad_output, B, S)
         return dq, dk, dv, None, None
 
 
@@ -121,5 +121,7 @@ def apply_sglang_triton_attention_patch(model):
     ALL_ATTENTION_FUNCTIONS["triton"] = _sglang_triton_attention
     model.config._attn_implementation = "triton"
 
-    patched = sum(1 for _, m in model.named_modules() if hasattr(m, "q_proj") and hasattr(m, "o_proj"))
+    patched = sum(
+        1 for _, m in model.named_modules() if hasattr(m, "q_proj") and hasattr(m, "o_proj")
+    )  # config-access-exempt: identify attention modules by their projection capabilities
     return patched
