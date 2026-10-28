@@ -164,8 +164,6 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             await asyncio.wrap_future(
                 asyncio.run_coroutine_threadsafe(_end_worker(self._heartbeat), self._heartbeat.get_loop())
             )
-        if (avacore := getattr(self.state, "avacore", None)) is not None:
-            await avacore.dispose()
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnOutput:
         if input.generate_state is not None:
@@ -211,15 +209,6 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
     async def _worker_loop(self) -> None:
         active: dict[asyncio.Task, list[Sample]] = {}
-        try:
-            await self._run_worker_loop(active)
-        finally:
-            for task in active:
-                task.cancel()
-            await asyncio.gather(*active, return_exceptions=True)
-            self._pending_groups.clear()
-
-    async def _run_worker_loop(self, active: dict[asyncio.Task, list[Sample]]) -> None:
         while True:
             await self._producer_resumed.wait()
             while self._scheduler.has_capacity(pending_groups=len(active), group_budget=self._max_in_flight_groups()):

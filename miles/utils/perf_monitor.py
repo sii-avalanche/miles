@@ -57,21 +57,18 @@ def add_perf_monitor_arguments(parser) -> None:
 
     group.add_argument(
         "--perf-monitor-gpu-interval",
-        "--dashboard-gpu-sample-interval",
         type=float,
         default=1.0,
         help="GPU sampling cadence in seconds (W&B fleet telemetry).",
     )
     group.add_argument(
         "--perf-monitor-engine-interval",
-        "--dashboard-sglang-scrape-interval",
         type=float,
         default=2.0,
         help="SGLang metrics scrape cadence in seconds.",
     )
     group.add_argument(
         "--perf-monitor-engine-mode",
-        "--dashboard-sglang-scrape-mode",
         choices=["auto", "direct", "router"],
         default="direct",
         help="auto/direct scrape engines; router uses /engine_metrics.",

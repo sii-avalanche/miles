@@ -143,8 +143,15 @@ local address. Use `--num-rollout 1` to stop after one step.
 
 ## 4. Verify compaction and training
 
-The trace root defaults to `<output-dir>/<run-id>/details`. With W&B enabled,
-open **Overview → Notes → RL timeline** for the [run report](../../../docs/user-guide/rl-report.md).
+The trace root defaults to `<output-dir>/<run-id>/details`. View the live Miles
+dashboard with:
+
+```bash
+python -m miles.dashboard.serve \
+    --dump-details /path/to/output/<run-id>/details \
+    --follow \
+    --port 7788
+```
 
 Useful per-step metrics are:
 
@@ -167,7 +174,7 @@ The per-rollout response-length metrics are not emitted for Multi-LoRA
 workloads because rollout identifiers are local to each adapter's data source.
 Multi-LoRA training itself is unaffected.
 
-Inspect `rollout_data/<step>.pt` to confirm that:
+Inspect `rollout_data/<step>.pt` or the dashboard's sample view to confirm that:
 
 - compacted siblings share a rollout ID and terminal reward;
 - shared prefix completions are loss-masked in all but one sibling; and

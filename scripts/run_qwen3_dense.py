@@ -61,15 +61,15 @@ class _Recipe:
     optimizer_cpu_offload: bool
     num_rollout: int = 3000
     extra_sglang_args: str = ""
-    # The quick-start recipe reports runtime telemetry; the rest keep it disabled by default.
-    use_telemetry: bool = False
+    # the quick-start recipe serves the dashboard; the rest stay quiet by default
+    use_dashboard: bool = False
 
 
 # Qwen3-32B decodes a wide batch sweep, so it pins the cuda graph batch sizes.
 _QWEN3_32B_CUDA_GRAPH_BS = " ".join(str(bs) for bs in [1, 2, 4, 8, *range(16, 257, 8)])
 
 _RECIPES: dict[str, _Recipe] = {
-    "Qwen3-4B": _Recipe("qwen3-4B", 2, 9216, 2, 0.7, False, use_telemetry=True),
+    "Qwen3-4B": _Recipe("qwen3-4B", 2, 9216, 2, 0.7, False, use_dashboard=True),
     "Qwen3-32B": _Recipe(
         "qwen3-32B",
         8,
@@ -203,8 +203,8 @@ def execute(args: ScriptArgs):
         f"--actor-num-gpus-per-node {args.num_gpus_per_node} "
         f"--num-gpus-per-node {args.num_gpus_per_node} "
     )
-    if args.recipe.use_telemetry:
-        misc_args += "--perf-monitor-interval 10 " f"--dump-details {args.output_dir}/dump_details "
+    if args.recipe.use_dashboard:
+        misc_args += "--use-miles-dashboard " f"--dump-details {args.output_dir}/dump_details "
 
     train_args = (
         f"{ckpt_args} "

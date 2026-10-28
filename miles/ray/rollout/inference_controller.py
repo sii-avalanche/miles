@@ -8,11 +8,12 @@ from typing import Any
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
-from miles.utils import fleet_monitor
+from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, EvalFleetPin, InferenceControllerEvalFleet
 from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers
 from miles.ray.rollout.router_manager import resolve_router_addrs
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
+from miles.utils import fleet_monitor
 from miles.utils import async_utils
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.context_lock import (
@@ -84,6 +85,7 @@ class InferenceController:
         self._watcher_disposers.append(await self._engine_provider.watch_cells(self._reconcile))
         self._ticker = SimpleTicker(self._tick_cells, interval_seconds=TICK_INTERVAL_SECONDS)
 
+        dashboard_hooks.register_router(self.args)
         fleet_monitor.register_router(self.args)
 
         await self.wait_expected_num_cells()
@@ -149,6 +151,7 @@ class InferenceController:
     @with_lock
     async def prepare_rollout(self, rollout_id: int, model_id: str | None = None) -> None:
         await self._health_monitoring_resume(model_id)
+        await dashboard_hooks.register_engines(self.servers, provider=self._engine_provider)
         await fleet_monitor.register_engines(self.servers, provider=self._engine_provider)
 
     @with_lock

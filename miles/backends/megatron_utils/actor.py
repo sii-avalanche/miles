@@ -33,10 +33,11 @@ from miles.backends.training_utils.types import TrainStepOutput
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.snapshot_publisher import SnapshotPublisher
 from miles.backends.training_utils.weight_update.updater import WeightUpdater
-from miles.utils import fleet_monitor
+from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train_actor import TrainRayActor
+from miles.utils import fleet_monitor
 from miles.utils import object_store
 from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.audit_utils.event_logger.logger import event_logger_context
@@ -150,6 +151,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self._is_first_replica_megatron_main_rank:
             init_tracking(args, primary=False)
 
+        dashboard_hooks.register_train_actor(args)
         fleet_monitor.register_train_actor(
             args, engine_id=f"{role}-{args.trainer_id}-{indep_dp_info.cell_index:05d}", worker_id=self._rank
         )

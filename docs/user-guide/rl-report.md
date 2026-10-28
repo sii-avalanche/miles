@@ -44,5 +44,5 @@ Training jobs do not need this optional package or repeat workspace setup.
   continue receiving runtime scalars on the `runtime/time_s` axis.
 - Missing samples stay missing; GPU activity is not MFU. Phase strips describe
   role-level orchestration, not per-GPU kernel timing. Pool counts are groups.
-- Old `--use-miles-dashboard` and dashboard service flags are removed. Replace
-  them with `--perf-monitor-interval 10`; no dashboard server command is needed.
+- This report uses `--perf-monitor-interval`; no dashboard server is needed.
+  The existing `--use-miles-dashboard` feature remains separately opt-in.

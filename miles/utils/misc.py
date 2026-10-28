@@ -116,6 +116,18 @@ def get_free_port(start_port=10000, consecutive=1):
     raise RuntimeError(f"No {consecutive} consecutive free ports in [{lowest_start}, {_MAX_PORT}]")
 
 
+def get_gpu_uuids(gpu_ids: list[int]) -> list[str | None]:
+    """Best-effort NVML UUIDs so the dashboard can reconcile GPU index
+    spaces across processes; None entries when NVML is unavailable."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        return [str(pynvml.nvmlDeviceGetUUID(pynvml.nvmlDeviceGetHandleByIndex(i))) for i in gpu_ids]
+    except Exception:
+        return [None] * len(gpu_ids)
+
+
 def _to_local_gpu_id(physical_gpu_id: int) -> int:
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("HIP_VISIBLE_DEVICES")
     if not cvd:
@@ -130,7 +142,7 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
         return physical_gpu_id
     raise RuntimeError(
         f"GPU id {physical_gpu_id} is not valid under CUDA_VISIBLE_DEVICES={cvd}. "
-        f"Expected one of {visible} (physical) or 0..{len(visible) - 1} (local)."
+        f"Expected one of {visible} (physical) or 0..{len(visible)-1} (local)."
     )
 
 
@@ -154,6 +166,10 @@ class NodeProbeMixin:
     @staticmethod
     def _is_port_available(*, port: int) -> bool:
         return is_port_available(port)
+
+    @staticmethod
+    def _get_gpu_uuids(gpu_ids: list[int]) -> list[str | None]:
+        return get_gpu_uuids(gpu_ids)
 
 
 def should_run_periodic_action(

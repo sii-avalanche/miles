@@ -19,9 +19,9 @@ def postprocess_rollout_data(args, data, train_parallel_config):
         metrics = metrics | snr_metrics
     metadata["metrics"] = metrics
 
-    # One batch can mix single-sample episodes and multi-fragment episodes.
-    while any(isinstance(item, list) for item in data):
-        data = list(itertools.chain.from_iterable(item if isinstance(item, list) else [item] for item in data))
+    # flatten the data if it is a list of lists
+    while isinstance(data[0], list):
+        data = list(itertools.chain.from_iterable(data))
 
     # Compact rollouts must not be trimmed by sample count; the schedule drops
     # whole trailing rollouts instead.
@@ -55,7 +55,7 @@ def validate_compact_rollout_ids(node, depth=0):
     if isinstance(node, Sample):
         return
     assert isinstance(node, list), f"unexpected rollout output node type: {type(node).__name__}"
-    if node and all(isinstance(item, Sample) for item in node):
+    if node and isinstance(node[0], Sample):
         if depth >= 2 and len(node) > 1:
             rids = [s.rollout_id for s in node]
             missing = [i for i, r in enumerate(rids) if r is None]

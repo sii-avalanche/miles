@@ -209,11 +209,12 @@ def _miscellaneous_args(args: ScriptArgs) -> str:
             "mtp_loss_scaling_factor": 0,
             "custom_megatron_before_train_step_hook_path": "workplace_training_checks.before_train_step",
             "dump_details": str(Path(args.output_dir) / "traces"),
-            "perf_monitor_interval": 10,
+            "use_miles_dashboard": True,
             "observe_training_entropy": True,
             "use_rollout_entropy": True,
             "use_prometheus": True,
             "prometheus_port": 9090,
+            "dashboard_forward_prometheus": True,
         }
     )
 
