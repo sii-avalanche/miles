@@ -2,7 +2,7 @@
 
 Counters are cumulative; duration percentiles describe the last 256 completed
 operations. Live waits include operations that have not returned yet. Snapshots
-go through the existing tracking backends. W&B runs do not write a second event stream.
+go through the existing tracking backends. W&B stores runtime details in a standalone HTML report instead of scalar history.
 No sample text, exception messages, environment values or credentials are saved.
 """
 
@@ -34,7 +34,7 @@ def add_perf_monitor_arguments(parser) -> None:
         "--perf-monitor-interval",
         type=float,
         default=0.0,
-        help="Wall-clock telemetry interval (s); 0 disables it. W&B receives all runtime/* metrics.",
+        help="Wall-clock telemetry interval (s); 0 disables it. Runtime details are embedded in a per-run HTML report; no runtime scalar channels.",
     )
     group.add_argument(
         "--perf-monitor-expert-layer",
@@ -114,6 +114,7 @@ class RuntimeMonitor:
         self.args = args
         self.interval = getattr(args, "perf_monitor_interval", 0)
         self.start_ts = getattr(args, "perf_monitor_start_ts", time.time())
+        self._report = None
         self._sink = sink
         self._path = path
         self._lock = threading.RLock()
@@ -236,10 +237,6 @@ class RuntimeMonitor:
 
     def _event(self, event: dict) -> None:
         with self._lock:
-            if wandb_runtime_enabled(self.args):
-                if event["t1"] is not None:
-                    self._counters[f"events/{event['name']}/count_total"] += 1
-                return
             if len(self._events) == self._events.maxlen:
                 self._counters["telemetry/events_dropped_total"] += 1
             self._events.append(event)
@@ -369,6 +366,11 @@ class RuntimeMonitor:
                     append_records(self._path, [*events, dict(kind="metrics", ts=time.time(), metrics=metrics)])
                 except Exception:
                     self._warn("performance log write failed; events dropped")
+            if wandb_runtime_enabled(self.args) and self._sink is None:
+                try:
+                    self._publish_report(metrics, events)
+                except Exception:
+                    self._warn("RL report update failed; other tracking backends continue")
             # A separate backend failure cannot prevent local records from landing.
             if self._sink is not None:
                 self._sink(metrics)
@@ -378,6 +380,20 @@ class RuntimeMonitor:
                 tracking.log(self.args, metrics, step_key="runtime/time_s")
         except Exception:
             self._warn("performance tracking failed; next interval will retry")
+
+    def _publish_report(self, metrics, events):
+        from miles.utils.fleet_monitor import submit_report_records
+        from miles.utils.rl_report.publisher import ReportPublisher, report_record
+
+        sample = report_record(metrics)
+        records = [*events, sample] if len(sample["metrics"]) > 1 else events
+        if not records and self.role != "driver":
+            return
+        received = submit_report_records(records, primary=self.role == "driver")
+        if self.role == "driver":
+            if self._report is None:
+                self._report = ReportPublisher(interval=self.interval)
+            self._report.publish(received, force=self._closed)
 
     def _warn(self, message: str) -> None:
         now = time.monotonic()

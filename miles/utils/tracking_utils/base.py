@@ -66,22 +66,33 @@ class WandbBackend(TrackingBackend):
 
         if not metrics:
             return
-        wandb.log(metrics)
+        # Runtime detail belongs to the per-run HTML report, not scalar history.
+        # Keep other tracking backends and alert delivery intact.
+        scalar_metrics = {key: value for key, value in metrics.items() if not key.startswith("runtime/")}
+        if scalar_metrics:
+            wandb.log(scalar_metrics)
+            if "perf/actor_train_mfu" in scalar_metrics:
+                from miles.utils.fleet_monitor import record_report_performance
+
+                try:
+                    record_report_performance(scalar_metrics)
+                except Exception:
+                    logger.debug("Report performance sample unavailable", exc_info=True)
         for key, active in metrics.items():
             if not key.startswith("runtime/") or "/alerts/" not in key:
                 continue
             if active and key not in self._active_alerts:
                 try:
-                    wandb.alert(title=key.rsplit("/", 1)[-1], text=f"{key} is active; see the Monitoring panels.")
+                    wandb.alert(title=key.rsplit("/", 1)[-1], text=f"{key} is active; see the per-run RL report.")
                     self._active_alerts.add(key)
                 except Exception:
-                    logger.warning("W&B alert delivery failed; the numeric alert remains logged", exc_info=True)
+                    logger.warning("W&B alert delivery failed; runtime alert was not delivered", exc_info=True)
             elif not active:
                 self._active_alerts.discard(key)
 
     def define_step_key_metric_group(self, prefix: str, step_key: str) -> None:
         # Call from the primary tracking process: definitions from secondary shared-mode writers are lost.
-        if (prefix, step_key) in self._defined_step_key_groups:
+        if prefix == "runtime" or (prefix, step_key) in self._defined_step_key_groups:
             return
         import wandb
 

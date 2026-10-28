@@ -43,6 +43,7 @@ setup(
     version="0.1.1",
     packages=find_packages(include=["miles*", "miles_plugins*"]),
     include_package_data=True,
+    package_data={"miles.utils.rl_report": ["static/*.js", "static/*.css"]},
     install_requires=_fetch_requirements("requirements.txt"),
     extras_require={
         "fsdp": [

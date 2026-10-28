@@ -1,11 +1,11 @@
-"""Latest fleet gauges for W&B, without a dashboard server, history store or event sinks."""
+"""Fleet sampling and bounded report transport, without a dashboard HTTP server."""
 
 from __future__ import annotations
 
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from miles.utils.fleet_sampling import GpuReader, read_engine_metrics
 
@@ -33,6 +33,20 @@ class FleetTelemetry:
         self._samples = {}
         self._previous = {}
         self._warned = {}
+        self._report_records = deque(maxlen=20000)
+        self._report_dropped = 0
+
+    def report_records(self, records, *, drain=False):
+        self._report_dropped += max(0, len(self._report_records) + len(records) - self._report_records.maxlen)
+        self._report_records.extend(records)
+        if not drain:
+            return []
+        result = list(self._report_records)
+        self._report_records.clear()
+        if self._report_dropped:
+            logger.warning("RL report queue dropped %s records", self._report_dropped)
+            self._report_dropped = 0
+        return result
 
     def start(self):
         for name, callback, interval in (
@@ -380,3 +394,26 @@ def finish_fleet():
                 logger.debug("Fleet sampler already stopped", exc_info=True)
     _handle = None
     _primary = False
+
+
+def submit_report_records(records, *, primary):
+    """Use the existing fleet actor, not a new service or W&B data-pool run."""
+    import ray
+
+    handle = _resolve()
+    if handle is None:
+        if primary:
+            return records
+        logger.warning("RL report collector unavailable; worker snapshot omitted")
+        return []
+    # Called only by monitor threads. A timeout cannot hold up training.
+    return ray.get(handle.report_records.remote(records, drain=primary), timeout=5)
+
+
+def record_report_performance(metrics):
+    """Small, asynchronous per-step records; never wait on a training worker."""
+    from miles.utils.rl_report import PERFORMANCE_KEYS
+
+    values = {key: metrics[key] for key in PERFORMANCE_KEYS if key in metrics}
+    if values and _handle is not None:
+        _handle.report_records.remote([{"kind": "metrics", "ts": time.time(), "metrics": values}])
