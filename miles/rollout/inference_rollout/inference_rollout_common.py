@@ -28,6 +28,10 @@ from miles.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
+class GroupOversamplingExhaustedError(RuntimeError):
+    """A prompt group ran out of usable eager candidates."""
+
+
 class GenerateState:
     def __init__(self, args: Namespace) -> None:
         # persistent state for the generation process
@@ -216,7 +220,7 @@ async def generate_and_rm_group(
             partial_group = [task.result() for task in tasks[:target_size]]
             _restore_group_identities(partial_group, group)
             return partial_group
-        raise RuntimeError(
+        raise GroupOversamplingExhaustedError(
             f"group oversampling exhausted with only {len(usable)}/{target_size} usable candidates "
             f"from {len(candidates)} attempts"
         )

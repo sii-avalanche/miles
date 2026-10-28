@@ -857,6 +857,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--group-oversampling-max-group-retries",
+                type=int,
+                default=0,
+                help=(
+                    "Number of times fully-async rollout retries a prompt group after its eager "
+                    "candidates cannot fill n_samples_per_prompt. Exhausted groups are dropped "
+                    "after this bound so one bad prompt cannot stop or block the producer."
+                ),
+            )
+            parser.add_argument(
                 "--dynamic-sampling-filter-path",
                 type=str,
                 default=None,
@@ -3895,6 +3905,9 @@ def miles_validate_args(args):
         )
 
     assert args.group_oversampling_extra >= 0, "--group-oversampling-extra must be non-negative"
+    assert args.group_oversampling_max_group_retries >= 0, (
+        "--group-oversampling-max-group-retries must be non-negative"
+    )
     assert not args.group_oversampling_extra or not use_legacy_rollout_v1(), (
         "--group-oversampling-extra requires the class-based rollout API; " "unset MILES_USE_LEGACY_ROLLOUT_V1"
     )

@@ -42,7 +42,11 @@ from miles.rollout.fully_async_data_buffer import (
     first_sample,
 )
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
-from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
+from miles.rollout.inference_rollout.inference_rollout_common import (
+    GenerateState,
+    GroupOversamplingExhaustedError,
+    generate_and_rm_group,
+)
 from miles.rollout.inference_rollout.inference_rollout_eval import run_eval_datasets
 from miles.rollout.submission_scheduler import candidate_group_size, make_submission_scheduler
 from miles.utils.function_registry import load_function
@@ -80,6 +84,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._handle_unused = (
             self._recycle if input.args.async_unused_samples_handler == "retry" else (lambda prompt_group: None)
         )
+        self._group_retry_counts: dict[tuple, int] = {}
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
         self._worker: asyncio.Task | None = None
         self._eval_prompt_dataset_cache: dict = {}
@@ -154,8 +159,32 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
                 active[task] = prompt_group
             done, _ = await self._scheduler.wait_for_progress(set(active))
             for task in done:
-                entry = self._collect_group_result(task, active.pop(task))
+                prompt_group = active.pop(task)
+                try:
+                    entry = self._collect_group_result(task, prompt_group)
+                except GroupOversamplingExhaustedError as error:
+                    self._handle_group_exhaustion(prompt_group, error)
+                    continue
+                self._group_retry_counts.pop(self._group_key(prompt_group), None)
                 await self._output.put(entry)
+
+    @staticmethod
+    def _group_key(prompt_group: list[Sample]) -> tuple:
+        return tuple((sample.group_index, sample.index, sample.epoch) for sample in prompt_group)
+
+    def _handle_group_exhaustion(
+        self, prompt_group: list[Sample], error: GroupOversamplingExhaustedError
+    ) -> None:
+        key = self._group_key(prompt_group)
+        retries = self._group_retry_counts.get(key, 0)
+        max_retries = self.args.group_oversampling_max_group_retries
+        if self.args.async_unused_samples_handler == "retry" and retries < max_retries:
+            self._group_retry_counts[key] = retries + 1
+            self._recycle(prompt_group)
+            logger.warning("Retrying exhausted rollout group %d/%d: %s", retries + 1, max_retries, error)
+            return
+        self._group_retry_counts.pop(key, None)
+        logger.warning("Dropping exhausted rollout group after %d retries: %s", retries, error)
 
     def _collect_group_result(self, task: asyncio.Task, prompt_group: list[Sample]) -> DataBufferInput:
         if not task.cancelled():

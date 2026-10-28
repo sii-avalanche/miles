@@ -85,6 +85,7 @@ def make_args(**overrides) -> Namespace:
         async_max_concurrent_samples=None,
         async_data_buffer_capacity_factor=1000.0,
         async_unused_samples_handler="drop",
+        group_oversampling_max_group_retries=0,
         custom_async_data_buffer_path=None,
         custom_async_data_buffer_path_per_model=None,
         megatron_config=None,
@@ -298,25 +299,48 @@ async def test_worker_error_propagates(monkeypatch):
 
 async def test_group_oversampling_exhaustion_does_not_stop_worker(monkeypatch):
     exhausted = make_group(1)
-    data_source = FakeDataSource(scripted=[exhausted])
 
-    async def generate(state, group, sampling_params, evaluation=False, sample_done_callback=None):
-        if group[0].group_index == 1:
-            raise RuntimeError("group oversampling exhausted with only 1/2 usable candidates from 3 attempts")
-        return group
+    class RetryDataSource(FakeDataSource):
+        def add_samples(self, groups):
+            super().add_samples(groups)
+            self.scripted.extend(groups)
+
+    data_source = RetryDataSource(scripted=[exhausted])
+    calls = 0
+
+    async def generate_sample(state, sample, sampling_params, evaluation=False):
+        nonlocal calls
+        slot = calls
+        calls += 1
+        await asyncio.sleep(0)
+        sample.reward = 1
+        sample.status = Sample.Status.COMPLETED if slot == 0 or slot >= 3 else Sample.Status.ABORTED
+        return sample
+
+    monkeypatch.setattr(rollout_common, "generate_and_rm", generate_sample)
+    monkeypatch.setattr(rollout_common, "policy_uses_routing_key", lambda args: False)
 
     fn = make_fn(
         monkeypatch,
-        make_args(rollout_batch_size=1, async_unused_samples_handler="retry"),
+        make_args(
+            rollout_batch_size=1,
+            async_unused_samples_handler="retry",
+            group_oversampling_max_group_retries=1,
+            group_oversampling_extra=1,
+            async_max_concurrent_samples=3,
+            rollout_submission_granularity="sample",
+            group_rm=False,
+        ),
         data_source,
-        generate=generate,
+        generate=rollout_common.generate_and_rm_group,
     )
 
     output = await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=0)), timeout=2)
 
     assert not fn._worker.done()
-    assert output.samples[0][0].group_index != 1
+    assert output.samples[0][0].group_index == 1
     assert data_source.recycled == [exhausted]
+    assert calls >= 6
 
 
 @pytest.mark.parametrize("handler", ["drop", "retry"])
