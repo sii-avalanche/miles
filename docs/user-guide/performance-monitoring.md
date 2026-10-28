@@ -18,13 +18,19 @@ perf_monitor_engine_interval = 5.0
 perf_monitor_expert_layer = 9
 ```
 
-W&B receives all numeric runtime snapshots and derived rates, including p50,
-p95, max, host resources, workload breakdowns and fleet coverage. Existing
-training, rollout and evaluation metrics retain their original logging paths;
-no metric-prefix allowlist removes them. Use `runtime/time_s` as the X axis.
+With W&B enabled, the monitor publishes a standalone, per-run Miles HTML report.
+Engine/GPU utilization, data pool and collect/train/sync stages share the same
+interactive timeline. The run's Notes contain **RL timeline** and its summary
+contains `rl_report_url`. See the [report guide](rl-report.md) for the project view
+setup with `python -m miles.utils.rl_report`.
 
-The fleet sampler keeps only latest GPU and engine readings. It creates no
-HTTP service, dashboard files, phase-event buffers or trajectory-event sinks.
+Only selected telemetry and exact phase events enter the report archive;
+`runtime/*` values are not separate W&B history series. Existing training,
+rollout and evaluation metrics retain their original logging paths. Other
+tracking backends keep runtime snapshots on the `runtime/time_s` axis.
+
+The fleet sampler keeps latest GPU and engine readings; the driver's background
+publisher embeds them and phase events into an HTML file without an HTTP service.
 Role-level fleet sampling requires Ray; Kubernetes runs still publish their
 process/rollout metrics and W&B's native system metrics.
 

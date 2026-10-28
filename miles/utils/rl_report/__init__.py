@@ -86,5 +86,5 @@ def render_report(records, *, title, run_url="", interval=10):
 
 
 def report_url(run_url):
-    """Project-scoped saved view installed by tools/wandb_workspace.py."""
+    """Project-scoped saved view installed by the Miles report workspace command."""
     return f"{run_url.split('?')[0].rstrip('/')}/panel/rlreportpanel?nw=rlreport"
