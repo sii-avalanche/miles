@@ -74,6 +74,9 @@ def _has_loadable_ckpt(load_dir: str | None) -> bool:
 from .fp32_param_utils import enforce_marked_param_dtypes
 from .lora.bridge import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
 
+from miles.backends.megatron_utils.group_packing import run_group_windows
+from miles.backends.megatron_utils.tp_precision import tp_precision_context
+
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler | None:
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
@@ -590,9 +593,15 @@ def train_one_step(
         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
-    losses_reduced = run_forward_backward_pass(
-        args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
-    )
+    with tp_precision_context(args):
+        if args.streaming_group_packing:
+            losses_reduced = run_group_windows(
+                args, dumper_phase_util, data_iterator[0], model, num_rollouts, run_forward_backward_pass
+            )
+        else:
+            losses_reduced = run_forward_backward_pass(
+                args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
+            )
 
     outcome = TrainStepOutcome.NORMAL
     grad_norm = 0.0

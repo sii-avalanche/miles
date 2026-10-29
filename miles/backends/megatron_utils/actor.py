@@ -80,6 +80,8 @@ from .optimizer_utils import reset_optimizer_state
 from .parallel import verify_megatron_parallel_state
 from .replay_utils import register_replay_list_moe
 
+from miles.backends.megatron_utils.group_packing import StreamingGroups
+
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
@@ -596,6 +598,10 @@ class MegatronTrainRayActor(TrainRayActor):
                     log_rollout_data(rollout_id, self.args, rollout_data)
                     return TrainStepOutput(outcome=TrainStepOutcome.NORMAL)
 
+            group_source = None
+            if self.args.streaming_group_packing:
+                group_source = StreamingGroups(self.args, rollout_data, rollout_id)
+                stack.callback(group_source.close)
             if self.role == "critic":
                 with timer("critic_train"):
                     result = self._train_critic(rollout_id, rollout_data)
@@ -604,6 +610,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_id,
                     rollout_data,
                     external_data=external_data,
+                    group_source=group_source,
                     witness_info=witness_info,
                     attempt=attempt,
                 )
@@ -662,9 +669,13 @@ class MegatronTrainRayActor(TrainRayActor):
         *,
         witness_info: WitnessInfo | None,
         attempt: int,
+        group_source: StreamingGroups | None = None,
     ) -> TrainStepOutput:
         # Create data iterator for log_probs and train.
-        data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        if group_source is None:
+            data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+        else:
+            data_iterator, num_microbatches = [group_source], [1]
         num_optimizer_steps = len(num_microbatches)
         skip_actor_forward_only = self.args.skip_actor_forward_only
         if skip_actor_forward_only:
@@ -756,7 +767,8 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
 
-            log_rollout_data(rollout_id, self.args, rollout_data)
+            if group_source is None:
+                log_rollout_data(rollout_id, self.args, rollout_data)
 
             # Train
             num_rollouts = get_num_rollouts(self.args, rollout_data, num_optimizer_steps)
@@ -837,7 +849,6 @@ class MegatronTrainRayActor(TrainRayActor):
             self._finalize_pending_async_save()
 
             from megatron.training.checkpointing import get_checkpoint_name
-
             from miles.utils.function_registry import load_function
 
             checkpoint_dir = get_checkpoint_name(self.args.save, rollout_id, return_base_dir=True)
