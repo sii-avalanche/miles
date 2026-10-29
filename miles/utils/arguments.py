@@ -4,7 +4,6 @@ import logging
 import math
 import os
 import re
-import sys
 from string import Formatter
 from typing import Any
 
@@ -138,11 +137,11 @@ _FT_CHOICES = ["rollout", "train"]
 _DEFAULT_FT_API_SERVER_PORT = 18080
 
 
-def apply_rl_algorithm_defaults(parser, argv=None):
+def apply_rl_algorithm_defaults(parser):
     """Presets only set defaults; argparse keeps explicit component flags authoritative."""
     selector = argparse.ArgumentParser(add_help=False)
-    selector.add_argument("--rl-algorithm", choices=["grpo_original", "dapo", "dr_grpo"])
-    name = selector.parse_known_args(sys.argv[1:] if argv is None else argv)[0].rl_algorithm
+    selector.add_argument("--rl-algorithm")
+    name = selector.parse_known_args()[0].rl_algorithm
     if name is None:
         return
     dapo = name == "dapo"
