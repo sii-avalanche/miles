@@ -53,7 +53,4 @@ def log(args, metrics, step_key: str):
 
 
 def finish_tracking():
-    from miles.dashboard.backend import finish_report
-
-    finish_report()
     _manager.finish()

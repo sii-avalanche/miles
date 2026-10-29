@@ -133,25 +133,9 @@ def dashboard_log(metrics: dict, *, step: int | None = None, step_key: str | Non
         _warner.warn("dashboard metric push failed; dropping this log call")
 
 
-def finish_report() -> None:
-    """Flush and upload while the driver's W&B run is still open."""
-    global _publisher
-    if _publisher is None:
-        return
-    import ray
-
-    try:
-        ray.get(_handle.flush.remote(), timeout=30)
-    except Exception:
-        logger.warning("Final dashboard flush incomplete; publishing available data", exc_info=True)
-    _publisher.close()
-    _publisher = None
-
-
 def finish_dashboard() -> None:
-    global _handle, _is_primary, _resolution_failed
+    global _handle, _is_primary, _publisher, _resolution_failed
     hooks.detach_and_flush()
-    finish_report()
     if _handle is not None and _is_primary:
         import ray
 
@@ -160,6 +144,10 @@ def finish_dashboard() -> None:
             ray.get(_handle.shutdown.remote(), timeout=30)
         except Exception:
             logger.warning("dashboard collector shutdown incomplete", exc_info=True)
+        if _publisher is not None:
+            # shutdown() flushed the native store; W&B is still open here.
+            _publisher.close()
+            _publisher = None
         ray.kill(_handle)
     _handle = None
     _is_primary = False
