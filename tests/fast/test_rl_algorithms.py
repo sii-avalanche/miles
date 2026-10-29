@@ -122,9 +122,9 @@ def test_penalty_preserves_raw_filtering_and_normalizes_whole_rollouts(monkeypat
 
 
 @pytest.mark.parametrize("cp_size", [1, 2])
-@pytest.mark.parametrize("fixed_normalizer", [None, 10])
-def test_native_drgrpo_reducer_preserves_cp_and_legacy_divisor(monkeypatch, cp_size, fixed_normalizer):
-    monkeypatch.setenv("DIVISOR", "20")
+@pytest.mark.parametrize("divisor", [10, 20])
+def test_native_drgrpo_reducer_uses_explicit_divisor_with_cp(monkeypatch, cp_size, divisor):
+    monkeypatch.setenv("DIVISOR", "ignored")
     lengths = [2, 3]
     masks = [torch.tensor([1.0, 1.0]), torch.tensor([1.0, 0.0, 1.0])]
     values = torch.arange(1.0, 6.0, requires_grad=True)
@@ -137,9 +137,9 @@ def test_native_drgrpo_reducer_preserves_cp_and_legacy_divisor(monkeypatch, cp_s
             part if cp_size == 1 else cp._slice_loss_mask_for_local_cp(length + 2, length, part, "thd", None)
             for length, part in zip(lengths, values.split(lengths), strict=True)
         ]
-        reducer = cp.get_drgrpo_pgloss_reducer([4, 5], lengths, masks, fixed_normalizer=fixed_normalizer)
+        reducer = cp.get_drgrpo_pgloss_reducer([4, 5], lengths, masks, divisor=divisor)
         total = total + reducer(torch.cat(local)) / 2
-    expected = (values * torch.cat(masks)).sum() / (2 * (fixed_normalizer or 20))
+    expected = (values * torch.cat(masks)).sum() / (2 * divisor)
     torch.testing.assert_close(total, expected)
     torch.testing.assert_close(
         torch.autograd.grad(total, values, retain_graph=True)[0], torch.autograd.grad(expected, values)[0]

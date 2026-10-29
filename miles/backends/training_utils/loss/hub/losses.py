@@ -320,7 +320,7 @@ def policy_loss_function(
             pg_loss_masks,
             qkv_format=args.qkv_format,
             max_seq_lens=max_seq_lens,
-            fixed_normalizer=args.rollout_max_response_len,
+            divisor=args.rollout_max_response_len,
         )
     else:
         pg_loss_reducer = sum_of_sample_mean
