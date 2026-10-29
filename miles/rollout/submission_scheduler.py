@@ -22,8 +22,11 @@ class GroupLevelSubmission:
 
     sample_done_callback = None
 
+    def available_groups(self, *, pending_groups: int, group_budget: int) -> int:
+        return max(0, group_budget - pending_groups)
+
     def has_capacity(self, *, pending_groups: int, group_budget: int) -> bool:
-        return pending_groups < group_budget
+        return self.available_groups(pending_groups=pending_groups, group_budget=group_budget) > 0
 
     def on_submit(self, groups: list[list[Sample]]) -> None:
         pass
@@ -44,16 +47,18 @@ class SampleBackfillSubmission:
         self.samples_in_flight -= 1
         self._sample_done.set()
 
-    def has_capacity(self, *, pending_groups: int, group_budget: int) -> bool:
-        """A False return arms the sample wakeup: only later completions wake ``wait_for_progress``."""
+    def available_groups(self, *, pending_groups: int, group_budget: int) -> int:
         if pending_groups == 0 and self.samples_in_flight:
             # a group returned without spawning its sample tasks, or a stub skipped the callback
             logger.warning(f"samples_in_flight={self.samples_in_flight} with no pending groups; resetting to 0")
             self.samples_in_flight = 0
-        if self.samples_in_flight + self.group_size <= group_budget * self.group_size:
-            return True
-        self._sample_done.clear()
-        return False
+        available = max(0, (group_budget * self.group_size - self.samples_in_flight) // self.group_size)
+        if available == 0:
+            self._sample_done.clear()
+        return available
+
+    def has_capacity(self, *, pending_groups: int, group_budget: int) -> bool:
+        return self.available_groups(pending_groups=pending_groups, group_budget=group_budget) > 0
 
     def on_submit(self, groups: list[list[Sample]]) -> None:
         self.samples_in_flight += len(groups) * self.group_size
