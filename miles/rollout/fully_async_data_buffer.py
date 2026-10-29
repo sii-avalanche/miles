@@ -102,11 +102,8 @@ class DataBuffer(ABC):
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
         """Report the metrics of one policy since its previous call (its window counters reset here)."""
 
-    def set_weight_version(self, version: int, trainer_model_id: str | None = None) -> None:
-        """Optional dashboard reference; does not change filtering."""
-
-    def report_batch(self, rollout_id: int, trainer_model_id: str | None = None) -> None:
-        """Optional marker for the batch just collected."""
+    def report_pool(self, event: str, *, trainer_model_id: str | None = None, **details) -> None:
+        """Optional dashboard event; does not change filtering."""
 
 
 # ============================= one policy buffer ==============================
@@ -167,7 +164,9 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_samples = 0
         self._metric_selected_versioned_samples = 0
 
-    def _report_pool(self, event: str, **details) -> None:
+    def report_pool(self, event: str, *, trainer_model_id: str | None = None, **details) -> None:
+        if event == "weight_published":
+            self._published_version = details.pop("current_version")
         if self._dashboard_enabled:
             dashboard_hooks.report_data_buffer(
                 len(self._buffer),
@@ -179,13 +178,6 @@ class DefaultDataBuffer(DataBuffer):
                 event=event,
                 **details,
             )
-
-    def set_weight_version(self, version: int, trainer_model_id: str | None = None) -> None:
-        self._published_version = version
-        self._report_pool("weight_published")
-
-    def report_batch(self, rollout_id: int, trainer_model_id: str | None = None) -> None:
-        self._report_pool("batch_ready", rollout_id=rollout_id)
 
     async def put(self, input: DataBufferInput) -> None:
         if not self._preput_filter(input):
@@ -201,28 +193,28 @@ class DefaultDataBuffer(DataBuffer):
                 self._queued_versions.append((stats.oldest_version, mixed))
                 self._version_counts[stats.oldest_version] += 1
                 self._mixed_groups += mixed
-                self._report_pool("put")
+                self.report_pool("put")
             self._cond.notify_all()
 
     def _preput_filter(self, input: DataBufferInput) -> bool:
         output = apply_aborted_filter(self._args, input.group)
         if not output.keep:
             self._metric_aborted_groups += 1
-            self._report_pool("reject", reason="aborted")
+            self.report_pool("reject", reason="aborted")
             self._unused_handler_fn(input.prompt_group)
             return False
 
         output = apply_missing_reward_filter(self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
-            self._report_pool("reject", reason=output.reason)
+            self.report_pool("reject", reason=output.reason)
             return False
 
         self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
         output = call_dynamic_filter(self._dynamic_filter, self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
-            self._report_pool("reject", reason=output.reason)
+            self.report_pool("reject", reason=output.reason)
             return False
         return True
 
@@ -240,7 +232,7 @@ class DefaultDataBuffer(DataBuffer):
                     if not self._version_counts[version]:
                         del self._version_counts[version]
                     self._mixed_groups -= mixed
-                    self._report_pool("get")
+                    self.report_pool("get")
                 self._cond.notify_all()  # wake producers blocked on a full buffer
 
                 version_stats = group_weight_version_stats(entry.group)
@@ -249,7 +241,7 @@ class DefaultDataBuffer(DataBuffer):
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
                         self._metric_stale_groups += 1
-                        self._report_pool("reject", reason="stale")
+                        self.report_pool("reject", reason="stale")
                         self._unused_handler_fn(entry.prompt_group)
                         continue
                     self._metric_consumed_staleness.append(staleness)
@@ -355,11 +347,8 @@ class DefaultMultiDataBuffer(DataBuffer):
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
         return self._inner_of(trainer_model_id).get_metrics(trainer_model_id=trainer_model_id)
 
-    def set_weight_version(self, version: int, trainer_model_id: str | None = None) -> None:
-        self._inner_of(trainer_model_id).set_weight_version(version, trainer_model_id=trainer_model_id)
-
-    def report_batch(self, rollout_id: int, trainer_model_id: str | None = None) -> None:
-        self._inner_of(trainer_model_id).report_batch(rollout_id, trainer_model_id=trainer_model_id)
+    def report_pool(self, event: str, *, trainer_model_id: str | None = None, **details) -> None:
+        self._inner_of(trainer_model_id).report_pool(event, trainer_model_id=trainer_model_id, **details)
 
     def _inner_of(self, trainer_model_id: str | None) -> DataBuffer:
         assert trainer_model_id in self._inners, (
