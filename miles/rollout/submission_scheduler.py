@@ -13,6 +13,10 @@ from miles.utils.types import Sample
 logger = logging.getLogger(__name__)
 
 
+def candidate_group_size(n_samples_per_prompt: int, group_oversampling_extra: int = 0) -> int:
+    return n_samples_per_prompt + group_oversampling_extra
+
+
 class GroupLevelSubmission:
     """A submission slot frees only when the whole group task returns."""
 
@@ -52,7 +56,7 @@ class SampleBackfillSubmission:
         return False
 
     def on_submit(self, groups: list[list[Sample]]) -> None:
-        self.samples_in_flight += sum(len(group) for group in groups)
+        self.samples_in_flight += len(groups) * self.group_size
 
     async def wait_for_progress(self, pendings: set[asyncio.Task]) -> tuple[set[asyncio.Task], set[asyncio.Task]]:
         waiter = asyncio.create_task(self._sample_done.wait())
@@ -64,8 +68,12 @@ class SampleBackfillSubmission:
 
 
 def make_submission_scheduler(args: Namespace, *, default: str) -> GroupLevelSubmission | SampleBackfillSubmission:
-    granularity = args.rollout_submission_granularity or default
+    extra = getattr(args, "group_oversampling_extra", 0)
+    granularity = args.rollout_submission_granularity or ("sample" if extra else default)
+    assert not extra or granularity == "sample", (
+        "--group-oversampling-extra requires --rollout-submission-granularity sample"
+    )
     if granularity == "group":
         return GroupLevelSubmission()
     assert granularity == "sample", f"unknown submission granularity: {granularity}"
-    return SampleBackfillSubmission(args.n_samples_per_prompt)
+    return SampleBackfillSubmission(candidate_group_size(args.n_samples_per_prompt, extra))
