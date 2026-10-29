@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
+import pybase64
 
 from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sampling
 from miles.utils.sampling_mask import RolloutSamplingMask
@@ -54,6 +55,15 @@ def append_rollout_topk_logprobs(
     n = len(meta.get("output_token_logprobs") or [])
     support_mode = sampling_logprobs_mode == "support"
     field = "output_token_sampling_logprobs" if support_mode else "output_top_logprobs"
+    compact = meta.get("output_top_logprobs_compact")
+    if compact is not None:
+        if support_mode or meta.get(field) is not None:
+            raise ValueError("Compact candidates require selected mode and no duplicate legacy field")
+        ids, logps = _decode_compact_candidates(compact, n, k)
+        for name, values in (("rollout_topk_token_ids", ids), ("rollout_topk_log_probs", logps)):
+            previous = getattr(sample, name)
+            setattr(sample, name, values if previous is None else np.concatenate((previous, values)))
+        return
     rows = meta.get(field)
     if n and (rows is None or len(rows) != n):
         raise ValueError(f"Rollout top-k logprobs collection requires SGLang {field} for every generated token")
@@ -142,3 +152,20 @@ def merge_rollout_topk_logprobs_field(first: Sample, second: Sample, field: str,
         raise ValueError(f"Both turns must carry matching {field} for rollout top-k logprobs collection")
     fill = -1 if field == "rollout_topk_token_ids" else -np.inf
     return np.concatenate((a, np.full((gap, a.shape[1]), fill, dtype=a.dtype), b))
+
+
+def _decode_compact_candidates(payload, rows: int, width: int):
+    if payload.get("version") != 1 or payload.get("shape") != [rows, width]:
+        raise ValueError("Unsupported compact candidate version or shape")
+    result = []
+    for key, dtype in (("ids_i32_le", "<i4"), ("logps_f32_le", "<f4")):
+        raw = pybase64.b64decode(payload[key], validate=True)
+        if len(raw) != rows * width * 4:
+            raise ValueError("Compact candidate byte length mismatch")
+        result.append(np.frombuffer(raw, dtype=dtype).reshape(rows, width))
+    ids, logps = result
+    if np.any(ids < -1) or np.isnan(logps).any() or np.isposinf(logps).any():
+        raise ValueError("Invalid compact candidate values")
+    if np.any((ids == -1) & ~np.isneginf(logps)):
+        raise ValueError("Invalid compact candidate padding")
+    return ids, logps

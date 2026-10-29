@@ -61,6 +61,12 @@ class AvaCoreRollout:
             request = {"sampling_params": dict(sampling_params)}
             configure_rollout_topk_logprobs_request(self.args, request)
             sampling_params = request["sampling_params"]
+            if self.args.loss_type == "score_centering" and self.args.rollout_sampling_logprobs_mode == "selected":
+                # Selected-mode SC requires the compact wire contract; legacy
+                # JSON candidates are no longer an optional SC transport.
+                if sampling_params.get("return_compact_top_logprobs") is False:
+                    raise ValueError("SC requires compact candidate transport")
+                sampling_params = {**sampling_params, "return_compact_top_logprobs": True}
             replay["sampler_logprobs"] = dict(
                 count=self.args.rollout_top_logprobs_num,
                 temperature=self.args.rollout_temperature,
@@ -281,6 +287,9 @@ def _with_sampling_metadata(args: Namespace, sample: Sample, segments, messages)
     for segment in segments[1:]:
         if segment.is_generated:
             meta = next(messages).metadata
+            if args.loss_type == "score_centering" and not support:
+                if "output_top_logprobs_compact" not in meta or "output_top_logprobs" in meta:
+                    raise ValueError("SC requires compact candidates; legacy Trace candidates are unsupported")
             if meta.get("sampler_logprobs") != contract:
                 raise ValueError("AvaCore sampler logprobs contract missing or mismatched; update the policy client")
             log_probs.extend(
