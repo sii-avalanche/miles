@@ -1,11 +1,12 @@
 import asyncio
 import copy
-import json
 import logging
 import os
 from argparse import Namespace
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
+from dataclasses import replace
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -18,19 +19,21 @@ from ava_core.generate.core import Sample as Row
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import Reward
 from ava_core.runner import RECOVERABLE_ERRORS
-from ava_core.store.core import STORED, Run
+from ava_core.store.core import Run
 from ava_core.store.postgres import PostgresBackend
 
-from miles.utils.recording.outbox import DurableRolloutOutbox, _atomic_json
-from miles.rollout.avacore_trace import conversation_tips, graph_nodes, snapshot_traces, write_record
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.rollout.generate_utils.rollout_topk_logprobs import (
+    append_rollout_topk_logprobs,
+    configure_rollout_topk_logprobs_request,
+    pad_rollout_topk_logprobs,
+    validate_rollout_topk_logprobs_sample,
+)
 from miles.rollout.generate_utils.sampling_mask import (
     append_forced_sampling_tokens,
     append_sampling_metadata,
     should_return_sampling_mask,
 )
-from miles.rollout.screening_resume import inherit_records, validate_reused_recording
-from miles.utils.perf_monitor import get_monitor
 from miles.utils.types import Sample, WeightVersionsPerCall
 
 __all__ = ["AvaCoreRollout", "generate"]
@@ -50,188 +53,80 @@ class AvaCoreRollout:
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
+        self.writes: set[asyncio.Task[None]] = set()
         self.failed_writes = 0
-        self._monitor = get_monitor(args)
-        self._record_pool = None
-        self._outbox: DurableRolloutOutbox | None = None
-        self._recording_ready: asyncio.Task | None = None
-        if self.recording is not None:
-            self._init_recording()
-        self._monitor.register("record", self._record_perf_snapshot)
-
-    def _init_recording(self) -> None:
-        recording = self.recording
-        self._pool_min = int(recording.get("pool_min_size", 8))
-        self._pool_max = int(recording.get("pool_max_size", 64))
-        workers = int(recording.get("write_workers", 16))
-        if not 1 <= self._pool_min <= self._pool_max or not 1 <= workers <= self._pool_max:
-            raise ValueError("Recording requires 1 <= pool_min_size <= pool_max_size and workers <= pool_max_size")
-        self._pool_timeout = float(recording.get("pool_timeout", 120))
-        self._shutdown_timeout = float(recording.get("shutdown_timeout", 300))
-        if self._pool_timeout <= 0 or self._shutdown_timeout <= 0:
-            raise ValueError("Recording pool and shutdown timeouts must be positive")
-        default = Path(os.environ.get("RUN_DIR", ".")) / "rollout_records"
-        self._outbox = DurableRolloutOutbox(
-            Path(recording.get("spool_dir", default)), self._write_record, workers=workers, on_event=self._record_event
-        )
-        self._legacy_seeded = (self._outbox.path / "legacy_seeded.json").exists()
-
-    async def _start_recording(self, sampling_params: dict[str, Any]) -> None:
-        manifest = {
-            "model": self.recording["model"],
-            "run": self.recording["run"],
-            "collection": Path(self.args.prompt_data).stem,
-            "sampling_params": sampling_params,
-        }
-        path = self._outbox.path / "run.json"
-        if path.exists():
-            existing = json.loads(path.read_text())
-            if any(existing[key] != manifest[key] for key in ("model", "run", "collection")):
-                raise ValueError("Recording directory belongs to a different model, run or collection")
-        else:
-            await asyncio.to_thread(_atomic_json, path, manifest)
-        self._sampling_params = sampling_params.copy()
-        if self.recording.get("expected_run_id") is not None:
-            await self._get_run()
-        # Legacy resumed runs have no local allocation counters. Seed before generation
-        # rather than assigning IDs that could overwrite their existing database rows.
-        if self.recording.get("resume", True) and not self._legacy_seeded:
-            delay = 1
-            while True:
-                try:
-                    run = await self._get_run()
-                    await self._outbox.seed_trials(list(run.statuses), self.args.n_samples_per_prompt)
-                    await asyncio.to_thread(_atomic_json, self._outbox.path / "legacy_seeded.json", {"complete": True})
-                    break
-                except (ValueError, LookupError):
-                    raise
-                except Exception as error:
-                    self._record_event("failed", error)
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, 30)
-        await self._outbox.start()
-
-    async def _prepare_recording(self, sampling_params: dict[str, Any]) -> None:
-        if self._recording_ready is None:
-            self._recording_ready = asyncio.create_task(self._start_recording(sampling_params))
-        await asyncio.shield(self._recording_ready)
-
-    async def inherit_completed(self, groups, manifests, sampling_params) -> int:
-        """Reuse or copy settled responses without regenerating or rejudging."""
-        if self.recording is None:
-            raise ValueError("Inherited rollouts require recording")
-        identity = {
-            "model": self.recording["model"], "run": self.recording["run"],
-            "collection": Path(self.args.prompt_data).stem,
-        }
-        reuse = self.recording.get("expected_run_id") is not None or any(
-            all(manifest[key] == value for key, value in identity.items()) for manifest in manifests.values()
-        )
-        if reuse:
-            count = await asyncio.to_thread(validate_reused_recording, groups, self._outbox.path, identity)
-            await self._prepare_recording(sampling_params)
-            if not await self._outbox.flush(self._shutdown_timeout):
-                raise RuntimeError("Original rollout writes are still pending; retry resume after recovery")
-            logger.info("Reused %d confirmed rollout snapshots in the existing database run", count)
-            return count
-        await self._prepare_recording(sampling_params)
-        count = await inherit_records(self._outbox, groups, manifests)
-        if not await self._outbox.flush(self._shutdown_timeout):
-            raise RuntimeError("Inherited rollout writes are still pending; replay the new run's rollout_records")
-        return count
 
     async def generate(
         self, sample: Sample, sampling_params: dict[str, Any], *, evaluation: bool = False
     ) -> Sample | list[Sample]:
-        trial_id = None
-        if self.recording is not None and not evaluation:
-            await self._prepare_recording(sampling_params)
-            trial_id = await self._outbox.allocate_trial(sample, self.args.n_samples_per_prompt)
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
-        if getattr(self.args, "use_sampling_support_replay", False) and not evaluation:
+        if getattr(self.args, "rollout_top_logprobs_num", 0) and not evaluation:
+            request = {"sampling_params": dict(sampling_params)}
+            configure_rollout_topk_logprobs_request(self.args, request)
+            sampling_params = request["sampling_params"]
+            replay["sampler_logprobs"] = dict(
+                count=self.args.rollout_top_logprobs_num,
+                temperature=self.args.rollout_temperature,
+                top_p=self.args.rollout_top_p,
+                top_k=self.args.rollout_top_k,
+                mode=self.args.rollout_sampling_logprobs_mode,
+            )
+        elif getattr(self.args, "use_sampling_support_replay", False) and not evaluation:
             should_return_sampling_mask(self.args, sampling_params)
-            # PPO needs the realized support and only the sampled token's normalized score.
+            # Without Score Centering candidates, PPO only needs the sampled token's score.
             replay.update(return_sampling_mask=True, sampling_logprobs_mode="selected")
         try:
-            with self._monitor.wait("sample/generate"):
-                traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
+            traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
+            if not isinstance(traces, tuple) or not traces or not all(isinstance(t, Trace) for t in traces):
+                raise TypeError("AvaCore generate must return a nonempty tuple of Trace objects")
             if any(
                 message.metadata["finish_reason"]["type"] == "abort"
-                for node in graph_nodes(traces)
-                for message in (node.message,)
+                for trace in traces
+                for message in trace.messages
                 if "finish_reason" in message.metadata
             ):
                 sample.status = Sample.Status.ABORTED
                 return sample
-            with self._monitor.wait("sample/reward"):
-                reward = await self.reward_fn(traces[0], row)
+            reward = await self.reward_fn(traces[0], row)
         except RECOVERABLE_ERRORS as error:
-            self._monitor.increment("sample/recoverable_errors_total")
             logger.warning("AvaCore rollout of sample %s aborted: %r", sample.index, error)
             sample.status = Sample.Status.ABORTED
             return sample
 
-        assert traces and any(node.segments for node in graph_nodes(traces)), (
-            "AvaCore rollouts must drive the policy through a token-level client"
-        )
-        if self.recording is not None and not evaluation:
-            # Only disk durability is awaited here. Database writes run independently
-            # with bounded concurrency; a retry cannot mutate an accepted snapshot.
-            persist = asyncio.create_task(self.record(row, sample, traces, reward, sampling_params, trial_id=trial_id))
-            try:
-                await asyncio.shield(persist)
-            except asyncio.CancelledError:
-                await persist
-                raise
-        samples, owned = [], set()
-        for tip in conversation_tips(traces):
-            generated = {node for node in tip.prefixes if node.generated and node.segments}
-            if generated - owned:
+        # Match AvaCore's store: the first returned path owns a shared generated node.
+        owned: set[Trace] = set()
+        samples = []
+        for trace in traces:
+            generated = [node for node in trace.prefixes if node.generated]
+            if any(not node.segments for node in generated):
+                raise ValueError("Training requires token-level segments for every generated turn")
+            if any(node not in owned for node in generated):
                 samples.append(
-                    filled(self.args, copy.deepcopy(sample), tip, reward.score, owned=owned, evaluation=evaluation)
+                    await asyncio.to_thread(
+                        filled,
+                        self.args,
+                        copy.deepcopy(sample),
+                        trace,
+                        reward.score,
+                        set(owned),
+                        evaluation=evaluation,
+                    )
                 )
-                owned.update(generated)
-        if len(samples) > 1:
-            # Compaction and source branches are fragments of one sampled episode.
-            rollout_id = sample.rollout_id if sample.rollout_id is not None else sample.index
-            assert rollout_id is not None, "AvaCore multi-fragment rollouts require Sample.rollout_id or Sample.index"
-            for fragment in samples:
-                fragment.rollout_id = rollout_id
+            owned.update(generated)
+        if not samples:
+            raise ValueError("AvaCore rollout contains no generated training tokens")
+        if self.recording is not None:
+            write = asyncio.create_task(self.record(row, sample, traces, reward, sampling_params))
+            self.writes.add(write)
+            write.add_done_callback(self.writes.discard)
         return samples[0] if len(samples) == 1 else samples
-
-    def _record_perf_snapshot(self) -> dict[str, float]:
-        metrics = self._outbox.stats() if self._outbox is not None else {"pending_writes": 0}
-        if self._record_pool is not None:
-            stats = self._record_pool.get_stats()  # get_stats never resets the real pool's counters
-            metrics.update({f"pool/{key}": value for key, value in stats.items()})
-            for key in ("connections_errors", "connections_lost", "requests_errors"):
-                # Mark cumulative fields explicitly so the monitor can derive interval rates.
-                metrics[f"pool/{key}_total"] = stats.get(key, 0)
-        return metrics
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
         store = await self.stack.enter_async_context(
-            PostgresBackend(
-                self.recording["postgres"],
-                min_size=self._pool_min,
-                max_size=self._pool_max,
-            )
+            PostgresBackend(self.recording["postgres"], min_size=1, max_size=4)
         )
-        store.pool.timeout = self._pool_timeout
-        self._record_pool = store.pool
-        # An explicit ID makes a resume fail before an upsert could create a new run.
-        if (expected_id := self.recording.get("expected_run_id")) is not None:
-            existing = await store.get_run(expected_id)
-            identity = (
-                existing.kind, existing.model, existing.run, existing.collection,
-                existing.model_step, existing.collection_version,
-            )
-            if identity != (
-                "rl", self.recording["model"], self.recording["run"], Path(self.args.prompt_data).stem, None, None
-            ):
-                raise ValueError("Recording identity differs from expected_run_id")
         run = await self.stack.enter_async_context(
             store.rl_run(
                 model=self.recording["model"],
@@ -246,39 +141,6 @@ class AvaCoreRollout:
         await run.update(status="running")
         return run
 
-    async def _get_run(self) -> Run:
-        if self.run is None or (self.run.done() and not self.run.cancelled() and self.run.exception() is not None):
-            self.run = asyncio.create_task(self._open_recording_run())
-        return await asyncio.shield(self.run)
-
-    async def _open_recording_run(self) -> Run:
-        try:
-            return await self.open(self._sampling_params)
-        except BaseException:
-            await self.stack.aclose()
-            self.stack = AsyncExitStack()
-            self._record_pool = None
-            raise
-
-    async def _write_record(self, record: dict[str, Any]) -> None:
-        with self._monitor.wait("record/open_wait"):
-            run = await self._get_run()
-        with self._monitor.wait("record/create_rollout"):
-            await write_record(run, record)
-
-    def _record_event(self, event: str, error: Exception | None) -> None:
-        self._monitor.increment(f"record/{event}_total")
-        if event != "failed":
-            return
-        self.failed_writes += 1
-        self._monitor.increment(
-            "record/pool_timeout_total" if type(error).__name__ == "PoolTimeout" else "record/other_errors_total"
-        )
-        if self.failed_writes in (1, 10, 100) or self.failed_writes % 1000 == 0:
-            logger.warning(
-                "Postgres write failed %d times; durable records retained for retry: %r", self.failed_writes, error
-            )
-
     async def record(
         self,
         row: Row,
@@ -286,65 +148,45 @@ class AvaCoreRollout:
         traces: tuple[Trace, ...],
         reward: Reward,
         sampling_params: dict[str, Any],
-        *,
-        trial_id: int | None = None,
     ) -> None:
-        with self._monitor.wait("record/end_to_end"):
-            await self._prepare_recording(sampling_params)
-            if trial_id is None:
-                trial_id = await self._outbox.allocate_trial(sample, self.args.n_samples_per_prompt)
-            # Raw-HF inference can report a name such as "default". Keep the
-            # source version; staleness calculations separately select numeric versions.
-            metadata = {
-                "weight_version": traces[0].last_assistant().metadata.get("weight_version"),
-                "epoch": sample.epoch,
-                "group_index": sample.group_index,
-                "sample_index": sample.index,
-                "generation_attempt": getattr(
-                    sample, "generation_attempt", trial_id // self.args.n_samples_per_prompt
-                ),
-                "generation_round": trial_id // self.args.n_samples_per_prompt,
-            }
-
-            def snapshot():
-                return {
-                    "query_id": str(sample.metadata["_index"]),
-                    "trial_id": trial_id,
-                    "instance": STORED.unstructure(row),
-                    "trace_graph": snapshot_traces(traces),
-                    "reward": STORED.unstructure(reward),
-                    "status": "completed",
-                    "metadata": metadata,
-                }
-
-            with self._monitor.wait("record/persist"):
-                await self._outbox.enqueue(await asyncio.to_thread(snapshot))
-            # Set only after durability; returned samples carry the exact retry identity.
-            sample.recording_trial_id = trial_id
-            sample.recording_source = str(self._outbox.path)
-
-    async def close(self) -> None:
-        if self._outbox is None:
-            return
-        if self._recording_ready is not None and not self._recording_ready.done():
-            self._recording_ready.cancel()
-            await asyncio.gather(self._recording_ready, return_exceptions=True)
-        drained = await self._outbox.close(self._shutdown_timeout)
-        if self.run is not None and not self.run.done():
-            self.run.cancel()
-            await asyncio.gather(self.run, return_exceptions=True)
-        await self.stack.aclose()
-        if not drained:
-            raise RuntimeError(
-                f"Rollout recordings are still pending in {self._outbox.pending}; replay them before declaring recording complete"
+        try:
+            assert sample.epoch is not None and sample.index is not None
+            n = self.args.n_samples_per_prompt
+            query_id = str(sample.metadata["_index"])
+            trial_id = sample.epoch * n + sample.index % n
+            if self.run is None:
+                self.run = asyncio.create_task(self.open(sampling_params))
+            run = await self.run
+            await run.create_rollout(
+                query_id=query_id,
+                trial_id=trial_id,
+                instance=row,
+                traces=traces,
+                reward=reward,
+                status="completed",
+                metadata={
+                    "weight_version": next(
+                        (
+                            node.message.metadata["weight_version"]
+                            for node in reversed(traces[0].prefixes)
+                            if node.generated and "weight_version" in node.message.metadata
+                        ),
+                        None,
+                    ),
+                    "weight_versions": [
+                        v
+                        for t in traces
+                        for n in t.prefixes
+                        if n.generated and (v := n.message.metadata.get("weight_version")) is not None
+                    ],
+                },
             )
-
-    async def dispose(self) -> None:
-        loop = self._recording_ready.get_loop() if self._recording_ready is not None else asyncio.get_running_loop()
-        if loop is asyncio.get_running_loop():
-            await self.close()
-        else:
-            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(self.close(), loop))
+        except Exception as error:
+            self.failed_writes += 1
+            if self.failed_writes in (1, 10, 100) or self.failed_writes % 1000 == 0:
+                logger.warning(
+                    "Recording rollouts to Postgres failed %d times; last error: %r", self.failed_writes, error
+                )
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
@@ -361,14 +203,14 @@ def filled(
     sample: Sample,
     trace: Trace,
     reward: float,
-    *,
     owned: set[Trace] | None = None,
+    *,
     evaluation: bool = False,
 ) -> Sample:
-    # Shared generated prefixes train only in the first listed branch, as in the result store.
     owned = owned or set()
-    segments = trace.path_segments
-    segments = segments[: max(i for i, segment in enumerate(segments) if segment.is_generated) + 1]
+    path = trace.path_segments
+    # Tool observations after the last generated token train nothing.
+    segments = path[: max(i for i, segment in enumerate(path) if segment.is_generated) + 1]
     length = sum(len(segment.tokens) for segment in segments)
     prompt_length = len(segments[0].tokens)
     sample.tokens = trace.tokens[:length]
@@ -381,15 +223,28 @@ def filled(
         for _ in segment.tokens
     ]
     sample.loss_mask = mask[prompt_length:length]
-    sample.rollout_log_probs = [log_prob or 0.0 for log_prob in trace.log_probs[prompt_length:length]]
+    for segment in segments:
+        if segment.is_generated and (
+            len(segment.log_probs) != len(segment.tokens)
+            or any(value is None or not isfinite(value) for value in segment.log_probs)
+        ):
+            raise ValueError("Generated tokens require finite, aligned rollout logprobs")
+    sample.rollout_log_probs = [
+        log_prob if log_prob is not None else 0.0 for log_prob in trace.log_probs[prompt_length:length]
+    ]
     spans, offset = [], 0
     for segment in segments:
         if segment.is_generated:
             spans.append((offset, offset + len(segment.tokens)))
         offset += len(segment.tokens)
-    finished = [node.message for node in trace.prefixes if node.generated and node.segments]
-    if getattr(args, "use_sampling_support_replay", False) and not evaluation:
-        _fill_sampling_metadata(sample, segments, finished)
+    finished = [node.message for node in trace.prefixes if node.generated and "finish_reason" in node.message.metadata]
+    if not evaluation and (
+        getattr(args, "rollout_top_logprobs_num", 0) or getattr(args, "use_sampling_support_replay", False)
+    ):
+        sample = _with_sampling_metadata(args, sample, segments, finished)
+        sample.validate()
+        if getattr(args, "ci_test", False) and getattr(args, "rollout_top_logprobs_num", 0):
+            validate_rollout_topk_logprobs_sample(sample, args.rollout_top_logprobs_num)
     for message, (start, end) in zip(finished, spans, strict=True):
         # The trace keeps log probs per token, not per call: anchor the call's weight versions to its own segment.
         versioning = ("weight_version", "weight_versions")
@@ -398,7 +253,7 @@ def filled(
             message.metadata | {"output_token_logprobs": [None] * (end - start)}, output_end=end
         )
     if args.use_rollout_routing_replay and sample.status != Sample.Status.ABORTED:
-        chunks = [segment.metadata["routed_experts"] for segment in segments if "routed_experts" in segment.metadata]
+        chunks = [s.metadata["routed_experts"] for s in segments if "routed_experts" in s.metadata]
         assert chunks, (
             "Internal error: routing replay enabled but no routed experts returned. Perhaps some traces are not generated by the configured generate function."
         )
@@ -412,19 +267,52 @@ def filled(
     return sample
 
 
-def _fill_sampling_metadata(sample: Sample, segments, messages) -> None:
-    """Replay each generated turn's support; environment tokens have singleton support."""
-    replay = Sample()
-    log_probs = []
-    messages = iter(messages)
+def _with_sampling_metadata(args: Namespace, sample: Sample, segments, messages) -> Sample:
+    """Return a sample with native sampling metadata, leaving the input sample untouched."""
+    k = getattr(args, "rollout_top_logprobs_num", 0)
+    mode = args.rollout_sampling_logprobs_mode if k else "selected"
+    support = mode == "support" or getattr(args, "use_sampling_support_replay", False)
+    contract = (
+        dict(
+            count=args.rollout_top_logprobs_num,
+            temperature=args.rollout_temperature,
+            top_p=args.rollout_top_p,
+            top_k=args.rollout_top_k,
+            mode=args.rollout_sampling_logprobs_mode,
+        )
+        if k
+        else None
+    )
+    messages, log_probs = iter(messages), []
+    result = replace(
+        sample,
+        response_length=0,
+        rollout_log_probs=log_probs,
+        rollout_topk_token_ids=None,
+        rollout_topk_log_probs=None,
+        rollout_sampling_mask=None if support else sample.rollout_sampling_mask,
+    )
+    if k:
+        append_rollout_topk_logprobs(result, {}, k)
     for segment in segments[1:]:
         if segment.is_generated:
-            log_probs.extend(append_sampling_metadata(replay, segment.tokens, next(messages).metadata))
+            meta = next(messages).metadata
+            if k and meta.get("sampler_logprobs") != contract:
+                raise ValueError("AvaCore sampler logprobs contract missing or mismatched; update the policy client")
+            log_probs.extend(
+                append_sampling_metadata(result, segment.tokens, meta, sampling_logprobs_mode=mode)
+                if support
+                else segment.log_probs
+            )
+            if k:
+                append_rollout_topk_logprobs(
+                    result, meta | {"output_token_logprobs": segment.log_probs}, k, sampling_logprobs_mode=mode
+                )
         else:
-            append_forced_sampling_tokens(replay, segment.tokens)
+            if support:
+                append_forced_sampling_tokens(result, segment.tokens)
+            if k:
+                pad_rollout_topk_logprobs(result, len(segment.tokens))
             log_probs.extend([0.0] * len(segment.tokens))
-        replay.response_length += len(segment.tokens)
-    if len(log_probs) != sample.response_length:
-        raise ValueError("AvaCore sampling metadata does not match the response length")
-    sample.rollout_sampling_mask = replay.rollout_sampling_mask
-    sample.rollout_log_probs = log_probs
+        result.response_length += len(segment.tokens)
+    return result

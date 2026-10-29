@@ -353,7 +353,7 @@ def execute(args: ScriptArgs):
 
     traces_dir = args.save_traces_dir or f"{args.save_dir.rstrip('/')}/traces"
     if traces_dir != "disabled":
-        misc_args += f"--dump-details {traces_dir} --perf-monitor-interval 10 "
+        misc_args += f"--dump-details {traces_dir} --use-miles-dashboard "
 
     # train/entropy_loss is a hardcoded 0.0 unless this is set, and a falling entropy is the
     # earliest warning of policy collapse on a long agentic run.

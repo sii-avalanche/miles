@@ -19,7 +19,7 @@ from miles.backends.megatron_utils.megatron_config import (
 )
 from miles.backends.sglang_utils.arguments import add_sglang_arguments, collect_eval_sglang_overrides
 from miles.backends.sglang_utils.arguments import validate_args as sglang_validate_args
-from miles.utils.perf_monitor import add_perf_monitor_arguments, validate_perf_monitor_args
+from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.ray.specs.train import compute_trainer_ids, external_trainer_controller_addrs
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
 from miles.utils.audit_utils.event_logger.logger import EVENTS_DIRNAME
@@ -2967,7 +2967,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_mlflow_arguments(parser)
         parser = add_tensorboard_arguments(parser)
         parser = add_prometheus_arguments(parser)
-        add_perf_monitor_arguments(parser)
+        add_dashboard_arguments(parser)
         parser = add_router_arguments(parser)
         parser = add_debug_arguments(parser)
         parser = add_sglang_arguments(parser)
@@ -3453,7 +3453,7 @@ def miles_validate_args(args):
         raise ValueError(f"Unknown --update-weight-transfer-mode {mode!r}")
     if mode == "broadcast_packed" and (args.train_backend != "megatron" or args.colocate):
         raise ValueError("broadcast_packed requires Megatron non-colocated weight transfer")
-    validate_perf_monitor_args(args)
+    validate_dashboard_args(args)
 
     args.ft_components = _resolve_ft_components(args)
     assert not ("rollout" in args.ft_components and args.eval_num_gpus > 0), (
@@ -4116,6 +4116,9 @@ def miles_validate_args(args):
     ).value
 
     if ClusterBackend(args.cluster_backend) == ClusterBackend.KUBERNETES:
+        assert (
+            not args.use_miles_dashboard
+        ), "--use-miles-dashboard creates a Ray actor, which --cluster-backend kubernetes has no Ray cluster for"
         assert (
             not args.use_distributed_post
         ), "--use-distributed-post reads ray.nodes(), which --cluster-backend kubernetes has no Ray cluster for"

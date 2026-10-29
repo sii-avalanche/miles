@@ -1,15 +1,14 @@
 from argparse import Namespace
-from contextlib import nullcontext
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from ava_core.core import ChatMessage, Trace
+from ava_core.core.segment import ChatSegment
 from ava_core.rewards.core import Reward
 
 from miles.backends.training_utils.data.sampling_mask import get_rollout_sampling_masks
 from miles.ray.rollout.train_data_conversion import convert_samples_to_train_data
 from miles.rollout.avacore_rollout import AvaCoreRollout, filled
-from miles.rollout.avacore_trace import _segment
 from miles.utils.types import Sample
 
 
@@ -29,7 +28,7 @@ def args():
 
 
 def turn(prev=None, *, prompt=(1, 2), output=(3, 4), with_support=True):
-    metadata = {"finish_reason": {"type": "stop"}, "weight_version": 0}
+    metadata = {"finish_reason": {"type": "stop"}, "weight_version": 1}
     if with_support:
         metadata.update(
             output_token_sampling_mask=[[token, token + 10] for token in output],
@@ -40,13 +39,11 @@ def turn(prev=None, *, prompt=(1, 2), output=(3, 4), with_support=True):
         message=ChatMessage(role="assistant", content="answer", metadata=metadata),
         generated=True,
         segments=tuple(
-            _segment(
-                dict(
-                    tokens=list(tokens),
-                    log_probs=[-0.75 if generated else None] * len(tokens),
-                    template="answer" if generated else "prompt",
-                    is_generated=generated,
-                )
+            ChatSegment(
+                tokens=tuple(tokens),
+                _log_probs=tuple([-0.75] * len(tokens)) if generated else None,
+                is_generated=generated,
+                tokenizer=Mock(decode=Mock(return_value="answer" if generated else "prompt")),
             )
             for tokens, generated in ((prompt, False), (output, True))
         ),
@@ -64,8 +61,6 @@ async def test_generate_requests_support_only_for_replayed_training(args, evalua
     rollout = object.__new__(AvaCoreRollout)
     rollout.args = args
     rollout.recording = None
-    rollout._monitor = Mock()
-    rollout._monitor.wait.side_effect = lambda *_: nullcontext()
     rollout.generate_fn = AsyncMock(return_value=(turn(with_support=capture),))
     rollout.reward_fn = AsyncMock(return_value=Reward(score=1))
     params = {"top_p": 0.95, "top_k": 512, "temperature": 1.0}
@@ -118,3 +113,36 @@ def test_conversion_rejects_entire_missing_batch_only_when_replay_enabled(args, 
             convert(args, [sample])
     else:
         assert "rollout_sampling_mask_ids" not in convert(args, [sample])
+
+
+@pytest.mark.parametrize("mode", ["selected", "support"])
+async def test_score_centering_candidates_survive_replay_merge(args, mode):
+    import math
+
+    args.rollout_top_logprobs_num = 2
+    args.rollout_sampling_logprobs_mode = mode
+    args.rollout_top_p = 1.0
+    args.rollout_top_k = 2 if mode == "support" else -1
+    args.use_sampling_support_replay = mode == "support"
+    contract = dict(count=2, temperature=1.0, top_p=1.0, top_k=args.rollout_top_k, mode=mode)
+    trace = turn(with_support=mode == "support")
+    trace.message.metadata["sampler_logprobs"] = contract
+    if mode == "support":
+        trace.message.metadata["output_token_sampling_logprobs"] = [[math.log(0.75), math.log(0.25)]] * 2
+    else:
+        trace.message.metadata["output_top_logprobs"] = [[[-0.75, token], [-1.5, token + 10]] for token in (3, 4)]
+    rollout = object.__new__(AvaCoreRollout)
+    rollout.args = args
+    rollout.recording = None
+    rollout.generate_fn = AsyncMock(return_value=(trace,))
+    rollout.reward_fn = AsyncMock(return_value=Reward(score=1))
+    params = {"temperature": 1.0, "top_p": 1.0, "top_k": args.rollout_top_k}
+
+    sample = await rollout.generate(Sample(index=7, metadata={}), params)
+
+    assert rollout.generate_fn.await_args.kwargs["sampler_logprobs"] == contract
+    assert "return_sampling_mask" not in rollout.generate_fn.await_args.kwargs
+    assert "min_p" not in params  # The candidate request must not mutate shared sampling defaults.
+    assert sample.rollout_topk_token_ids.tolist() == [[3, 13], [4, 14]]
+    assert (sample.rollout_sampling_mask is not None) == (mode == "support")
+    assert sample.rollout_log_probs == pytest.approx([math.log(0.75) if mode == "support" else -0.75] * 2)

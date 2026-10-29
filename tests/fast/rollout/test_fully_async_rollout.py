@@ -90,6 +90,7 @@ def make_args(**overrides) -> Namespace:
         megatron_config=None,
         rollout_submission_granularity=None,
         dynamic_sampling_filter_path=None,
+        quantile_k=None,
         reward_key=None,
         rollout_sample_filter_path=None,
         sglang_router_ip="127.0.0.1",
