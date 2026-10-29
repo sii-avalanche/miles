@@ -1,8 +1,8 @@
 # Per-run RL report
 
 The report uses Miles' existing dashboard collector, GPU sampler, Timer events,
-engine metrics and timeline template. FSDP registers through the same hook as
-Megatron. Async data pools add queue/version snapshots and batch/rejection events
+engine metrics and timeline template. Training phase events use Megatron's existing
+hook. Async data pools add queue/version snapshots and batch/rejection events
 to the existing `data_buffer` stream; no new node or process metrics are logged.
 
 ## Enable and open
