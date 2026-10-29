@@ -32,7 +32,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -149,16 +149,23 @@ class TopologySnapshot(Record):
 
 @dataclass
 class DataBufferSample(Record):
-    """One report of ``RolloutDataSourceWithBuffer.get_buffer_length()``
-    (design doc's "show the data status in databuffer" ask). Appended once
-    per ``RolloutExecutor.get()`` call — a no-op for plain
-    ``RolloutDataSource`` runs, which never buffer samples across steps.
-    Low-rate and unpartitioned like ``TopologySnapshot``: only the latest
-    value matters for display."""
+    """Input-buffer snapshots and async output-pool queue/version events.
+
+    Details are optional so existing dashboard files remain readable.
+    """
 
     stream: ClassVar[Stream] = Stream.DATA_BUFFER
     ts: float
     length: int
+    # Optional async-pool details; old JSONL records remain readable.
+    capacity: int | None = None
+    current_version: int | None = None
+    versions: dict[str, int] = field(default_factory=dict)
+    mixed_groups: int = 0
+    event: str = "snapshot"
+    rollout_id: int | None = None
+    trainer_model_id: str | None = None
+    reason: str | None = None
 
 
 class TrajectoryEventKind(StrEnum):
@@ -848,6 +855,16 @@ class MetricStore:
         or a dump predating this probe)."""
         records = self.records[Stream.DATA_BUFFER]
         return records[-1].length if records else None
+
+    def data_buffer_series(self, *, t0: float | None = None, t1: float | None = None) -> list[dict]:
+        """Queue events plus each policy's last observation before the window."""
+        before, events = {}, []
+        for record in sorted(self.records[Stream.DATA_BUFFER], key=lambda r: r.ts):
+            if t0 is not None and record.ts < t0:
+                before[(record.trainer_model_id, record.event == "snapshot")] = record
+            elif t1 is None or record.ts <= t1:
+                events.append(record)
+        return [asdict(record) for record in sorted([*before.values(), *events], key=lambda r: r.ts)]
 
     def phases_by_lane(
         self, *, t0: float | None = None, t1: float | None = None, lanes: set[tuple[str, int]] | None = None

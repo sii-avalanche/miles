@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import time
 from argparse import Namespace
 from collections.abc import Callable
 
@@ -15,7 +14,7 @@ from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_roll
 from miles.rollout.generate_utils.sample_utils import reward_log_summary, sample_text_preview
 from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm_group
 from miles.rollout.submission_scheduler import make_submission_scheduler
-from miles.utils import dumper_utils, perf_monitor
+from miles.utils import dumper_utils
 from miles.utils.function_registry import load_function
 from miles.utils.http_utils import get, post, router_worker_base_urls
 from miles.utils.misc import as_completed_async, call_agent_abort_hook
@@ -94,20 +93,7 @@ def submit_generate_tasks(
 async def generate_rollout_async(
     state: GenerateState, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
-    monitor = perf_monitor.get_monitor(state.args)
-    try:
-        with monitor.phase("generate", rollout_id=rollout_id):
-            return await _generate_rollout_async(state, rollout_id, data_source)
-    finally:
-        monitor.unregister("batch")
-        monitor.update({"batch/active": 0, "batch/pending_groups": 0, "batch/oldest_group_seconds": 0})
-
-
-async def _generate_rollout_async(
-    state: GenerateState, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
-) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     args = state.args
-    monitor = perf_monitor.get_monitor(args)
     assert args.rollout_global_dataset
 
     await dumper_utils.configure_sglang(args)
@@ -126,19 +112,6 @@ async def _generate_rollout_async(
     pendings = set()
     data = []
     all_data = []
-    submitted = {}
-    monitor.update({"batch/active": 1, "batch/ready_groups": 0})
-    monitor.register(
-        "batch",
-        lambda: {
-            "target_groups": target_data_size,
-            "ready_groups": len(data),
-            "pending_groups": len(pendings),
-            "oldest_group_seconds": max(
-                (time.monotonic() - started for started in submitted.copy().values()), default=0
-            ),
-        },
-    )
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while len(data) < target_data_size:
@@ -146,17 +119,13 @@ async def _generate_rollout_async(
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
             scheduler.on_submit(samples)
-            tasks = submit_generate_tasks(state, samples, scheduler.sample_done_callback)
-            submitted.update((task, time.monotonic()) for task in tasks)
-            pendings.update(tasks)
+            pendings.update(submit_generate_tasks(state, samples, scheduler.sample_done_callback))
 
         # wait for the generation to finish
         logger.debug(f"[rollout] Waiting on {len(pendings)} pending tasks, data={len(data)}/{target_data_size}")
         done, pendings = await scheduler.wait_for_progress(pendings)
         logger.debug(f"[rollout] asyncio.wait returned: {len(done)} done, {len(pendings)} pending")
         for task in done:
-            submitted.pop(task, None)
-            monitor.increment("batch/groups_completed_total")
             try:
                 group: list[Sample] = task.result()
             except Exception as e:
@@ -178,8 +147,6 @@ async def _generate_rollout_async(
             metric_gatherer.on_group_before_dynamic_filter(args, group)
             filter_output = apply_preput_filters(args, dynamic_filter, group)
             if not filter_output.keep:
-                monitor.increment("batch/groups_rejected_total")
-                monitor.event("buffer_reject", rollout_id=rollout_id)
                 metric_gatherer.on_dynamic_filter_drop(reason=filter_output.reason)
                 continue
 
@@ -187,7 +154,6 @@ async def _generate_rollout_async(
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
                 data.append(group)
-                monitor.increment("batch/groups_selected_total")
                 pbar.update(args.n_samples_per_prompt)
 
     pbar.close()
@@ -200,11 +166,6 @@ async def _generate_rollout_async(
     )
 
     # there are still some unfinished requests, abort them
-    monitor.update({"batch/ready_groups": len(data)})
-    monitor.event("batch_ready", rollout_id=rollout_id)
-    if pendings:
-        monitor.event("abort", rollout_id=rollout_id)
-        monitor.increment("batch/aborted_groups_total", len(pendings))
     aborted_samples = await abort(state, pendings, rollout_id)
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"

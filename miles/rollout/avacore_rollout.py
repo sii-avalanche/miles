@@ -30,7 +30,6 @@ from miles.rollout.generate_utils.rollout_topk_logprobs import (
 )
 from miles.rollout.generate_utils.sampling_mask import append_forced_sampling_tokens, append_sampling_metadata
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
-from miles.utils.perf_monitor import get_monitor
 from miles.utils.types import Sample, WeightVersionsPerCall
 
 __all__ = ["AvaCoreRollout", "generate"]
@@ -52,7 +51,6 @@ class AvaCoreRollout:
         self.stack = AsyncExitStack()
         self.writes: set[asyncio.Task[None]] = set()
         self.failed_writes = 0
-        self._monitor = get_monitor(args)
 
     async def generate(
         self, sample: Sample, sampling_params: dict[str, Any], *, evaluation: bool = False
@@ -71,8 +69,7 @@ class AvaCoreRollout:
                 mode=self.args.rollout_sampling_logprobs_mode,
             )
         try:
-            with self._monitor.wait("sample/generate"):
-                traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
+            traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
             if not isinstance(traces, tuple) or not traces or not all(isinstance(t, Trace) for t in traces):
                 raise TypeError("AvaCore generate must return a nonempty tuple of Trace objects")
             if any(
@@ -83,8 +80,7 @@ class AvaCoreRollout:
             ):
                 sample.status = Sample.Status.ABORTED
                 return sample
-            with self._monitor.wait("sample/reward"):
-                reward = await self.reward_fn(traces[0], row)
+            reward = await self.reward_fn(traces[0], row)
         except RECOVERABLE_ERRORS as error:
             logger.warning("AvaCore rollout of sample %s aborted: %r", sample.index, error)
             sample.status = Sample.Status.ABORTED

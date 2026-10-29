@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import time
 
 from miles.ray.placement_group import (
     create_rollout_components,
@@ -16,7 +15,6 @@ from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
 from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
 from miles.utils.misc import should_run_periodic_action
 from miles.utils.orchestration_utils import init_orchestration_script
-from miles.utils.perf_monitor import get_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -26,25 +24,21 @@ async def train(args, *, disposer: Disposer):
     assert not args.colocate, "Colocation is not supported for async training."
     validate_async_off_policy_correction(args)
     _worker_manager = init_orchestration_script(args, disposer=disposer)
-    monitor = get_monitor(args, "driver")
 
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
-    with monitor.phase("startup_rollout"):
-        inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
+    inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
     disposer.add(inference_controller, rollout_executor)
 
     # create the actor and critic models
-    with monitor.phase("startup_train"):
-        actor_model, critic_model = await create_training_models(args, rollout_executor)
+    actor_model, critic_model = await create_training_models(args, rollout_executor)
     disposer.add(critic_model, actor_model)
 
     maybe_start_api_server(args, trainer_models={"actor": actor_model}, inference_controller=inference_controller)
     maybe_start_mini_ft_controller(args)
 
     # always update weight first so that sglang has the loaded weights from training.
-    with monitor.phase("initial_weight_sync"):
-        await update_weights(args, actor_model, rollout_executor, inference_controller)
+    await update_weights(args, actor_model, rollout_executor, inference_controller)
 
     if args.check_weight_update_equal:
         await inference_controller.check_weights(
@@ -75,12 +69,9 @@ async def train(args, *, disposer: Disposer):
     # async train loop.
     rollout_data_next_future = await eager_create_task(prepare_and_generate(args.start_rollout_id))
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        step_started = time.time()
-        monitor.update({"rollout_id": rollout_id})
         # Sync the last generation
         if rollout_data_next_future is not None:
-            with monitor.phase("wait_rollout", rollout_id=rollout_id):
-                rollout_data_curr_ref = await rollout_data_next_future
+            rollout_data_curr_ref = await rollout_data_next_future
 
         has_next_rollout = rollout_id + 1 < args.num_rollout
         weight_update_due = (rollout_id + 1) % args.update_weights_interval == 0
@@ -92,19 +83,16 @@ async def train(args, *, disposer: Disposer):
             rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
         if args.use_critic:
-            with monitor.phase("critic_train", rollout_id=rollout_id):
-                values = await critic_model.train(rollout_id, rollout_data_curr_ref)
+            values = await critic_model.train(rollout_id, rollout_data_curr_ref)
             if args.offload_train:
                 await critic_model.offload()
             if rollout_id >= args.num_critic_only_steps:
-                with monitor.phase("train", rollout_id=rollout_id):
-                    await actor_model.train(rollout_id, rollout_data_curr_ref, external_data=values)
+                await actor_model.train(rollout_id, rollout_data_curr_ref, external_data=values)
                 if args.offload_train:
                     await actor_model.offload()
             remove_train_output_refs(values)
         else:
-            with monitor.phase("train", rollout_id=rollout_id):
-                await actor_model.train(rollout_id, rollout_data_curr_ref)
+            await actor_model.train(rollout_id, rollout_data_curr_ref)
         remove_rollout_data_refs(args, rollout_data_curr_ref)
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
@@ -112,11 +100,10 @@ async def train(args, *, disposer: Disposer):
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
         ):
             force_sync = external_save or rollout_id == args.num_rollout - 1
-            with monitor.phase("checkpoint", rollout_id=rollout_id):
-                await save_training_model(actor_model, rollout_id, force_sync)
-                if args.use_critic:
-                    await save_training_model(critic_model, rollout_id, force_sync)
-                await rollout_executor.save(rollout_id)
+            await save_training_model(actor_model, rollout_id, force_sync)
+            if args.use_critic:
+                await save_training_model(critic_model, rollout_id, force_sync)
+            await rollout_executor.save(rollout_id)
             if external_save:
                 os.remove(args.save_trigger_sentinel)
 
@@ -125,17 +112,13 @@ async def train(args, *, disposer: Disposer):
                 # sync generate before update weights to prevent update weight in the middle of generation
                 rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
                 rollout_data_next_future = None
-            with monitor.phase("update_weights", rollout_id=rollout_id):
-                await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
+            await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
             if defer_next_drain:
                 rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
-            with monitor.phase("eval_dispatch", rollout_id=rollout_id):
-                await inference_controller.prepare_eval()
-                await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
-
-        monitor.completed_step(rollout_id, started=step_started)
+            await inference_controller.prepare_eval()
+            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
 
         if (
             args.debug_exit_after_rollout is not None

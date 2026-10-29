@@ -37,12 +37,13 @@ GET_ACTOR_INTERVAL_SECONDS = 2.0
 
 _handle = None
 _is_primary = False
+_publisher = None
 _resolution_failed = False
 _warner = RateLimitedWarner(logger)
 
 
 def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None, **kwargs) -> None:
-    global _handle, _is_primary
+    global _handle, _is_primary, _publisher
     import ray
 
     if primary:
@@ -68,6 +69,10 @@ def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None
         )
         ray.get(_handle.ping.remote())
         _handle.start.remote()
+        if getattr(args, "use_wandb", False):
+            from miles.dashboard.report import ReportPublisher
+
+            _publisher = ReportPublisher(config.dashboard_dir)
         logger.info(
             "miles dashboard: telemetry -> %s | view live: python -m miles.dashboard.serve "
             "--dump-details %s --follow --port 7788",
@@ -128,9 +133,25 @@ def dashboard_log(metrics: dict, *, step: int | None = None, step_key: str | Non
         _warner.warn("dashboard metric push failed; dropping this log call")
 
 
+def finish_report() -> None:
+    """Flush and upload while the driver's W&B run is still open."""
+    global _publisher
+    if _publisher is None:
+        return
+    import ray
+
+    try:
+        ray.get(_handle.flush.remote(), timeout=30)
+    except Exception:
+        logger.warning("Final dashboard flush incomplete; publishing available data", exc_info=True)
+    _publisher.close()
+    _publisher = None
+
+
 def finish_dashboard() -> None:
     global _handle, _is_primary, _resolution_failed
     hooks.detach_and_flush()
+    finish_report()
     if _handle is not None and _is_primary:
         import ray
 

@@ -13,7 +13,6 @@ from miles.ray.rollout.eval_fleet import EvalFleetInfo, EvalFleetPin, InferenceC
 from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers
 from miles.ray.rollout.router_manager import resolve_router_addrs
 from miles.ray.rollout.server_cell import ServerCell, ServerCellMetadata
-from miles.utils import fleet_monitor
 from miles.utils import async_utils
 from miles.utils.audit_utils.process_identity import SimpleProcessIdentity
 from miles.utils.context_lock import (
@@ -86,7 +85,6 @@ class InferenceController:
         self._ticker = SimpleTicker(self._tick_cells, interval_seconds=TICK_INTERVAL_SECONDS)
 
         dashboard_hooks.register_router(self.args)
-        fleet_monitor.register_router(self.args)
 
         await self.wait_expected_num_cells()
 
@@ -152,7 +150,6 @@ class InferenceController:
     async def prepare_rollout(self, rollout_id: int, model_id: str | None = None) -> None:
         await self._health_monitoring_resume(model_id)
         await dashboard_hooks.register_engines(self.servers, provider=self._engine_provider)
-        await fleet_monitor.register_engines(self.servers, provider=self._engine_provider)
 
     @with_lock
     async def prepare_eval(self, model_id: str | None = None) -> None:

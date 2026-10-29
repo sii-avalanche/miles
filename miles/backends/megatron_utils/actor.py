@@ -37,7 +37,6 @@ from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.inference_controller import UpdatableEngines
 from miles.ray.specs.train import compute_trainer_pool_id
 from miles.ray.train_actor import TrainRayActor
-from miles.utils import fleet_monitor
 from miles.utils import object_store
 from miles.utils.argparse_utils import inplace_modify_args
 from miles.utils.audit_utils.event_logger.logger import event_logger_context
@@ -152,9 +151,6 @@ class MegatronTrainRayActor(TrainRayActor):
             init_tracking(args, primary=False)
 
         dashboard_hooks.register_train_actor(args)
-        fleet_monitor.register_train_actor(
-            args, engine_id=f"{role}-{args.trainer_id}-{indep_dp_info.cell_index:05d}", worker_id=self._rank
-        )
 
         unsupported = {"train_actor", "train_log_probs"} & set(args.profile_target)
         if unsupported and args.use_pytorch_profiler:

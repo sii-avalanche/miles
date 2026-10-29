@@ -51,7 +51,6 @@ class WandbBackend(TrackingBackend):
 
     def __init__(self) -> None:
         self._defined_step_key_groups: set[tuple[str, str]] = set()
-        self._active_alerts: set[str] = set()
 
     def init(self, args, *, primary: bool = True, **kwargs) -> None:
         from . import wandb_utils
@@ -64,35 +63,11 @@ class WandbBackend(TrackingBackend):
     def log(self, metrics: dict[str, Any], step: int | None = None, **kwargs) -> None:
         import wandb
 
-        if not metrics:
-            return
-        # Runtime detail belongs to the per-run HTML report, not scalar history.
-        # Keep other tracking backends and alert delivery intact.
-        scalar_metrics = {key: value for key, value in metrics.items() if not key.startswith("runtime/")}
-        if scalar_metrics:
-            wandb.log(scalar_metrics)
-            if "perf/actor_train_mfu" in scalar_metrics:
-                from miles.utils.fleet_monitor import record_report_performance
-
-                try:
-                    record_report_performance(scalar_metrics)
-                except Exception:
-                    logger.debug("Report performance sample unavailable", exc_info=True)
-        for key, active in metrics.items():
-            if not key.startswith("runtime/") or "/alerts/" not in key:
-                continue
-            if active and key not in self._active_alerts:
-                try:
-                    wandb.alert(title=key.rsplit("/", 1)[-1], text=f"{key} is active; see the per-run RL report.")
-                    self._active_alerts.add(key)
-                except Exception:
-                    logger.warning("W&B alert delivery failed; runtime alert was not delivered", exc_info=True)
-            elif not active:
-                self._active_alerts.discard(key)
+        wandb.log(metrics)
 
     def define_step_key_metric_group(self, prefix: str, step_key: str) -> None:
         # Call from the primary tracking process: definitions from secondary shared-mode writers are lost.
-        if prefix == "runtime" or (prefix, step_key) in self._defined_step_key_groups:
+        if (prefix, step_key) in self._defined_step_key_groups:
             return
         import wandb
 
