@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import re
 from string import Formatter
@@ -134,6 +135,54 @@ def reset_arg(parser, name, **kwargs):
 
 _FT_CHOICES = ["rollout", "train"]
 _DEFAULT_FT_API_SERVER_PORT = 18080
+
+
+def apply_rl_algorithm_defaults(parser):
+    """Presets only set defaults; argparse keeps explicit component flags authoritative."""
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument("--rl-algorithm")
+    name = selector.parse_known_args()[0].rl_algorithm
+    if name is None:
+        return
+    dapo = name == "dapo"
+    parser.set_defaults(
+        advantage_estimator="grpo",
+        rewards_normalization=True,
+        grpo_std_normalization=name != "dr_grpo",
+        eps_clip=0.2,
+        eps_clip_high=0.28 if dapo else 0.2,
+        calculate_per_token_loss=dapo,
+        dynamic_sampling_filter_path=(
+            "miles.rollout.filter_hub.common_filters.apply_reward_nonzero_std_filter" if dapo else None
+        ),
+        overlong_reward_mode="soft_penalty" if dapo else "none",
+    )
+
+
+def validate_rl_algorithm_args(args):
+    if args.rl_algorithm is not None:
+        if args.train_backend != "megatron" or args.loss_type != "policy_loss" or args.advantage_estimator != "grpo":
+            raise ValueError("RL presets require Megatron policy_loss with the grpo advantage estimator")
+        if getattr(args, "multi_lora", False) or use_legacy_rollout_v1():
+            raise ValueError("RL presets require the class-based rollout API without multi-LoRA")
+        if args.rl_algorithm == "dr_grpo" and not (
+            args.custom_pg_loss_reducer_function_path or args.calculate_per_token_loss
+        ):
+            if args.rollout_max_response_len is None or args.rollout_max_response_len <= 0:
+                raise ValueError("Dr.GRPO requires a positive rollout_max_response_len as its fixed divisor")
+    if args.rl_algorithm is not None or args.overlong_reward_mode == "soft_penalty":
+        if args.custom_reward_post_process_path or args.custom_convert_samples_to_train_data_path:
+            raise ValueError("RL presets and overlong penalties cannot bypass the native reward/data converter")
+    if args.overlong_reward_mode == "soft_penalty":
+        limit = args.rollout_max_response_len
+        if limit is None or limit <= 0:
+            raise ValueError("soft_penalty requires a positive rollout_max_response_len")
+        if args.overlong_buffer_length is None:
+            args.overlong_buffer_length = max(1, limit // 5)
+        if not 0 < args.overlong_buffer_length <= limit:
+            raise ValueError("overlong_buffer_length must be in (0, rollout_max_response_len]")
+        if not math.isfinite(args.overlong_penalty_strength) or args.overlong_penalty_strength < 0:
+            raise ValueError("overlong_penalty_strength must be finite and nonnegative")
 
 
 def get_miles_extra_args_provider(add_custom_arguments=None):
@@ -1561,6 +1610,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
 
         def add_algo_arguments(parser):
             parser.add_argument(
+                "--rl-algorithm",
+                choices=["grpo_original", "dapo", "dr_grpo"],
+                default=None,
+                help="Optional presets using native components; explicit component flags override defaults.",
+            )
+            parser.add_argument("--overlong-reward-mode", choices=["none", "soft_penalty"], default="none")
+            parser.add_argument("--overlong-buffer-length", type=int, default=None)
+            parser.add_argument("--overlong-penalty-strength", type=float, default=1.0)
+            parser.add_argument(
                 "--ref-load",
                 type=str,
                 default=None,
@@ -2854,6 +2912,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
         parser = add_prefill_decode_disaggregation_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        apply_rl_algorithm_defaults(parser)
         parser = add_user_provided_function_arguments(parser)
 
         reset_arg(
@@ -2948,6 +3007,7 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
     args.entry = entry
     if preprocess_args is not None:
         preprocess_args(args)
+    validate_rl_algorithm_args(args)
     miles_validate_args(args)
 
     if backend == "megatron":
