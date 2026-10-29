@@ -180,9 +180,7 @@ class DefaultDataBuffer(DataBuffer):
             )
 
     async def put(self, input: DataBufferInput) -> None:
-        keep = self._preput_filter(input)
-        self._metric_gatherer.on_filter_result(self._args, keep=keep)
-        if not keep:
+        if not self._preput_filter(input):
             return
 
         async with self._cond:

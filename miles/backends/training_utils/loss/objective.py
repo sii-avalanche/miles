@@ -162,10 +162,6 @@ def loss_function(
     """
     parallel_state = get_parallel_state()
     num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
-    if getattr(args, "policy_loss_reduction", None) == "token_mean":
-        # Megatron sums this count across microbatches and DP/CP before scaling gradients.
-        # Empty/filtered responses contribute no tokens; clamp only the global divisor.
-        num_tokens = sum(loss_mask.sum() for loss_mask in batch["loss_masks"])
     num_samples = len(batch["response_lengths"])
 
     sum_of_sample_mean = get_sum_of_sample_mean(

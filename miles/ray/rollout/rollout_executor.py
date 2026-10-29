@@ -3,7 +3,6 @@ import logging
 import time
 from collections import defaultdict
 from collections.abc import Sequence
-from statistics import pstdev
 from typing import Any
 
 from miles.dashboard import hooks as dashboard_hooks
@@ -39,7 +38,6 @@ from miles.utils.http_utils import init_http_client
 from miles.utils.init_once import InitOnce, init_once
 from miles.utils.logging_utils import configure_logger
 from miles.utils.metric_checker import MetricChecker
-from miles.utils.metric_utils import compute_statistics
 from miles.utils.timer import timer
 from miles.utils.tracking_utils.tracking import init_tracking
 from miles.utils.weight_version import assert_samples_weight_version_sane, assert_weight_version_is_published
@@ -165,22 +163,15 @@ class RolloutExecutor:
             metadata=metadata,
             trainer_model_id=trainer_model_id,
         )
-        samples = data
+        log_rollout_data(
+            rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
+        )
         data = convert_samples_to_train_data(
             self.args,
             data,
             metadata=metadata,
             custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
             custom_reward_post_process_func=self.custom_reward_post_process_func,
-        )
-        if getattr(self.args, "rl_algorithm", None):
-            metrics.update({f"rollout/group_advantage/{k}": v for k, v in compute_statistics(data["rewards"]).items()})
-            metrics["rollout/group_advantage/std"] = pstdev(data["rewards"])
-        for key in ("length_penalty", "shaped_reward"):
-            if key in data:
-                metrics.update({f"rollout/{key}/{k}": v for k, v in compute_statistics(data[key]).items()})
-        log_rollout_data(
-            rollout_id, self.args, samples, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
         )
         sample_indices = data.get("sample_indices")
         if self.args.delay_split_train_data_by_dp:

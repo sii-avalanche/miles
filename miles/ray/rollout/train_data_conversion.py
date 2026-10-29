@@ -42,14 +42,11 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_mask_sums": ValueSpec(codec="ndarray", dtype="int64"),
-    "policy_loss_denominators": ValueSpec(codec="ndarray", dtype="float32"),
     "multimodal_train_inputs": ValueSpec(codec="ragged_tensor_dict"),
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
     "raw_reward": ValueSpec(codec="auto"),
-    "length_penalty": ValueSpec(codec="auto"),
-    "shaped_reward": ValueSpec(codec="auto"),
     "total_lengths": ValueSpec(codec="auto"),
     "dynamic_global_batch_size": ValueSpec(codec="auto"),
     "num_microbatches": ValueSpec(codec="auto"),
@@ -71,15 +68,11 @@ def convert_samples_to_train_data(
     if (f := custom_convert_samples_to_train_data_func) is not None:
         return f(args, samples)
 
-    shaped_rewards = None
-    if getattr(args, "overlong_reward_mode", None) not in (None, "none"):
-        _, length_penalties, shaped_rewards = _shape_rollout_rewards(args, samples)
     raw_rewards, rewards = _post_process_rewards(
         args,
         samples,
         custom_reward_post_process_func=custom_reward_post_process_func,
         prompt_group_sizes=metadata.get("prompt_group_sizes"),
-        shaped_rewards=shaped_rewards,
     )
 
     assert len(raw_rewards) == len(samples)
@@ -96,9 +89,6 @@ def convert_samples_to_train_data(
         "sample_indices": [sample.index for sample in samples],
         "rollout_ids": [s.rollout_id if s.rollout_id is not None else s.index for s in samples],
     }
-    if getattr(args, "overlong_reward_mode", None) not in (None, "none"):
-        train_data["length_penalty"] = length_penalties
-        train_data["shaped_reward"] = shaped_rewards
 
     # loss mask
     # TODO: compress the loss mask
@@ -117,16 +107,6 @@ def convert_samples_to_train_data(
     train_data["loss_masks"] = loss_masks
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
-    if getattr(args, "policy_loss_reduction", None) == "group_token_mean":
-        groups = _reward_group_segments(args, samples, metadata.get("prompt_group_sizes"))
-        rollout_count = len(set(train_data["rollout_ids"]))
-        denominators = [0.0] * len(samples)
-        for group in groups:
-            # The outer trainer divides by B responses; cancel B to average N prompt groups.
-            divisor = sum(sum(loss_masks[i]) for i in group) * len(groups) / rollout_count
-            for i in group:
-                denominators[i] = divisor
-        train_data["policy_loss_denominators"] = denominators
 
     # overwriting the raw reward
     if samples[0].metadata and "raw_reward" in samples[0].metadata:
@@ -155,7 +135,7 @@ def convert_samples_to_train_data(
         train_data["rollout_topk_log_probs"] = [sample.rollout_topk_log_probs for sample in samples]
 
     has_sampling_mask = any(sample.rollout_sampling_mask is not None for sample in samples)
-    if has_sampling_mask or getattr(args, "use_sampling_support_replay", False):
+    if has_sampling_mask:
         sampling_mask_ids = []
         sampling_mask_offsets = []
         for position, sample in enumerate(samples):
@@ -294,8 +274,6 @@ def _reward_group_segments(args: Any, samples: list[Sample], prompt_group_sizes:
             list(range(start, start + args.n_samples_per_prompt))
             for start in range(0, len(samples), args.n_samples_per_prompt)
         ]
-    if getattr(args, "rl_algorithm", None) or getattr(args, "policy_loss_reduction", None):
-        raise ValueError("RL recipes require explicit group IDs or a complete fixed-fanout batch")
     # Without prompt identities or a complete fixed layout, use one reward group.
     return [list(range(len(samples)))]
 
@@ -355,39 +333,24 @@ def _normalize_rewards_by_rollout(
     return normalized_rewards.tolist()
 
 
-def _shape_rollout_rewards(args, samples: list[Sample]) -> tuple[list[float], list[float], list[float]]:
-    """Shape after raw-reward group filtering, once per episode rather than per fragment."""
-    raw = [sample.get_reward_value(args) for sample in samples]
-    mode = getattr(args, "overlong_reward_mode", None)
-    penalties = [0.0] * len(samples)
-    if mode in (None, "none"):
-        return raw, penalties, raw
-    episodes: dict[tuple[str, int], list[int]] = {}
-    for i, sample in enumerate(samples):
-        key = (
-            ("rollout", sample.rollout_id)
-            if sample.rollout_id is not None
-            else ("sample", sample.index if sample.index is not None else i)
-        )
-        episodes.setdefault(key, []).append(i)
-    for indices in episodes.values():
-        length = sum(
-            sum(samples[i].loss_mask) if samples[i].loss_mask is not None else samples[i].response_length
-            for i in indices
-        )
-        penalty = 0.0
-        if mode == "soft_penalty":
-            buffer = args.overlong_buffer_length
-            safe = args.rollout_max_response_len - buffer
-            penalty = -args.overlong_penalty_strength * min(1.0, max(0.0, (length - safe) / buffer))
-        truncated = any(samples[i].status == Sample.Status.TRUNCATED for i in indices)
-        for i in indices:
-            penalties[i] = penalty
-            sample = samples[i]
-            sample.metadata = {**(sample.metadata or {}), "length_penalty": penalty, "shaped_reward": raw[i] + penalty}
-            if mode == "mask_truncated" and truncated:
-                sample.loss_mask = [0] * sample.response_length
-    return raw, penalties, [reward + penalty for reward, penalty in zip(raw, penalties, strict=True)]
+def _penalize_overlong_rewards(args, samples: list[Sample], rewards: list[float]) -> list[float]:
+    """Penalize each rollout's generated length once; siblings share the same shaped reward."""
+    keys = [
+        ("rollout", sample.rollout_id)
+        if sample.rollout_id is not None
+        else ("sample", sample.index if sample.index is not None else i)
+        for i, sample in enumerate(samples)
+    ]
+    lengths = {}
+    for key, sample in zip(keys, samples, strict=True):
+        length = sum(sample.loss_mask) if sample.loss_mask is not None else sample.response_length
+        lengths[key] = lengths.get(key, 0) + length
+    buffer = args.overlong_buffer_length
+    safe_length = args.rollout_max_response_len - buffer
+    return [
+        reward - args.overlong_penalty_strength * min(1.0, max(0.0, (lengths[key] - safe_length) / buffer))
+        for key, reward in zip(keys, rewards, strict=True)
+    ]
 
 
 def _post_process_rewards(
@@ -395,13 +358,14 @@ def _post_process_rewards(
     samples: list[Sample] | list[list[Sample]],
     custom_reward_post_process_func,
     prompt_group_sizes: list[int] | None = None,
-    shaped_rewards: list[float] | None = None,
 ):
     if (f := custom_reward_post_process_func) is not None:
         return f(args, samples)
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
-    rewards = raw_rewards if shaped_rewards is None else shaped_rewards
+    rewards = raw_rewards
+    if getattr(args, "overlong_reward_mode", "none") == "soft_penalty":
+        rewards = _penalize_overlong_rewards(args, samples, raw_rewards)
     if (
         args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline", "cispo"]
         and args.rewards_normalization
@@ -506,7 +470,6 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "sample_indices",
             "rollout_ids",
             "rollout_mask_sums",
-            "policy_loss_denominators",
             "rollout_log_probs",
             "rollout_topk_token_ids",
             "rollout_topk_lengths",

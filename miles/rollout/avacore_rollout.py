@@ -22,18 +22,14 @@ from ava_core.runner import RECOVERABLE_ERRORS
 from ava_core.store.core import Run
 from ava_core.store.postgres import PostgresBackend
 
-from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.rollout.generate_utils.rollout_topk_logprobs import (
     append_rollout_topk_logprobs,
     configure_rollout_topk_logprobs_request,
     pad_rollout_topk_logprobs,
     validate_rollout_topk_logprobs_sample,
 )
-from miles.rollout.generate_utils.sampling_mask import (
-    append_forced_sampling_tokens,
-    append_sampling_metadata,
-    should_return_sampling_mask,
-)
+from miles.rollout.generate_utils.sampling_mask import append_forced_sampling_tokens, append_sampling_metadata
+from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.utils.types import Sample, WeightVersionsPerCall
 
 __all__ = ["AvaCoreRollout", "generate"]
@@ -72,10 +68,6 @@ class AvaCoreRollout:
                 top_k=self.args.rollout_top_k,
                 mode=self.args.rollout_sampling_logprobs_mode,
             )
-        elif getattr(self.args, "use_sampling_support_replay", False) and not evaluation:
-            should_return_sampling_mask(self.args, sampling_params)
-            # Without Score Centering candidates, PPO only needs the sampled token's score.
-            replay.update(return_sampling_mask=True, sampling_logprobs_mode="selected")
         try:
             traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
             if not isinstance(traces, tuple) or not traces or not all(isinstance(t, Trace) for t in traces):
@@ -238,12 +230,10 @@ def filled(
             spans.append((offset, offset + len(segment.tokens)))
         offset += len(segment.tokens)
     finished = [node.message for node in trace.prefixes if node.generated and "finish_reason" in node.message.metadata]
-    if not evaluation and (
-        getattr(args, "rollout_top_logprobs_num", 0) or getattr(args, "use_sampling_support_replay", False)
-    ):
+    if not evaluation and getattr(args, "rollout_top_logprobs_num", 0):
         sample = _with_sampling_metadata(args, sample, segments, finished)
         sample.validate()
-        if getattr(args, "ci_test", False) and getattr(args, "rollout_top_logprobs_num", 0):
+        if getattr(args, "ci_test", False):
             validate_rollout_topk_logprobs_sample(sample, args.rollout_top_logprobs_num)
     for message, (start, end) in zip(finished, spans, strict=True):
         # The trace keeps log probs per token, not per call: anchor the call's weight versions to its own segment.
@@ -269,19 +259,14 @@ def filled(
 
 def _with_sampling_metadata(args: Namespace, sample: Sample, segments, messages) -> Sample:
     """Return a sample with native sampling metadata, leaving the input sample untouched."""
-    k = getattr(args, "rollout_top_logprobs_num", 0)
-    mode = args.rollout_sampling_logprobs_mode if k else "selected"
-    support = mode == "support" or getattr(args, "use_sampling_support_replay", False)
-    contract = (
-        dict(
-            count=args.rollout_top_logprobs_num,
-            temperature=args.rollout_temperature,
-            top_p=args.rollout_top_p,
-            top_k=args.rollout_top_k,
-            mode=args.rollout_sampling_logprobs_mode,
-        )
-        if k
-        else None
+    k, mode = args.rollout_top_logprobs_num, args.rollout_sampling_logprobs_mode
+    support = mode == "support"
+    contract = dict(
+        count=args.rollout_top_logprobs_num,
+        temperature=args.rollout_temperature,
+        top_p=args.rollout_top_p,
+        top_k=args.rollout_top_k,
+        mode=args.rollout_sampling_logprobs_mode,
     )
     messages, log_probs = iter(messages), []
     result = replace(
@@ -292,27 +277,24 @@ def _with_sampling_metadata(args: Namespace, sample: Sample, segments, messages)
         rollout_topk_log_probs=None,
         rollout_sampling_mask=None if support else sample.rollout_sampling_mask,
     )
-    if k:
-        append_rollout_topk_logprobs(result, {}, k)
+    append_rollout_topk_logprobs(result, {}, k)
     for segment in segments[1:]:
         if segment.is_generated:
             meta = next(messages).metadata
-            if k and meta.get("sampler_logprobs") != contract:
+            if meta.get("sampler_logprobs") != contract:
                 raise ValueError("AvaCore sampler logprobs contract missing or mismatched; update the policy client")
             log_probs.extend(
                 append_sampling_metadata(result, segment.tokens, meta, sampling_logprobs_mode=mode)
                 if support
                 else segment.log_probs
             )
-            if k:
-                append_rollout_topk_logprobs(
-                    result, meta | {"output_token_logprobs": segment.log_probs}, k, sampling_logprobs_mode=mode
-                )
+            append_rollout_topk_logprobs(
+                result, meta | {"output_token_logprobs": segment.log_probs}, k, sampling_logprobs_mode=mode
+            )
         else:
             if support:
                 append_forced_sampling_tokens(result, segment.tokens)
-            if k:
-                pad_rollout_topk_logprobs(result, len(segment.tokens))
+            pad_rollout_topk_logprobs(result, len(segment.tokens))
             log_probs.extend([0.0] * len(segment.tokens))
         result.response_length += len(segment.tokens)
     return result
