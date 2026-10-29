@@ -2,6 +2,7 @@ import { api } from "./api.js";
 import { el, fmtNum, setViewCleanup, statBox } from "./app.js";
 import { createCarpet } from "./carpet.js";
 import { createFleet } from "./fleet.js";
+import { createDataPool } from "./data_pool.js";
 import { extent, hideTooltip, showTooltip } from "./charts.js";
 
 // idle states share a light neutral family (train_wait also gets a hatch
@@ -154,7 +155,7 @@ export async function renderTimeline(view, meta, route) {
           { length: DEFAULT_LANES },
           (_, i) => `g:${allLanes[Math.floor((i * allLanes.length) / DEFAULT_LANES)].index}`,
         ).join(", ");
-        history.replaceState(null, "", `#/timeline?lanes=${encodeURIComponent(selection)}`);
+        try { history.replaceState(null, "", `#/timeline?lanes=${encodeURIComponent(selection)}`); } catch { /* sandbox */ }
       }
     }
     const [phasesRes, gpuRes, processesRes] = await Promise.all([
@@ -291,7 +292,7 @@ export async function renderTimeline(view, meta, route) {
 
   async function setSelection(grammar) {
     selection = grammar || null;
-    history.replaceState(null, "", selection ? `#/timeline?lanes=${encodeURIComponent(selection)}` : "#/timeline");
+    try { history.replaceState(null, "", selection ? `#/timeline?lanes=${encodeURIComponent(selection)}` : "#/timeline"); } catch { /* sandbox */ }
     selError.textContent = "";
     renderSelection();
     try {
@@ -368,6 +369,7 @@ export async function renderTimeline(view, meta, route) {
     },
   });
   const fleet = createFleet({ phaseColors: PHASE_COLORS, runStart: () => T0 });
+  const dataPool = createDataPool(meta);
 
   // above this many lanes the per-rank carpet stops scaling (payload and
   // pixels are both O(lanes)); serve --dashboard-use-utilization-overview forces it
@@ -380,7 +382,7 @@ export async function renderTimeline(view, meta, route) {
   async function refreshOverview() {
     carpet.root.style.display = manyLanes() ? "none" : "";
     fleet.root.style.display = manyLanes() ? "" : "none";
-    await (manyLanes() ? fleet.refresh(carpetRange()) : carpet.refresh(carpetRange()));
+    await Promise.all([dataPool.refresh(carpetRange()), manyLanes() ? fleet.refresh(carpetRange()) : carpet.refresh(carpetRange())]);
   }
   let carpetTimer = null;
   const syncCarpet = () => {
@@ -664,6 +666,12 @@ export async function renderTimeline(view, meta, route) {
     showTooltip(ev.clientX, ev.clientY, lines.join("\n"));
   };
   canvas.onmouseleave = hideTooltip;
+  for (const panel of [dataPool.root, fleet.root]) {
+    panel.addEventListener("wheel", e => { if (e.target.tagName === "CANVAS") canvas.onwheel(e); }, {passive: false});
+    panel.addEventListener("mousedown", e => { if (e.target.tagName === "CANVAS") canvas.onmousedown(e); });
+    panel.addEventListener("mousemove", e => { if (dragFrom) canvas.onmousemove(e); });
+    panel.addEventListener("dblclick", () => canvas.ondblclick());
+  }
 
   // -------------------------------- legend ----------------------------------
   const legendPanel = el("div", { class: "panel" });
@@ -742,6 +750,7 @@ export async function renderTimeline(view, meta, route) {
     selRow,
     mfuPanel,
     advisoryPanel,
+    dataPool.root,
     carpet.root,
     fleet.root,
     bubbleStrip,
@@ -757,6 +766,7 @@ export async function renderTimeline(view, meta, route) {
   const onResize = () => {
     draw();
     manyLanes() ? fleet.redraw() : carpet.redraw();
+    dataPool.redraw();
   };
   window.addEventListener("resize", onResize);
 
@@ -772,7 +782,7 @@ export async function renderTimeline(view, meta, route) {
         applyRange((await api("/api/meta")).time_range);
         await Promise.all([loadData(), loadAdvisories()]);
         renderAll();
-        await carpet.refresh(carpetRange());
+        await refreshOverview();
       } catch {
         // transient fetch failure (server restart, network blip): keep polling
       } finally {

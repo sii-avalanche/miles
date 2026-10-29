@@ -96,6 +96,7 @@ def make_app(
             mode="follow" if follow else "static",
             run_name=store.meta.run_name if store.meta else None,
             start_ts=store.meta.start_ts if store.meta else None,
+            engine_interval_s=store.meta.args.get("dashboard_sglang_scrape_interval", 2) if store.meta else 2,
             wandb_url=_wandb_url(store.meta.args) if store.meta else None,
             data_buffer_length=store.latest_data_buffer_length(),
             time_range=store.time_range(),
@@ -144,6 +145,12 @@ def make_app(
             t0 = consume - MetricStore.MAX_WINDOW_S if consume is not None else None
             lanes = store.trajectory_lanes(t0=t0, t1=consume, sample_indices=indices)
             return _json_safe(dict(lanes=lanes, consume_ts=consume, t0=t0))
+
+    @app.get("/api/timeline/data_pool")
+    def timeline_data_pool(t0: float | None = None, t1: float | None = None):
+        with _translate_errors():
+            _check_window(t0, t1)
+            return dict(events=store.data_buffer_series(t0=t0, t1=t1))
 
     @app.get("/api/timeline/topology")
     def timeline_topology():

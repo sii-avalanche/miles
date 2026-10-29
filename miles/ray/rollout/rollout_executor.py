@@ -325,6 +325,11 @@ class RolloutExecutor:
             logger.warning(message)
         self._weight_versions_of_model_id[trainer_model_id] = weight_version
         self._rollouts_since_publish_of_model_id[trainer_model_id] = 0
+        if (
+            not self.use_legacy_rollout_v1
+            and (notify := getattr(self.generate_rollout, "set_weight_version", None)) is not None
+        ):
+            notify(weight_version, trainer_model_id=trainer_model_id)
 
     def set_train_parallel_config(self, config: dict[str, Any], trainer_model_id: str | None = None) -> None:
         self._train_parallel_configs_of_model_id[trainer_model_id] = config

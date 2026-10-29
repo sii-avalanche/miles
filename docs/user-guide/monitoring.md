@@ -20,6 +20,11 @@ fields depend on backend and config):
 When `--use-wandb` is set, metrics also go to wandb under the `train/`, `rollout/`,
 and `perf/` namespaces (see `miles/utils/tracking_utils/wandb_utils.py`).
 
+Use `train/step` for training curves and `rollout/step` for rollout and `perf/*`
+curves. W&B's internal `_step` is not the optimizer step in shared mode.
+For GPU/engine utilization, data pool and stage timelines, see the
+[per-run RL report](rl-report.md).
+
 ## Enabling wandb
 
 ```bash

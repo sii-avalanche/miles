@@ -344,11 +344,8 @@ async def register_engines(servers, *, provider: BaseWorkerProvider) -> None:
         _warner.warn("dashboard engine registration failed; topology may be stale")
 
 
-def report_data_buffer(length: int | None) -> None:
-    """Called at the top of every ``RolloutExecutor.get()`` alongside
-    ``register_engines``, with ``getattr(data_source, "get_buffer_length",
-    lambda: None)()``. A no-op for ``length is None`` — most data sources
-    (plain ``RolloutDataSource``) never buffer samples across steps."""
+def report_data_buffer(length: int | None, **details) -> None:
+    """Report an input-buffer snapshot or async-pool event through the native collector."""
     if length is None:
         return
     from miles.dashboard import backend
@@ -357,7 +354,7 @@ def report_data_buffer(length: int | None) -> None:
     if handle is None:
         return
     try:
-        handle.push_data_buffer.remote(DataBufferSample(ts=time.time(), length=length))
+        handle.push_data_buffer.remote(DataBufferSample(ts=time.time(), length=length, **details))
     except Exception:
         _warner.warn("dashboard data-buffer report failed")
 
