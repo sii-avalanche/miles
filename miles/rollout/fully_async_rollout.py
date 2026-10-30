@@ -107,9 +107,12 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         return await self._drain(input)
 
     async def dispose(self) -> None:
-        if (worker := self._worker) is None:
-            return
-        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_end_worker(worker), worker.get_loop()))
+        try:
+            if (worker := self._worker) is not None:
+                await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_end_worker(worker), worker.get_loop()))
+        finally:
+            if (rollout := getattr(self.state, "avacore", None)) is not None:
+                await rollout.dispose()
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnOutput:
         if input.generate_state is not None:

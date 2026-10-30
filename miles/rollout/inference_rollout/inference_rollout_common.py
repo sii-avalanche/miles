@@ -221,6 +221,10 @@ class InferenceRolloutFn(BaseRolloutFn):
             return await self._call_eval(input)
         return await self._call_train(input)
 
+    async def dispose(self) -> None:
+        if (rollout := getattr(self.state, "avacore", None)) is not None:
+            await rollout.dispose()
+
     async def _call_train(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
         from miles.rollout.inference_rollout.inference_rollout_train import generate_rollout_async
 
