@@ -37,6 +37,16 @@ def test_weight_version_ignores_unrendered_generated_turn() -> None:
     assert _weight_version(trace) == 8
 
 
+def test_default_weight_version_is_recorded_as_initial_version() -> None:
+    trace = SimpleNamespace(
+        prefixes=[
+            node(generated=True, segments=(object(),), weight_version="default"),
+        ]
+    )
+
+    assert _weight_version(trace) == 0
+
+
 def test_weight_version_requires_token_level_policy_turn() -> None:
     trace = SimpleNamespace(prefixes=[node(generated=False)])
 

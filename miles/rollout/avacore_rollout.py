@@ -270,7 +270,8 @@ def _weight_version(trace: Trace) -> int:
     """Return the version from the last token-level policy turn, even when a tool result ends the trace."""
     for node in reversed(trace.prefixes):
         if node.generated and node.segments and "weight_version" in node.message.metadata:
-            return int(node.message.metadata["weight_version"])
+            version = node.message.metadata["weight_version"]
+            return 0 if version == "default" else int(version)
     raise ValueError("AvaCore rollout trace has no generated weight_version")
 
 
