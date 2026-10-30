@@ -9,6 +9,7 @@ import logging
 import os
 import tempfile
 import time
+import traceback
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,19 @@ def _sync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _clear_error_frames(error: BaseException) -> None:
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending.extend((current.__cause__, current.__context__))
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any], *, compressed: bool = False) -> None:
@@ -177,6 +191,11 @@ class DurableRolloutOutbox:
                 return
             except Exception as error:
                 self._emit("failed", error)
+                # Pool timeouts can retain this exception after the request ends.
+                # Drop completed writer frames and this attempt's decoded record
+                # before sleeping; the durable file remains available for retry.
+                _clear_error_frames(error)
+                record = None
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self._retry_max)
 
