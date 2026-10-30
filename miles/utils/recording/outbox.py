@@ -29,13 +29,11 @@ def _clear_error_frames(error: BaseException) -> None:
     pending, seen = [error], set()
     while pending:
         current = pending.pop()
-        if current is None or id(current) in seen:
-            continue
-        seen.add(id(current))
-        traceback.clear_frames(current.__traceback__)
-        pending.extend((current.__cause__, current.__context__))
-        if isinstance(current, BaseExceptionGroup):
-            pending.extend(current.exceptions)
+        if current is not None and id(current) not in seen:
+            seen.add(id(current))
+            traceback.clear_frames(current.__traceback__)
+            pending.extend((current.__cause__, current.__context__))
+            pending.extend(current.exceptions if isinstance(current, BaseExceptionGroup) else ())
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any], *, compressed: bool = False) -> None:
