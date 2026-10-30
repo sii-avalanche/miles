@@ -29,6 +29,20 @@ async def abort(state: GenerateState, pendings: set, rollout_id: int) -> list[li
     assert not state.aborted
     state.aborted = True
 
+    if not args.partial_rollout:
+        # Discarded episodes have no partial samples to preserve. Cancel their
+        # owners first so remote HTTP disconnects stop agent/reward work before
+        # SGLang's abort response can surface as a generation failure.
+        tasks = tuple(pendings)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        pendings.clear()
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+
     urls = await get_worker_urls(args)
     logger.info(f"Abort request for {urls}")
     results = await asyncio.gather(
