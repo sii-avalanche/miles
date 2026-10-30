@@ -155,9 +155,12 @@ class AvaCoreRollout:
             node.segments for node in iter_trace_nodes(traces)
         ), "AvaCore rollouts must drive the policy through a token-level client"
         if self.recording is not None:
-            write = asyncio.create_task(self.record(row, sample, traces, reward, sampling_params))
-            self.writes.add(write)
-            write.add_done_callback(self.writes.discard)
+            if self.args.debug_rollout_only:
+                await self.record(row, sample, traces, reward, sampling_params)
+            else:
+                write = asyncio.create_task(self.record(row, sample, traces, reward, sampling_params))
+                self.writes.add(write)
+                write.add_done_callback(self.writes.discard)
         samples, owned = [], set()
         for tip in conversation_tips(traces):
             generated = {node for node in tip.prefixes if node.generated and node.segments}
@@ -264,6 +267,8 @@ class AvaCoreRollout:
                 logger.warning(
                     "Recording rollouts to Postgres failed %d times; last error: %r", self.failed_writes, error
                 )
+            if self.args.debug_rollout_only:
+                raise
 
 
 def _weight_version(trace: Trace) -> int:
