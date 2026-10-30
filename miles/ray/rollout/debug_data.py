@@ -16,7 +16,8 @@ def trajectory_rows(samples: list[Sample]) -> list[dict]:
     """One row per sample that recorded a raw conversation
     (``metadata["messages"]``, attached by the session / multi_turn paths).
 
-    ``sample_occurrence`` counts over the FULL sample list not over the recorded subset, so a sample
+    ``sample_occurrence`` counts over the FULL sample list -- the numbering the
+    dashboard uses everywhere -- not over the recorded subset, so a sample
     stays addressable even when an earlier leaf of the same index recorded no
     conversation."""
     rows = []
@@ -41,6 +42,48 @@ def trajectory_rows(samples: list[Sample]) -> list[dict]:
     return rows
 
 
+_warned_no_polars = False
+
+
+def save_dashboard_columns(samples: list[Sample], path: Path) -> None:
+    """Point-read mirror of the per-token rollout columns (parquet, one row
+    per sample) so the dashboard token view never full-loads the .pt."""
+    global _warned_no_polars
+    try:
+        import polars as pl
+    except ImportError:
+        if not _warned_no_polars:
+            logger.warning("polars not installed; skipping dashboard_columns dump (pip install miles[dashboard])")
+            _warned_no_polars = True
+        return
+    schema = dict(
+        sample_index=pl.Int32,
+        response_length=pl.Int32,
+        total_length=pl.Int32,
+        tokens=pl.List(pl.Int32),
+        loss_mask=pl.List(pl.Int8),
+        rollout_log_probs=pl.List(pl.Float32),
+    )
+    frame = pl.DataFrame(
+        [
+            dict(
+                sample_index=sample.index,
+                response_length=sample.response_length,
+                total_length=len(sample.tokens),
+                tokens=list(sample.tokens),
+                loss_mask=sample.loss_mask,
+                rollout_log_probs=sample.rollout_log_probs,
+            )
+            for sample in samples
+        ],
+        schema=schema,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    frame.write_parquet(tmp, row_group_size=8)
+    tmp.replace(path)
+
+
 def save_debug_trajectory_data(
     args, samples: list[Sample], rollout_id, evaluation: bool, trainer_model_id: str | None = None
 ):
@@ -48,7 +91,7 @@ def save_debug_trajectory_data(
         return
     rows = trajectory_rows(samples)
     if not rows:
-        return  # no conversations to save
+        return  # no conversations: no file (the dashboard keys off its presence)
     stem = _compute_dump_stem(rollout_id, evaluation=evaluation, trainer_model_id=trainer_model_id)
     path = _format_dump_path(path_template, stem=stem)
     logger.info(f"Save trajectory dump to {path}")
@@ -97,6 +140,7 @@ def save_debug_rollout_data(
 
         samples = [sample for info in data.values() for sample in info["samples"]] if evaluation else list(data)
         save_debug_trajectory_data(args, samples, rollout_id, evaluation, trainer_model_id=trainer_model_id)
+        save_dashboard_columns(samples, path.parent.parent / "dashboard_columns" / f"rollout_{stem}.parquet")
 
         # TODO may improve the format
         dump_data = dict(samples=[_sample_to_debug_dict(args, sample) for sample in samples])
@@ -104,9 +148,9 @@ def save_debug_rollout_data(
 
 
 def _format_dump_path(path_template: str, *, stem: str) -> Path:
-    assert any(field_name == "rollout_id" for _, field_name, _, _ in Formatter().parse(path_template)), (
-        f"Debug dump path template {path_template!r} must contain the {{rollout_id}} placeholder"
-    )
+    assert any(
+        field_name == "rollout_id" for _, field_name, _, _ in Formatter().parse(path_template)
+    ), f"Debug dump path template {path_template!r} must contain the {{rollout_id}} placeholder"
     return Path(path_template.format(rollout_id=stem))
 
 
@@ -138,9 +182,9 @@ class RolloutDataInjectionUtil:
         cls, args, *, generated: list[Sample], injected: list[Sample], rollout_id: int
     ) -> None:
         min_match_ratio: float = args.ci_inject_rollout_data_min_match_ratio
-        assert len(generated) == len(injected), (
-            f"rollout {rollout_id}: sample count mismatch, generated {len(generated)} vs injected {len(injected)}"
-        )
+        assert len(generated) == len(
+            injected
+        ), f"rollout {rollout_id}: sample count mismatch, generated {len(generated)} vs injected {len(injected)}"
 
         ratios: list[float] = []
         for index, (generated_sample, injected_sample) in enumerate(zip(generated, injected, strict=True)):

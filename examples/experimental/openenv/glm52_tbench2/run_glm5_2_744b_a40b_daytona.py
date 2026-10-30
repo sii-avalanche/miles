@@ -260,7 +260,7 @@ def _execute_train(args: ScriptArgs):
 
     dashboard_args = (
         f"--dump-details {args.output_dir}/{args.run_id}/dump_details "
-        "--perf-monitor-interval 10 "
+        "--use-miles-dashboard "
         "--dashboard-sglang-scrape-mode direct "
     )
 

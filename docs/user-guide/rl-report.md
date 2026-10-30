@@ -1,48 +1,39 @@
 # Per-run RL report
 
-The report reuses the Miles timeline template for engine/GPU utilization, data
-pool and collect/train/weight-sync stages. Hover, wheel zoom and drag pan work
-in one self-contained HTML file; no separate service or Data pool channel is needed.
+The report uses Miles' existing dashboard collector, GPU sampler, Timer events,
+engine metrics and timeline template. Training phase events use Megatron's existing
+hook. Async data pools add queue/version snapshots and batch/rejection events
+to the existing `data_buffer` stream; no new node or process metrics are logged.
 
 ## Enable and open
 
-For AvaTrain, add to `[train]` (native Miles uses the corresponding CLI flags):
+Use the existing dashboard options in AvaTrain:
 
 ```toml
+[train]
 use_wandb = true
-perf_monitor_interval = 10.0
-# Optional sampling intervals, in seconds:
-perf_monitor_gpu_interval = 2.0
-perf_monitor_engine_interval = 5.0
+use_miles_dashboard = true
+dump_details = "/persistent/path/unique-to-this-run/details"
 ```
 
-Monitoring defaults to off. The training image must contain this Miles version.
-After the first upload, open the run's **Overview → Notes → RL timeline**,
-use its summary field `rl_report_url`, or download `rl-report.html` from Files.
-The background publisher updates about once per minute; refresh the page to
-load a newer snapshot. Runs without collected telemetry have no report.
+`dump_details` also enables Miles' normal debug dumps. Use a distinct directory
+for each run. Sampling uses `dashboard_gpu_sample_interval` and
+`dashboard_sglang_scrape_interval`; the separate `perf_monitor_*` options have
+been removed in favor of these existing settings.
 
-## Set up W&B project views once
+With both backends enabled, the driver exports and uploads a snapshot about once
+per minute. In a project with the saved RL report view, open
+**Overview → Notes → RL timeline** or use summary `rl_report_url`.
+The link targets the `rlreport` view and its `rlreportpanel` HTML panel, displaying
+the `rl_report` media key. Existing saved W&B views remain independent of this code.
+Without that view, download `rl-report.html` from Files and open it locally.
+Refresh to load a newer snapshot.
+No HTTP server is started. Older runs need collected dashboard files to export.
 
-Install the optional `wandb-workspaces==0.4.13` in the command environment, then:
+The HTML embeds the latest four hours. It supports hover, wheel zoom, drag pan
+and GPU selection. GPU/engine series are downsampled by the native queries;
+fleet overview bins and outlier ordering are fixed at export time. The original
+files remain under `<dump_details>/dashboard/` for longer-history inspection.
 
-```bash
-python -m miles.utils.rl_report --entity ENTITY --project PROJECT
-```
-
-This installs the full-screen report view and a compact experiment-comparison
-workspace. To replace an existing saved workspace, add `--url 'WORKSPACE_URL'`;
-it is backed up before saving. Use `--dry-run` to preview the sections.
-Training jobs do not need this optional package or repeat workspace setup.
-
-## Recorded data and limits
-
-- W&B keeps `train/*`, `rollout/*` and `perf/*` scalars. Selected `runtime/*`
-  telemetry goes into the report archive instead of separate W&B curves.
-- The HTML contains the latest 20,000 records. `rl-telemetry.jsonl.gz` retains
-  the collected report telemetry beyond that window. Other tracking backends
-  continue receiving runtime scalars on the `runtime/time_s` axis.
-- Missing samples stay missing; GPU activity is not MFU. Phase strips describe
-  role-level orchestration, not per-GPU kernel timing. Pool counts are groups.
-- Old `--use-miles-dashboard` and dashboard service flags are removed. Replace
-  them with `--perf-monitor-interval 10`; no dashboard server command is needed.
+W&B retains the existing training/rollout/performance scalars and one HTML report;
+there is no separate Data pool channel or duplicate engine-metric scrape.

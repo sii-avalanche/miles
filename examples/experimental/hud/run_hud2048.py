@@ -138,7 +138,7 @@ def execute():
     # diagnosable after the fact; log-multi-turn adds per-turn counts and
     # lengths, the difference between "the reward moved" and knowing how many
     # actions produced it.
-    telemetry_args = "--perf-monitor-interval 10 --dashboard-gpu-sample-interval 5 --log-multi-turn --log-passrate "
+    telemetry_args = "--use-miles-dashboard --dashboard-gpu-sample-interval 5 --log-multi-turn --log-passrate "
 
     sglang_args = (
         "--rollout-num-gpus-per-engine 1 "

@@ -211,7 +211,7 @@ def _observability_args(args: ScriptArgs) -> str:
         )
     return (
         f"--dump-details {_save_traces_dir(args)} "
-        "--perf-monitor-interval 10 "
+        "--use-miles-dashboard "
         "--use-rollout-entropy "
         f"{prometheus_args}"
         f"{command_utils.get_default_wandb_args(__file__, run_name_prefix='terminus-compaction', run_id=args.run_id)}"

@@ -33,7 +33,7 @@ def _clear_error_frames(error: BaseException) -> None:
             seen.add(id(current))
             traceback.clear_frames(current.__traceback__)
             pending.extend((current.__cause__, current.__context__))
-            pending.extend(current.exceptions if isinstance(current, BaseExceptionGroup) else ())
+            pending.extend(getattr(current, "exceptions", ()))
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any], *, compressed: bool = False) -> None:

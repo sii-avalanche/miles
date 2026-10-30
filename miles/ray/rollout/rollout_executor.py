@@ -5,6 +5,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any
 
+from miles.dashboard import hooks as dashboard_hooks
 from miles.ray.rollout.debug_data import RolloutDataInjectionUtil, load_debug_rollout_data, save_debug_rollout_data
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, RolloutExecutorEvalFleet
 from miles.ray.rollout.metrics import log_eval_rollout_data, log_eval_skip, log_rollout_data
@@ -23,7 +24,6 @@ from miles.rollout.base_types import (
 )
 from miles.rollout.checkpoint_eval import CheckpointEvalFn, EvalSkip
 from miles.rollout.inference_rollout.compatibility import call_rollout_function, load_rollout_function
-from miles.rollout.moe_metrics import expert_load_metrics
 from miles.utils import object_store
 from miles.utils.async_utils import maybe_await
 from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
@@ -38,7 +38,6 @@ from miles.utils.http_utils import init_http_client
 from miles.utils.init_once import InitOnce, init_once
 from miles.utils.logging_utils import configure_logger
 from miles.utils.metric_checker import MetricChecker
-from miles.utils.perf_monitor import get_monitor
 from miles.utils.timer import timer
 from miles.utils.tracking_utils.tracking import init_tracking
 from miles.utils.weight_version import assert_samples_weight_version_sane, assert_weight_version_is_published
@@ -123,7 +122,6 @@ class RolloutExecutor:
         self._eval_fleet: RolloutExecutorEvalFleet | None = None
 
         self._metric_checker = MetricChecker.maybe_create(args)
-        self._monitor = get_monitor(args)
 
     async def get_init_state(self) -> str:
         return self._init_once.state.value
@@ -140,7 +138,6 @@ class RolloutExecutor:
             self._metric_checker.dispose()
         if isinstance(self.eval_generate_rollout, CheckpointEvalFn):
             await maybe_await(self.eval_generate_rollout.dispose())
-        self._monitor.stop()
 
     # -------------------------- data generation -----------------------------
 
@@ -152,10 +149,9 @@ class RolloutExecutor:
         assert_weight_version_is_published(
             self.args, rollouts_since_publish=self._rollouts_since_publish_of_model_id[trainer_model_id]
         )
-        with (
-            self._monitor.phase("collect_batch", rollout_id=rollout_id),
-            timer("rollout" if trainer_model_id is None else f"{trainer_model_id}/rollout"),
-        ):
+        if (get_buffer_length := getattr(self.data_source, "get_buffer_length", None)) is not None:
+            dashboard_hooks.report_data_buffer(get_buffer_length())
+        with timer("rollout" if trainer_model_id is None else f"{trainer_model_id}/rollout"):
             data, metadata, metrics = await self._get_rollout_data(
                 rollout_id=rollout_id, trainer_model_id=trainer_model_id
             )
@@ -167,31 +163,23 @@ class RolloutExecutor:
             metadata=metadata,
             trainer_model_id=trainer_model_id,
         )
-        if (layer := getattr(self.args, "perf_monitor_expert_layer", None)) is not None:
-            try:
-                with self._monitor.wait("telemetry/expert_counts"):
-                    metrics.update(expert_load_metrics(data, layer=layer, num_experts=self.args.num_experts))
-            except Exception:
-                logger.warning("Expert telemetry failed; this batch has no expert metrics", exc_info=True)
         log_rollout_data(
             rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
         )
-        with self._monitor.phase("convert_batch", rollout_id=rollout_id):
-            data = convert_samples_to_train_data(
-                self.args,
-                data,
-                metadata=metadata,
-                custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
-                custom_reward_post_process_func=self.custom_reward_post_process_func,
-            )
+        data = convert_samples_to_train_data(
+            self.args,
+            data,
+            metadata=metadata,
+            custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
+            custom_reward_post_process_func=self.custom_reward_post_process_func,
+        )
         sample_indices = data.get("sample_indices")
-        with self._monitor.phase("object_store_put", rollout_id=rollout_id):
-            if self.args.delay_split_train_data_by_dp:
-                data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
-            else:
-                data_ref = split_train_data_by_dp(
-                    self.args, data, self._train_parallel_configs_of_model_id[trainer_model_id]
-                )
+        if self.args.delay_split_train_data_by_dp:
+            data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
+        else:
+            data_ref = split_train_data_by_dp(
+                self.args, data, self._train_parallel_configs_of_model_id[trainer_model_id]
+            )
         return RolloutDataPack(sample_indices=sample_indices, data_ref=data_ref)
 
     async def eval(
@@ -337,16 +325,11 @@ class RolloutExecutor:
             logger.warning(message)
         self._weight_versions_of_model_id[trainer_model_id] = weight_version
         self._rollouts_since_publish_of_model_id[trainer_model_id] = 0
-        if (notify := getattr(self.generate_rollout, "set_weight_version", None)) is not None:
+        if (
+            not self.use_legacy_rollout_v1
+            and (notify := getattr(self.generate_rollout, "set_weight_version", None)) is not None
+        ):
             notify(weight_version, trainer_model_id=trainer_model_id)
-        self._monitor.event(
-            "weight_published",
-            details=dict(
-                current_version=weight_version,
-                previous_version=previous,
-                trainer_model_id=trainer_model_id,
-            ),
-        )
 
     def set_train_parallel_config(self, config: dict[str, Any], trainer_model_id: str | None = None) -> None:
         self._train_parallel_configs_of_model_id[trainer_model_id] = config

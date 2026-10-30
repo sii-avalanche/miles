@@ -21,6 +21,7 @@ from miles.rollout.generate_hub.single_turn import generate
 from miles.rollout.generate_utils.generate_endpoint_utils import policy_uses_routing_key
 from miles.rollout.inference_rollout.compatibility import load_generate_function
 from miles.rollout.rm_hub import async_rm, batched_async_rm
+from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
@@ -74,6 +75,11 @@ async def generate_and_rm(
             assert sample.reward is not None
         return sample
 
+    # dashboard lifecycle probe: the semaphore wait is the queue; attempt_end fires before reward
+    sink = None if evaluation else TrajectoryLifecycle().sink
+    if sink is not None:
+        sink.attempt_start(sample)
+
     # generate
     log_prefix = f"[sample={getattr(sample, 'index', '?')}]"
     logger.debug(f"{log_prefix} Waiting for semaphore...")
@@ -84,6 +90,8 @@ async def generate_and_rm(
                 return sample
 
             logger.debug(f"{log_prefix} Acquired semaphore, calling generate_function")
+            if sink is not None:
+                sink.gen_start(sample)
             # per-sample override, e.g. an eval dataset naming its own generate function
             generate_fn = load_generate_function(sample.generate_function_path) or state.generate_function
             output = await generate_fn(
@@ -96,9 +104,9 @@ async def generate_and_rm(
             )
             sample = output.samples
             logger.debug(f"{log_prefix} generate_function returned")
-    except asyncio.CancelledError:
-        sample.status = Sample.Status.ABORTED
-        raise
+    finally:
+        if sink is not None:
+            sink.attempt_end(sample)
 
     # TODO change to `if not args.group_rm: do reward model` for more clarity after the refactor below
     # for the rm that need the whole group, we will not do the rm here
@@ -163,10 +171,7 @@ async def generate_and_rm_group(
         # cancel siblings and let them settle: the group returns only after every
         # sample task is done, so no orphan generation or in-flight credit outlives it
         for task in tasks:
-            # Cancelling gather already cancelled its children. A second cancel could
-            # interrupt a child's shielded Trace persistence cleanup.
-            if not task.done() and not task.cancelling():
-                task.cancel()
+            task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     logger.debug(f"{log_prefix} [group] All {len(group)} samples completed")
@@ -211,14 +216,14 @@ class InferenceRolloutFn(BaseRolloutFn):
         self.state = GenerateState(input.args)
         self.eval_prompt_dataset_cache = {}
 
-    async def dispose(self) -> None:
-        if (avacore := getattr(self.state, "avacore", None)) is not None:
-            await avacore.dispose()
-
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
             return await self._call_eval(input)
         return await self._call_train(input)
+
+    async def dispose(self) -> None:
+        if (rollout := getattr(self.state, "avacore", None)) is not None:
+            await rollout.dispose()
 
     async def _call_train(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
         from miles.rollout.inference_rollout.inference_rollout_train import generate_rollout_async
