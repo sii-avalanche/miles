@@ -191,9 +191,7 @@ class DurableRolloutOutbox:
                 return
             except Exception as error:
                 self._emit("failed", error)
-                # Pool timeouts can retain this exception after the request ends.
-                # Drop completed writer frames and this attempt's decoded record
-                # before sleeping; the durable file remains available for retry.
+                # Release failed write data before waiting to retry.
                 _clear_error_frames(error)
                 record = None
                 await asyncio.sleep(delay)
