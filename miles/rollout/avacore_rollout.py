@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 import pybase64
+from psycopg import Error as PostgresError
+from psycopg_pool import PoolTimeout
 from ava_core.config import interpolated, launch_converter
 from ava_core.core import Schema, Trace
 from ava_core.core.trace import iter_trace_nodes
@@ -31,6 +33,7 @@ from miles.rollout.generate_utils.rollout_topk_logprobs import (
 )
 from miles.rollout.generate_utils.sampling_mask import append_forced_sampling_tokens, append_sampling_metadata
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.utils.retry_utils import retry_until_deadline
 from miles.utils.types import Sample, WeightVersionsPerCall
 
 __all__ = ["AvaCoreRollout", "generate"]
@@ -39,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 _CANDIDATE_SLOT = "_group_oversampling_candidate_slot"
 _CANDIDATE_WIDTH = "_group_oversampling_candidate_width"
+_RECORDING_RETRY_SECONDS = 900.0
+_RECORDING_RETRY_ERRORS = (PostgresError, PoolTimeout)
 
 
 @dataclass(frozen=True)
@@ -205,22 +210,74 @@ class AvaCoreRollout:
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
-        store = await self.stack.enter_async_context(
-            PostgresBackend(self.recording["postgres"], min_size=1, max_size=4)
-        )
-        run = await self.stack.enter_async_context(
-            store.rl_run(
-                model=self.recording["model"],
-                run=self.recording["run"],
-                collection=Path(self.args.prompt_data).stem,
-                sampling_params=sampling_params,
-                config=self.config,
-                schema=Schema(),
-                resume=True,
+        stack = AsyncExitStack()
+        try:
+            store = await stack.enter_async_context(
+                PostgresBackend(self.recording["postgres"], min_size=1, max_size=4)
             )
-        )
-        await run.update(status="running")
+            run = await stack.enter_async_context(
+                store.rl_run(
+                    model=self.recording["model"],
+                    run=self.recording["run"],
+                    collection=Path(self.args.prompt_data).stem,
+                    sampling_params=sampling_params,
+                    config=self.config,
+                    schema=Schema(),
+                    resume=True,
+                )
+            )
+            await run.update(status="running")
+        except BaseException:
+            await stack.aclose()
+            raise
+        self.stack.push_async_callback(stack.aclose)
         return run
+
+    async def _record_once(
+        self,
+        row: Row,
+        sample: Sample,
+        traces: tuple[Trace, ...],
+        reward: Reward,
+        sampling_params: dict[str, Any],
+    ) -> None:
+        if self.run is None:
+            self.run = asyncio.create_task(self.open(sampling_params))
+        opening = self.run
+        try:
+            run = await asyncio.shield(opening)
+        except _RECORDING_RETRY_ERRORS:
+            if self.run is opening:
+                self.run = None
+            raise
+
+        assert sample.epoch is not None and sample.index is not None
+        n = self.args.n_samples_per_prompt
+        query_id = str(sample.metadata["_index"])
+        metadata = {
+            "weight_version": _weight_version(traces[0]),
+            "weight_versions": [
+                version
+                for trace in traces
+                for node in trace.prefixes
+                if node.generated and (version := node.message.metadata.get("weight_version")) is not None
+            ],
+        }
+        if (slot := sample.metadata.get(_CANDIDATE_SLOT)) is not None:
+            width = int(sample.metadata[_CANDIDATE_WIDTH])
+            trial_id = sample.epoch * width + int(slot)
+            metadata |= {_CANDIDATE_SLOT: int(slot), _CANDIDATE_WIDTH: width}
+        else:
+            trial_id = sample.epoch * n + sample.index % n
+        await run.create_rollout(
+            query_id=query_id,
+            trial_id=trial_id,
+            instance=row,
+            traces=traces,
+            reward=reward,
+            status="completed",
+            metadata=metadata,
+        )
 
     async def record(
         self,
@@ -231,35 +288,12 @@ class AvaCoreRollout:
         sampling_params: dict[str, Any],
     ) -> None:
         try:
-            assert sample.epoch is not None and sample.index is not None
-            n = self.args.n_samples_per_prompt
-            query_id = str(sample.metadata["_index"])
-            metadata = {
-                "weight_version": _weight_version(traces[0]),
-                "weight_versions": [
-                    version
-                    for trace in traces
-                    for node in trace.prefixes
-                    if node.generated and (version := node.message.metadata.get("weight_version")) is not None
-                ],
-            }
-            if (slot := sample.metadata.get(_CANDIDATE_SLOT)) is not None:
-                width = int(sample.metadata[_CANDIDATE_WIDTH])
-                trial_id = sample.epoch * width + int(slot)
-                metadata |= {_CANDIDATE_SLOT: int(slot), _CANDIDATE_WIDTH: width}
-            else:
-                trial_id = sample.epoch * n + sample.index % n
-            if self.run is None:
-                self.run = asyncio.create_task(self.open(sampling_params))
-            run = await self.run
-            await run.create_rollout(
-                query_id=query_id,
-                trial_id=trial_id,
-                instance=row,
-                traces=traces,
-                reward=reward,
-                status="completed",
-                metadata=metadata,
+            await retry_until_deadline(
+                lambda _remaining: self._record_once(row, sample, traces, reward, sampling_params),
+                total_seconds=_RECORDING_RETRY_SECONDS,
+                retry_on=_RECORDING_RETRY_ERRORS,
+                max_delay=30.0,
+                log_fields={"component": "avacore_rollout", "operation": "record"},
             )
         except Exception as error:
             self.failed_writes += 1
