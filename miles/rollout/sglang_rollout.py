@@ -401,17 +401,21 @@ async def generate_and_rm_group(
             if sample.routing_key is None:
                 sample.routing_key = str(uuid.uuid4())
 
-    tasks = []
-    for idx, sample in enumerate(group):
+    member_sampling_params = []
+    for idx in range(len(group)):
         current_sampling_params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(
-                generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation, timeout=timeout)
-            )
-        )
+        member_sampling_params.append(current_sampling_params)
+
+    if state.avacore is not None and state.avacore.grouped:
+        return await state.avacore.generate_group(group, member_sampling_params, state)
+
+    tasks = [
+        asyncio.create_task(generate_and_rm(args, sample, params, evaluation=evaluation, timeout=timeout))
+        for sample, params in zip(group, member_sampling_params, strict=True)
+    ]
 
     group = await asyncio.gather(*tasks)
 
