@@ -63,17 +63,6 @@ def get_rollout_data(
             for t, sid in zip(rollout_data["tokens"], seq_witness_ids, strict=True)
         ]
 
-    if "multimodal_train_inputs" in rollout_data:
-        # Move multimodal training tensors to GPU in advance
-        rollout_data["multimodal_train_inputs"] = [
-            (
-                {key: tensor.to(device=torch.cuda.current_device()) for key, tensor in mm_dict.items()}
-                if mm_dict is not None
-                else None
-            )
-            for mm_dict in rollout_data["multimodal_train_inputs"]
-        ]
-
     if args.qkv_format == "bshd":
         # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator
         max_seq_len = max(rollout_data["total_lengths"])
@@ -208,6 +197,15 @@ def get_batch(
     if "adapter_slots" not in keys:
         keys = [*keys, "adapter_slots"]
     batch = data_iterator.get_next(keys)
+    if batch.get("multimodal_train_inputs") is not None:
+        batch["multimodal_train_inputs"] = [
+            (
+                {key: tensor.to(device=torch.cuda.current_device()) for key, tensor in mm_dict.items()}
+                if mm_dict is not None
+                else None
+            )
+            for mm_dict in batch["multimodal_train_inputs"]
+        ]
 
     if "dynamic_global_batch_size" in data_iterator.rollout_data:
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]

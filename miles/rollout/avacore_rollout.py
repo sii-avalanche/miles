@@ -23,6 +23,7 @@ from ava_core.runner import RECOVERABLE_ERRORS
 from ava_core.store.core import Run
 from ava_core.store.postgres import PostgresBackend
 
+from miles.rollout.avacore_vision import training_images
 from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.rollout.generate_utils.rollout_topk_logprobs import (
     append_rollout_topk_logprobs,
@@ -366,6 +367,7 @@ def filled(
             # sglang also forwarded the final token, whose routing feeds no training position
             routed = routed[: (length - 1) * row]
         sample.rollout_routed_experts = routed.reshape(length - 1, args.num_layers, args.moe_router_topk)
+    sample.multimodal_train_inputs = training_images(segments)
     sample.reward = reward
     return sample
 
