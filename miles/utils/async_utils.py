@@ -181,7 +181,11 @@ async def maybe_await(value: Awaitable[_T] | _T) -> _T:
 
 async def with_disposer(fn: Callable[..., Awaitable[_T]], *args: Any, **kwargs: Any) -> _T:
     async with Disposer() as disposer:
-        return await fn(*args, disposer=disposer, **kwargs)
+        try:
+            return await fn(*args, disposer=disposer, **kwargs)
+        except BaseException:
+            logger.exception("[DEBUG-arvo-zvp-primary] orchestration failed before cleanup")
+            raise
 
 
 class Disposer:
