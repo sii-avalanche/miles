@@ -17,13 +17,13 @@ from ava_core.core import Schema, Trace
 from ava_core.core.trace import iter_trace_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
-from ava_core.generate.remote_generate import RemoteGenerate
 from ava_core.rewards import RewardFunction
-from ava_core.rewards.core import Reward
+from ava_core.rewards.core import GroupRewardFunction, Reward
 from ava_core.runner import RECOVERABLE_ERRORS
 from ava_core.store.core import Run
 from ava_core.store.postgres import PostgresBackend
 
+from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
 from miles.rollout.generate_utils.rollout_topk_logprobs import (
     append_rollout_topk_logprobs,
     configure_rollout_topk_logprobs_request,
@@ -31,7 +31,7 @@ from miles.rollout.generate_utils.rollout_topk_logprobs import (
     validate_rollout_topk_logprobs_sample,
 )
 from miles.rollout.generate_utils.sampling_mask import append_forced_sampling_tokens, append_sampling_metadata
-from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.types import Sample, WeightVersionsPerCall
 
 __all__ = ["AvaCoreRollout", "generate"]
@@ -47,23 +47,91 @@ class AvaCoreRollout:
         self.config = config
         conv = launch_converter()
         self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
-        self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
+        reward = interpolated(self.config["reward"])
+        self.grouped = reward["kind"] in GroupRewardFunction.kinds
+        self.reward_fn = conv.structure(reward, GroupRewardFunction if self.grouped else RewardFunction)
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
-        self.remote_recording = self.recording is not None and self.config["generate"]["kind"] == "remote"
-        if self.remote_recording:
-            if self.config["reward"]["kind"] != "remote_reward":
-                raise ValueError("Remote recording requires remote generation and reward")
-            if not self.config["generate"].get("recording"):
-                raise ValueError("Remote recording requires a CPU session recording identity")
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
         self.writes: set[asyncio.Task[None]] = set()
         self.failed_writes = 0
 
     async def generate(
-        self, sample: Sample, sampling_params: dict[str, Any], *, evaluation: bool = False
+        self,
+        sample: Sample,
+        sampling_params: dict[str, Any],
+        *,
+        evaluation: bool = False,
     ) -> list[Sample]:
-        row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
+        if self.grouped:
+            raise ValueError("A group reward scores whole groups; it cannot score a single sample")
+        rolled = await self.rollout(sample, sampling_params, evaluation=evaluation)
+        if rolled is None:
+            sample.status = Sample.Status.ABORTED
+            return [sample]
+        row, traces, sampling_params = rolled
+        try:
+            reward = await self.reward_fn(traces[0], row)
+        except RECOVERABLE_ERRORS as error:
+            logger.warning("AvaCore reward of sample %s failed: %r", sample.index, error)
+            sample.status = Sample.Status.ABORTED
+            return [sample]
+        return await self.finish(sample, row, traces, reward, sampling_params, evaluation=evaluation)
+
+    async def generate_group(
+        self, group: list[Sample], sampling_params: list[dict[str, Any]], state: Any
+    ) -> list[list[Sample]] | list[Sample]:
+        sink = TrajectoryLifecycle().sink
+
+        async def member(sample: Sample, params: dict[str, Any]) -> tuple[Row, tuple[Trace, ...], dict] | None:
+            if sink is not None:
+                sink.attempt_start(sample)
+            async with state.semaphore:
+                if state.aborted:
+                    rolled = None
+                else:
+                    if sink is not None:
+                        sink.gen_start(sample)
+                    rolled = await self.rollout(sample, params, evaluation=False)
+            if sink is not None:
+                sink.attempt_end(sample)
+            return rolled
+
+        rolled = await asyncio.gather(
+            *(member(sample, params) for sample, params in zip(group, sampling_params, strict=True))
+        )
+        if any(each is None for each in rolled):
+            # miles drops a group with an aborted member, so the others are not scored.
+            for sample in group:
+                sample.status = Sample.Status.ABORTED
+            return group
+        try:
+            rewards = await self.reward_fn.evaluate([traces[0] for _, traces, _ in rolled], rolled[0][0])
+        except RECOVERABLE_ERRORS as error:
+            logger.warning(
+                "AvaCore group reward of group %s failed: %r",
+                group[0].group_index,
+                error,
+            )
+            for sample in group:
+                sample.status = Sample.Status.ABORTED
+            return group
+        return list(
+            await asyncio.gather(
+                *(
+                    self.finish(sample, row, traces, reward, params, evaluation=False)
+                    for sample, (row, traces, params), reward in zip(group, rolled, rewards, strict=True)
+                )
+            )
+        )
+
+    async def rollout(
+        self, sample: Sample, sampling_params: dict[str, Any], *, evaluation: bool
+    ) -> tuple[Row, tuple[Trace, ...], dict[str, Any]] | None:
+        row = Row(
+            {**sample.metadata, "prompt": sample.prompt, "label": sample.label},
+            key=lambda _: sample.index,
+        )
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         if getattr(self.args, "rollout_top_logprobs_num", 0) and not evaluation:
             request = {"sampling_params": dict(sampling_params)}
@@ -74,7 +142,10 @@ class AvaCoreRollout:
                 # JSON candidates are no longer an optional SC transport.
                 if sampling_params.get("return_compact_top_logprobs") is False:
                     raise ValueError("SC requires compact candidate transport")
-                sampling_params = {**sampling_params, "return_compact_top_logprobs": True}
+                sampling_params = {
+                    **sampling_params,
+                    "return_compact_top_logprobs": True,
+                }
             replay["sampler_logprobs"] = dict(
                 count=self.args.rollout_top_logprobs_num,
                 temperature=self.args.rollout_temperature,
@@ -84,25 +155,33 @@ class AvaCoreRollout:
             )
         try:
             traces = await self.generate_fn(row, sampling_params=sampling_params, **replay)
-            if not isinstance(traces, tuple) or not traces or not all(isinstance(t, Trace) for t in traces):
-                raise TypeError("AvaCore generate must return a nonempty tuple of Trace objects")
-            if any(
-                message.metadata["finish_reason"]["type"] == "abort"
-                for node in iter_trace_nodes(traces)
-                for message in (node.message,)
-                if "finish_reason" in message.metadata
-            ):
-                sample.status = Sample.Status.ABORTED
-                return [sample]
-            reward = await self.reward_fn(traces[0], row)
         except RECOVERABLE_ERRORS as error:
             logger.warning("AvaCore rollout of sample %s aborted: %r", sample.index, error)
-            sample.status = Sample.Status.ABORTED
-            return [sample]
+            return None
+        if not isinstance(traces, tuple) or not traces or not all(isinstance(t, Trace) for t in traces):
+            raise TypeError("AvaCore generate must return a nonempty tuple of Trace objects")
+        if any(
+            message.metadata["finish_reason"]["type"] == "abort"
+            for node in iter_trace_nodes(traces)
+            for message in (node.message,)
+            if "finish_reason" in message.metadata
+        ):
+            return None
+        return row, traces, sampling_params
 
-        assert any(node.segments for node in iter_trace_nodes(traces)), (
-            "AvaCore rollouts must drive the policy through a token-level client"
-        )
+    async def finish(
+        self,
+        sample: Sample,
+        row: Row,
+        traces: tuple[Trace, ...],
+        reward: Reward,
+        sampling_params: dict[str, Any],
+        *,
+        evaluation: bool,
+    ) -> list[Sample]:
+        assert any(
+            node.segments for node in iter_trace_nodes(traces)
+        ), "AvaCore rollouts must drive the policy through a token-level client"
         owned: set[Trace] = set()
         samples = []
         for trace in conversation_tips(traces):
@@ -138,9 +217,7 @@ class AvaCoreRollout:
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
-        store = await self.stack.enter_async_context(
-            PostgresBackend(self.recording["postgres"], min_size=1, max_size=4)
-        )
+        store = await self.stack.enter_async_context(PostgresBackend(self.recording["postgres"]))
         run = await self.stack.enter_async_context(
             store.rl_run(
                 model=self.recording["model"],
@@ -168,21 +245,15 @@ class AvaCoreRollout:
             n = self.args.n_samples_per_prompt
             query_id = str(sample.metadata["_index"])
             trial_id = sample.epoch * n + sample.index % n
-            if self.remote_recording:
-                assert isinstance(self.generate_fn, RemoteGenerate)
-                create_rollout = self.generate_fn.record
-            else:
-                if self.run is None:
-                    self.run = asyncio.create_task(self.open(sampling_params))
-                run = await self.run
-                create_rollout = run.create_rollout
-            await create_rollout(
+            if self.run is None:
+                self.run = asyncio.create_task(self.open(sampling_params))
+            run = await self.run
+            await run.create_rollout(
                 query_id=query_id,
                 trial_id=trial_id,
                 instance=row,
                 traces=traces,
                 reward=reward,
-                **({"sampling_params": sampling_params, "config": dict(self.config)} if self.remote_recording else {}),
                 status="completed",
                 metadata={
                     "weight_version": next(
@@ -205,7 +276,9 @@ class AvaCoreRollout:
             self.failed_writes += 1
             if self.failed_writes in (1, 10, 100) or self.failed_writes % 1000 == 0:
                 logger.warning(
-                    "Recording rollouts to Postgres failed %d times; last error: %r", self.failed_writes, error
+                    "Recording rollouts to Postgres failed %d times; last error: %r",
+                    self.failed_writes,
+                    error,
                 )
 
 
@@ -279,13 +352,14 @@ def filled(
         versioning = ("weight_version", "weight_versions")
         sample.update_from_meta_info(args, {k: v for k, v in message.metadata.items() if k not in versioning})
         sample.weight_versions[-1] = WeightVersionsPerCall.from_meta_info(
-            message.metadata | {"output_token_logprobs": [None] * (end - start)}, output_end=end
+            message.metadata | {"output_token_logprobs": [None] * (end - start)},
+            output_end=end,
         )
     if args.use_rollout_routing_replay and sample.status != Sample.Status.ABORTED:
         chunks = [s.metadata["routed_experts"] for s in segments if "routed_experts" in s.metadata]
-        assert chunks, (
-            "Internal error: routing replay enabled but no routed experts returned. Perhaps some traces are not generated by the configured generate function."
-        )
+        assert (
+            chunks
+        ), "Internal error: routing replay enabled but no routed experts returned. Perhaps some traces are not generated by the configured generate function."
         routed = np.frombuffer(b"".join(pybase64.b64decode(chunk) for chunk in chunks), dtype=np.int32)
         row = args.num_layers * args.moe_router_topk
         if routed.size == length * row:
@@ -331,7 +405,10 @@ def _with_sampling_metadata(args: Namespace, sample: Sample, segments, messages)
                 else segment.log_probs
             )
             append_rollout_topk_logprobs(
-                result, meta | {"output_token_logprobs": segment.log_probs}, k, sampling_logprobs_mode=mode
+                result,
+                meta | {"output_token_logprobs": segment.log_probs},
+                k,
+                sampling_logprobs_mode=mode,
             )
         else:
             if support:
