@@ -30,7 +30,9 @@ def training_images(segments: list[ChatSegment]) -> dict[str, torch.Tensor] | No
         }
         if not block or any(not isinstance(value, torch.Tensor) for value in block.values()):
             raise ValueError("Vision processor must return tensor training inputs")
-        blocks.append(block)
+        blocks.append(
+            {key: value.to(torch.bfloat16) if value.is_floating_point() else value for key, value in block.items()}
+        )
     if not blocks:
         return None
     if any(block.keys() != blocks[0].keys() for block in blocks):
