@@ -17,6 +17,7 @@ from ava_core.core import Schema, Trace
 from ava_core.core.trace import iter_trace_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
+from ava_core.generate.remote_generate import RemoteGenerate
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import Reward
 from ava_core.runner import RECOVERABLE_ERRORS
@@ -48,6 +49,12 @@ class AvaCoreRollout:
         self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
         self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
+        self.remote_recording = self.recording is not None and self.config["generate"]["kind"] == "remote"
+        if self.remote_recording:
+            if self.config["reward"]["kind"] != "remote_reward":
+                raise ValueError("Remote recording requires remote generation and reward")
+            if not self.config["generate"].get("recording"):
+                raise ValueError("Remote recording requires a CPU session recording identity")
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
         self.writes: set[asyncio.Task[None]] = set()
@@ -161,15 +168,21 @@ class AvaCoreRollout:
             n = self.args.n_samples_per_prompt
             query_id = str(sample.metadata["_index"])
             trial_id = sample.epoch * n + sample.index % n
-            if self.run is None:
-                self.run = asyncio.create_task(self.open(sampling_params))
-            run = await self.run
-            await run.create_rollout(
+            if self.remote_recording:
+                assert isinstance(self.generate_fn, RemoteGenerate)
+                create_rollout = self.generate_fn.record
+            else:
+                if self.run is None:
+                    self.run = asyncio.create_task(self.open(sampling_params))
+                run = await self.run
+                create_rollout = run.create_rollout
+            await create_rollout(
                 query_id=query_id,
                 trial_id=trial_id,
                 instance=row,
                 traces=traces,
                 reward=reward,
+                **({"sampling_params": sampling_params, "config": dict(self.config)} if self.remote_recording else {}),
                 status="completed",
                 metadata={
                     "weight_version": next(
