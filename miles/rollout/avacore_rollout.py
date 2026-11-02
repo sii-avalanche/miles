@@ -10,6 +10,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any
 
+import httpx
 import numpy as np
 import pybase64
 from psycopg import Error as PostgresError
@@ -19,6 +20,7 @@ from ava_core.core import Schema, Trace
 from ava_core.core.trace import iter_trace_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
+from ava_core.generate.remote_generate import RemoteGenerate
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import Reward
 from ava_core.runner import RECOVERABLE_ERRORS, Retry
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 _CANDIDATE_SLOT = "_group_oversampling_candidate_slot"
 _CANDIDATE_WIDTH = "_group_oversampling_candidate_width"
 _RECORDING_RETRY_SECONDS = 900.0
-_RECORDING_RETRY_ERRORS = (PostgresError, PoolTimeout)
+_RECORDING_RETRY_ERRORS = (PostgresError, PoolTimeout, httpx.HTTPError)
 
 
 @dataclass(frozen=True)
@@ -102,8 +104,6 @@ class AvaCoreRollout:
                 raise ValueError("Remote recording requires remote generation and reward")
             if not self.config["generate"].get("recording"):
                 raise ValueError("Remote recording requires a CPU session recording identity")
-            # The CPU service owns persistence; GPU workers must not write to PostgreSQL.
-            self.recording = None
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
         self.writes: set[asyncio.Task[None]] = set()
@@ -120,15 +120,6 @@ class AvaCoreRollout:
         }
         row = Row({**metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
-        if self.remote_recording:
-            replay["recording"] = {
-                "query_id": str(sample.metadata.get("_index", sample.index)),
-                "epoch": sample.epoch,
-                "group_index": sample.group_index,
-                "sample_index": sample.index,
-                "evaluation": evaluation,
-                "generation_attempt": getattr(sample, "generation_attempt", None),
-            }
         if getattr(self.args, "rollout_top_logprobs_num", 0) and not evaluation:
             request = {"sampling_params": dict(sampling_params)}
             configure_rollout_topk_logprobs_request(self.args, request)
@@ -258,16 +249,6 @@ class AvaCoreRollout:
         reward: Reward,
         sampling_params: dict[str, Any],
     ) -> None:
-        if self.run is None:
-            self.run = asyncio.create_task(self.open(sampling_params))
-        opening = self.run
-        try:
-            run = await asyncio.shield(opening)
-        except _RECORDING_RETRY_ERRORS:
-            if self.run is opening:
-                self.run = None
-            raise
-
         assert sample.epoch is not None and sample.index is not None
         n = self.args.n_samples_per_prompt
         query_id = str(sample.metadata["_index"])
@@ -286,12 +267,29 @@ class AvaCoreRollout:
             metadata |= {_CANDIDATE_SLOT: int(slot), _CANDIDATE_WIDTH: width}
         else:
             trial_id = sample.epoch * n + sample.index % n
-        await run.create_rollout(
+        if self.remote_recording:
+            assert isinstance(self.generate_fn, RemoteGenerate)
+            create_rollout = self.generate_fn.record
+            extra = {"sampling_params": sampling_params, "config": dict(self.config)}
+        else:
+            if self.run is None:
+                self.run = asyncio.create_task(self.open(sampling_params))
+            opening = self.run
+            try:
+                run = await asyncio.shield(opening)
+            except _RECORDING_RETRY_ERRORS:
+                if self.run is opening:
+                    self.run = None
+                raise
+            create_rollout = run.create_rollout
+            extra = {}
+        await create_rollout(
             query_id=query_id,
             trial_id=trial_id,
             instance=row,
             traces=traces,
             reward=reward,
+            **extra,
             status="completed",
             metadata=metadata,
         )
