@@ -48,6 +48,14 @@ class AvaCoreRollout:
         self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
         self.reward_fn = conv.structure(interpolated(self.config["reward"]), RewardFunction)
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
+        self.remote_recording = self.recording is not None and self.config["generate"]["kind"] == "remote"
+        if self.remote_recording:
+            if self.config["reward"]["kind"] != "remote_reward":
+                raise ValueError("Remote recording requires remote generation and reward")
+            if not self.config["generate"].get("recording"):
+                raise ValueError("Remote recording requires a CPU session recording identity")
+            # The CPU service owns persistence; GPU workers must not write to PostgreSQL.
+            self.recording = None
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
         self.writes: set[asyncio.Task[None]] = set()
@@ -58,6 +66,15 @@ class AvaCoreRollout:
     ) -> list[Sample]:
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
+        if self.remote_recording:
+            replay["recording"] = {
+                "query_id": str(sample.metadata.get("_index", sample.index)),
+                "epoch": sample.epoch,
+                "group_index": sample.group_index,
+                "sample_index": sample.index,
+                "evaluation": evaluation,
+                "generation_attempt": getattr(sample, "generation_attempt", None),
+            }
         if getattr(self.args, "rollout_top_logprobs_num", 0) and not evaluation:
             request = {"sampling_params": dict(sampling_params)}
             configure_rollout_topk_logprobs_request(self.args, request)
