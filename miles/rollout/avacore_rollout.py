@@ -17,6 +17,7 @@ from ava_core.core import Schema, Trace
 from ava_core.core.trace import iter_trace_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
+from ava_core.generate.remote_generate import RemoteGenerate
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import Reward
 from ava_core.runner import RECOVERABLE_ERRORS
@@ -54,8 +55,6 @@ class AvaCoreRollout:
                 raise ValueError("Remote recording requires remote generation and reward")
             if not self.config["generate"].get("recording"):
                 raise ValueError("Remote recording requires a CPU session recording identity")
-            # The CPU service owns persistence; GPU workers must not write to PostgreSQL.
-            self.recording = None
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
         self.writes: set[asyncio.Task[None]] = set()
@@ -66,15 +65,6 @@ class AvaCoreRollout:
     ) -> list[Sample]:
         row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
-        if self.remote_recording:
-            replay["recording"] = {
-                "query_id": str(sample.metadata.get("_index", sample.index)),
-                "epoch": sample.epoch,
-                "group_index": sample.group_index,
-                "sample_index": sample.index,
-                "evaluation": evaluation,
-                "generation_attempt": getattr(sample, "generation_attempt", None),
-            }
         if getattr(self.args, "rollout_top_logprobs_num", 0) and not evaluation:
             request = {"sampling_params": dict(sampling_params)}
             configure_rollout_topk_logprobs_request(self.args, request)
@@ -178,15 +168,21 @@ class AvaCoreRollout:
             n = self.args.n_samples_per_prompt
             query_id = str(sample.metadata["_index"])
             trial_id = sample.epoch * n + sample.index % n
-            if self.run is None:
-                self.run = asyncio.create_task(self.open(sampling_params))
-            run = await self.run
-            await run.create_rollout(
+            if self.remote_recording:
+                assert isinstance(self.generate_fn, RemoteGenerate)
+                create_rollout = self.generate_fn.record
+            else:
+                if self.run is None:
+                    self.run = asyncio.create_task(self.open(sampling_params))
+                run = await self.run
+                create_rollout = run.create_rollout
+            await create_rollout(
                 query_id=query_id,
                 trial_id=trial_id,
                 instance=row,
                 traces=traces,
                 reward=reward,
+                **({"sampling_params": sampling_params, "config": dict(self.config)} if self.remote_recording else {}),
                 status="completed",
                 metadata={
                     "weight_version": next(
