@@ -49,7 +49,7 @@ def test_identity_restoration_is_stable_when_candidates_alias_originals():
     assert [sample.index for sample in selected] == [0, 1, 2]
 
 
-async def test_group_failure_observes_every_candidate_task(monkeypatch):
+async def test_group_failure_observes_every_candidate_exception(caplog):
     ready = asyncio.Event()
     calls = 0
 
@@ -61,19 +61,36 @@ async def test_group_failure_observes_every_candidate_task(monkeypatch):
         await ready.wait()
         raise RuntimeError("candidate failed")
 
-    observed = set()
-
-    async def settle(tasks):
-        observed.update(tasks)
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    monkeypatch.setattr(common, "_cancel_and_settle", settle)
     group = [Sample(group_index=0, index=1), Sample(group_index=0, index=2)]
 
-    with pytest.raises(RuntimeError, match="candidate failed"):
+    with pytest.raises(common.GroupOversamplingExhaustedError, match="3 candidate errors"):
         await common.generate_and_rm_group(make_state(generate), group, sampling_params={})
 
-    assert len(observed) == 3
+    assert calls == 3
+    assert sum("Oversampling candidate=" in record.message for record in caplog.records) == 3
+
+
+async def test_candidate_exception_is_absorbed_when_enough_candidates_succeed():
+    calls = 0
+
+    async def generate(input):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("one sandbox failed")
+        input.sample.status = Sample.Status.COMPLETED
+        input.sample.reward = 1
+        return GenerateFnOutput(samples=input.sample)
+
+    state = make_state(generate)
+    state.args.group_oversampling_extra = 2
+    group = [Sample(group_index=0, index=index) for index in range(4)]
+
+    result = await common.generate_and_rm_group(state, group, sampling_params={})
+
+    assert len(result) == 4
+    assert all(sample.status == Sample.Status.COMPLETED for sample in result)
+    assert calls == 6
 
 
 async def test_parent_cancellation_waits_for_surplus_cleanup_to_finish():

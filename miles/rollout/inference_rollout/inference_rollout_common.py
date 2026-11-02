@@ -199,11 +199,23 @@ async def generate_and_rm_group(
     order = {task: index for index, task in enumerate(tasks)}
     usable: list[Sample | list[Sample]] = []
     unusable: list[Sample | list[Sample]] = []
+    error_count = 0
     try:
         while pending and len(usable) < target_size:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in sorted(done, key=order.__getitem__):
-                result = task.result()
+                try:
+                    result = task.result()
+                except Exception as error:
+                    error_count += 1
+                    logger.warning(
+                        "%s Oversampling candidate=%d failed: %s: %s",
+                        log_prefix,
+                        order[task],
+                        type(error).__name__,
+                        error,
+                    )
+                    continue
                 (usable if _usable_candidate(result) else unusable).append(result)
     except BaseException:
         await _cancel_and_settle(set(tasks))
@@ -222,18 +234,19 @@ async def generate_and_rm_group(
             return partial_group
         raise GroupOversamplingExhaustedError(
             f"group oversampling exhausted with only {len(usable)}/{target_size} usable candidates "
-            f"from {len(candidates)} attempts"
+            f"from {len(candidates)} attempts ({len(unusable)} unusable, {error_count} candidate errors)"
         )
     selected = usable[:target_size]
     _restore_group_identities(selected, group)
     if len(candidates) > target_size:
         logger.info(
-            "%s Oversampling target=%d candidates=%d usable=%d unusable=%d cancelled=%d",
+            "%s Oversampling target=%d candidates=%d usable=%d unusable=%d errors=%d cancelled=%d",
             log_prefix,
             target_size,
             len(candidates),
             len(usable),
             len(unusable),
+            error_count,
             cancelled,
         )
     group = selected

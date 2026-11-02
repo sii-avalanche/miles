@@ -343,6 +343,44 @@ async def test_group_oversampling_exhaustion_does_not_stop_worker(monkeypatch):
     assert calls >= 6
 
 
+async def test_candidate_exception_does_not_stop_worker(monkeypatch):
+    calls = 0
+
+    async def generate_sample(state, sample, sampling_params, evaluation=False):
+        nonlocal calls
+        slot = calls
+        calls += 1
+        await asyncio.sleep(0)
+        if slot == 0:
+            raise RuntimeError("one sandbox failed")
+        sample.reward = 1
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    monkeypatch.setattr(rollout_common, "generate_and_rm", generate_sample)
+    monkeypatch.setattr(rollout_common, "policy_uses_routing_key", lambda args: False)
+    fn = make_fn(
+        monkeypatch,
+        make_args(
+            rollout_batch_size=1,
+            group_oversampling_extra=1,
+            async_max_concurrent_samples=3,
+            rollout_submission_granularity="sample",
+            group_rm=False,
+        ),
+        FakeDataSource(),
+        generate=rollout_common.generate_and_rm_group,
+    )
+
+    output = await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=0)), timeout=2)
+
+    assert not fn._worker.done()
+    assert len(output.samples) == 1
+    assert all(sample.status == Sample.Status.COMPLETED for sample in output.samples[0])
+    following = await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=1)), timeout=2)
+    assert following.samples
+
+
 @pytest.mark.parametrize("handler", ["drop", "retry"])
 @pytest.mark.parametrize("granularity", ["sample", "group"])
 async def test_sample_cancellation_aborts_group_without_stopping_worker(
