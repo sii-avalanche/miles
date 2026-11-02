@@ -197,7 +197,9 @@ class TrackingManager:
             backend.define_step_key_metric_group(prefix, step_key)
 
     def finish(self) -> None:
-        for backend in self._backends:
+        # The dashboard publishes its final HTML before W&B closes its run.
+        # Keep the relative order of all other backends unchanged.
+        for backend in sorted(self._backends, key=lambda backend: not isinstance(backend, MilesDashboardBackend)):
             try:
                 backend.finish()
             except Exception:

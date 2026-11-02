@@ -11,10 +11,12 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
+from collections import Counter, deque
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from miles.backends.megatron_utils.megatron_config import resolve_megatron_config
+from miles.dashboard import hooks as dashboard_hooks
 from miles.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, iter_samples
 from miles.rollout.filter_hub.common_filters import (
     GroupWeightVersionStats,
@@ -66,6 +68,7 @@ def first_sample(group: Group) -> Sample:
 class DataBufferConstructorInput:
     args: Namespace
     unused_handler_fn: Callable[[list[Sample]], None]  # --async-unused-samples-handler, applied to unused groups
+    trainer_model_id: str | None = None
 
 
 @dataclass
@@ -98,6 +101,9 @@ class DataBuffer(ABC):
     @abstractmethod
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
         """Report the metrics of one policy since its previous call (its window counters reset here)."""
+
+    def report_pool(self, event: str, *, trainer_model_id: str | None = None, **details) -> None:
+        """Optional dashboard event; does not change filtering."""
 
 
 # ============================= one policy buffer ==============================
@@ -140,6 +146,12 @@ class DefaultDataBuffer(DataBuffer):
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
         self._cond = asyncio.Condition()
         self._current_version: int | None = None
+        self._dashboard_enabled = getattr(args, "use_miles_dashboard", False)
+        self._trainer_model_id = input.trainer_model_id
+        self._published_version: int | None = None
+        self._queued_versions = deque()
+        self._version_counts = Counter()
+        self._mixed_groups = 0
 
         self._metric_gatherer = MetricGatherer()
         self._metric_aborted_groups = 0
@@ -152,6 +164,21 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_samples = 0
         self._metric_selected_versioned_samples = 0
 
+    def report_pool(self, event: str, *, trainer_model_id: str | None = None, **details) -> None:
+        if event == "weight_published":
+            self._published_version = details.pop("current_version")
+        if self._dashboard_enabled:
+            dashboard_hooks.report_data_buffer(
+                len(self._buffer),
+                capacity=self._capacity,
+                current_version=self._published_version,
+                versions={str(k) if k is not None else "unknown": v for k, v in self._version_counts.items() if v},
+                mixed_groups=self._mixed_groups,
+                trainer_model_id=self._trainer_model_id,
+                event=event,
+                **details,
+            )
+
     async def put(self, input: DataBufferInput) -> None:
         if not self._preput_filter(input):
             return
@@ -160,24 +187,34 @@ class DefaultDataBuffer(DataBuffer):
             while len(self._buffer) >= self._capacity:
                 await self._cond.wait()
             self._buffer.append(input)
+            if self._dashboard_enabled:
+                stats = group_weight_version_stats(input.group)
+                mixed = int(stats.oldest_version != stats.newest_version)
+                self._queued_versions.append((stats.oldest_version, mixed))
+                self._version_counts[stats.oldest_version] += 1
+                self._mixed_groups += mixed
+                self.report_pool("put")
             self._cond.notify_all()
 
     def _preput_filter(self, input: DataBufferInput) -> bool:
         output = apply_aborted_filter(self._args, input.group)
         if not output.keep:
             self._metric_aborted_groups += 1
+            self.report_pool("reject", reason="aborted")
             self._unused_handler_fn(input.prompt_group)
             return False
 
         output = apply_missing_reward_filter(self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            self.report_pool("reject", reason=output.reason)
             return False
 
         self._metric_gatherer.on_group_before_dynamic_filter(self._args, input.group)
         output = call_dynamic_filter(self._dynamic_filter, self._args, input.group)
         if not output.keep:
             self._metric_gatherer.on_dynamic_filter_drop(reason=output.reason)
+            self.report_pool("reject", reason=output.reason)
             return False
         return True
 
@@ -189,6 +226,13 @@ class DefaultDataBuffer(DataBuffer):
                 while not self._buffer:
                     await self._cond.wait()
                 entry = self._buffer.pop(0)
+                if self._dashboard_enabled:
+                    version, mixed = self._queued_versions.popleft()
+                    self._version_counts[version] -= 1
+                    if not self._version_counts[version]:
+                        del self._version_counts[version]
+                    self._mixed_groups -= mixed
+                    self.report_pool("get")
                 self._cond.notify_all()  # wake producers blocked on a full buffer
 
                 version_stats = group_weight_version_stats(entry.group)
@@ -197,6 +241,7 @@ class DefaultDataBuffer(DataBuffer):
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
                         logger.info(f"Filtered stale group ({staleness=} > max={self._args.max_weight_staleness})")
                         self._metric_stale_groups += 1
+                        self.report_pool("reject", reason="stale")
                         self._unused_handler_fn(entry.prompt_group)
                         continue
                     self._metric_consumed_staleness.append(staleness)
@@ -285,7 +330,10 @@ class DefaultMultiDataBuffer(DataBuffer):
             f"({sorted(model_ids)})"
         )
         self._inners: dict[str, DataBuffer] = {
-            model_id: (load_function(paths.get(model_id)) or DefaultDataBuffer)(input) for model_id in model_ids
+            model_id: (load_function(paths.get(model_id)) or DefaultDataBuffer)(
+                replace(input, trainer_model_id=model_id)
+            )
+            for model_id in model_ids
         }
 
     async def put(self, input: DataBufferInput) -> None:
@@ -298,6 +346,9 @@ class DefaultMultiDataBuffer(DataBuffer):
 
     def get_metrics(self, trainer_model_id: str | None = None) -> dict[str, float]:
         return self._inner_of(trainer_model_id).get_metrics(trainer_model_id=trainer_model_id)
+
+    def report_pool(self, event: str, *, trainer_model_id: str | None = None, **details) -> None:
+        self._inner_of(trainer_model_id).report_pool(event, trainer_model_id=trainer_model_id, **details)
 
     def _inner_of(self, trainer_model_id: str | None) -> DataBuffer:
         assert trainer_model_id in self._inners, (

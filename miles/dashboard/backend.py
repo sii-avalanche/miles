@@ -37,12 +37,13 @@ GET_ACTOR_INTERVAL_SECONDS = 2.0
 
 _handle = None
 _is_primary = False
+_publisher = None
 _resolution_failed = False
 _warner = RateLimitedWarner(logger)
 
 
 def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None, **kwargs) -> None:
-    global _handle, _is_primary
+    global _handle, _is_primary, _publisher
     import ray
 
     if primary:
@@ -68,6 +69,10 @@ def init_dashboard(args, *, primary: bool = True, router_addr: str | None = None
         )
         ray.get(_handle.ping.remote())
         _handle.start.remote()
+        if getattr(args, "use_wandb", False):
+            from miles.dashboard.report import ReportPublisher
+
+            _publisher = ReportPublisher(config.dashboard_dir)
         logger.info(
             "miles dashboard: telemetry -> %s | view live: python -m miles.dashboard.serve "
             "--dump-details %s --follow --port 7788",
@@ -129,7 +134,7 @@ def dashboard_log(metrics: dict, *, step: int | None = None, step_key: str | Non
 
 
 def finish_dashboard() -> None:
-    global _handle, _is_primary, _resolution_failed
+    global _handle, _is_primary, _publisher, _resolution_failed
     hooks.detach_and_flush()
     if _handle is not None and _is_primary:
         import ray
@@ -139,6 +144,10 @@ def finish_dashboard() -> None:
             ray.get(_handle.shutdown.remote(), timeout=30)
         except Exception:
             logger.warning("dashboard collector shutdown incomplete", exc_info=True)
+        if _publisher is not None:
+            # shutdown() flushed the native store; W&B is still open here.
+            _publisher.close()
+            _publisher = None
         ray.kill(_handle)
     _handle = None
     _is_primary = False

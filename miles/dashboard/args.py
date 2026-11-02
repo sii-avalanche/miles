@@ -27,6 +27,7 @@ _SNAPSHOT_KEYS = (
     "rollout_max_response_len",
     "hf_checkpoint",
     "sglang_max_running_requests",
+    "dashboard_sglang_scrape_interval",
     "sglang_mem_fraction_static",
     "sglang_load_balance_method",
     "use_miles_router",
