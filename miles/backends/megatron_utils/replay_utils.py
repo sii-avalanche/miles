@@ -1,24 +1,27 @@
-from megatron.core.transformer.transformer_block import get_num_layers_to_build
+import logging
+import re
+
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+logger = logging.getLogger(__name__)
+
+_DECODER_LAYER = re.compile(r"(?:^|\.)decoder\.layers\.(\d+)\.")
 
 
 def register_replay_list_moe(replay_list, replay_data, *, models, **_kwargs):
-    """Map replay streams to Megatron MoE layers using the local model layout."""
-    layer_indices = []
-    for vp_stage, model in enumerate(models):
-        config = model.module.config
-        num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
-        offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
-        for layer_id in range(offset, offset + num_layers_to_build):
-            if isinstance(config.moe_layer_freq, int):
-                if layer_id % config.moe_layer_freq != 0:
-                    continue
-            elif isinstance(config.moe_layer_freq, list):
-                assert len(config.moe_layer_freq) == config.num_layers
-                if config.moe_layer_freq[layer_id] == 0:
-                    continue
-            layer_indices.append(layer_id)
-
-    for replay_idx, layer_idx in enumerate(layer_indices):
-        layer_data = replay_data[:, layer_idx]
-        replay_list[replay_idx].record(layer_data)
+    """Give each main-decoder router the replay stream of its own global layer."""
+    routers = [
+        (
+            get_transformer_layer_offset(model.module.config, vp_stage=vp_stage) + int(found.group(1)),
+            module.routing_replay,
+        )
+        for vp_stage, model in enumerate(models)
+        for name, module in model.named_modules()
+        if getattr(module, "routing_replay", None) is not None
+        and "vision_model" not in name
+        and (found := _DECODER_LAYER.search(name)) is not None
+    ]
+    if len(routers) != len(replay_list):
+        logger.warning("%d decoder routers among %d registered replays", len(routers), len(replay_list))
+    for layer_idx, replay in routers:
+        replay.record(replay_data[:, layer_idx])

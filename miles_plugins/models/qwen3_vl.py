@@ -99,7 +99,7 @@ def _patch_model_forward_and_rope_index() -> None:
 
     Qwen3VLModel = getattr(model_mod, "Qwen3VLModel", None)
     # The bridge selects CP-local vision embeds natively; warn when running an old one.
-    if Qwen3VLModel is not None and not hasattr(Qwen3VLModel, "_cp_local_vision_embed_indices"):
+    if Qwen3VLModel is not None and not hasattr(model_mod, "_get_cp_local_vision_embed_indices"):
         logger.warning(
             "megatron-bridge Qwen3VLModel lacks native CP-local vision-embed selection; "
             "CP runs with vision tokens will mis-place vision embeddings. "
@@ -120,6 +120,7 @@ def _patch_model_forward_and_rope_index() -> None:
             _tls.packed_positions = packed
         if ctx is not None:
             _tls.cp_local = ctx
+            kwargs["position_ids"] = packed
         try:
             return orig_forward(self, *args, **kwargs)
         finally:

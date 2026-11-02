@@ -432,7 +432,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 )
             for component in ("model", "projection"):
                 parser.add_argument(
-                    f"--vision-{component}-modules", nargs="+", default=None,
+                    f"--vision-{component}-modules",
+                    nargs="+",
+                    default=None,
                     help="Exact module paths on the Megatron model; supply both vision path lists to override Bridge.",
                 )
             parser.add_argument(
