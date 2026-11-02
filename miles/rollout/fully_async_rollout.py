@@ -82,6 +82,12 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         self._producer_resumed = asyncio.Event()
         self._producer_resumed.set()
         self._output: DataBuffer | None = None
+        self._published_versions: dict[str | None, int] = {}
+
+    def set_weight_version(self, version: int, trainer_model_id: str | None = None) -> None:
+        self._published_versions[trainer_model_id] = version
+        if self._output is not None:
+            self._output.report_pool("weight_published", current_version=version, trainer_model_id=trainer_model_id)
 
     async def __call__(self, input: RolloutFnInput) -> RolloutFnOutput:
         if input.evaluation:
@@ -94,6 +100,8 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             self._output = buffer_cls(
                 DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
             )
+            for model_id, version in self._published_versions.items():
+                self._output.report_pool("weight_published", current_version=version, trainer_model_id=model_id)
             self._worker = asyncio.create_task(self._worker_loop())
             logger.info("Started fully-async rollout worker")
         return await self._drain(input)
@@ -232,6 +240,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         if self._sample_filter is not None:
             self._sample_filter(args, data)
 
+        self._output.report_pool("batch_ready", rollout_id=input.rollout_id, trainer_model_id=input.trainer_model_id)
         return RolloutFnTrainOutput(samples=data, metrics=self._output.get_metrics(input.trainer_model_id))
 
     def _recycle(self, prompt_group: list[Sample]) -> None:
