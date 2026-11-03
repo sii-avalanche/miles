@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 from miles.rollout.data_source import DataSource
 from miles.utils.types import Sample
 
+from collections.abc import Callable
+
 if TYPE_CHECKING:
     from miles.rollout import sglang_rollout
     from miles.rollout.inference_rollout.inference_rollout_common import GenerateState
@@ -36,6 +38,8 @@ class RolloutFnTrainInput(RolloutFnBaseInput):
     weight_version: int | None = None
     # which policy model asked for this rollout; None when the run trains one policy
     trainer_model_id: str | None = None
+    # Called only for a complete, accepted GRPO group; never for partial samples.
+    on_group_ready: Callable[[list[Sample]], None] | None = None
 
     @property
     def evaluation(self):

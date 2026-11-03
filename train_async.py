@@ -16,6 +16,7 @@ from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controll
 from miles.utils.misc import should_run_periodic_action
 from miles.utils.orchestration_utils import init_orchestration_script
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +64,8 @@ async def train(args, *, disposer: Disposer):
             await model.offload()
 
     async def prepare_and_generate(rollout_id):
+        if args.streaming_group_packing:
+            await rollout_executor.wait_for_group_producer()
         await inference_controller.prepare_rollout(rollout_id)
         return await rollout_executor.get(rollout_id)
 
@@ -100,6 +103,10 @@ async def train(args, *, disposer: Disposer):
             rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
         ):
             force_sync = external_save or rollout_id == args.num_rollout - 1
+            if args.streaming_group_packing:
+                if rollout_data_next_future is not None:
+                    await rollout_data_next_future
+                await rollout_executor.wait_for_group_producer()
             await save_training_model(actor_model, rollout_id, force_sync)
             if args.use_critic:
                 await save_training_model(critic_model, rollout_id, force_sync)
@@ -112,11 +119,19 @@ async def train(args, *, disposer: Disposer):
                 # sync generate before update weights to prevent update weight in the middle of generation
                 rollout_data_curr_ref = (await x) if (x := rollout_data_next_future) is not None else None
                 rollout_data_next_future = None
+            if args.streaming_group_packing:
+                # get() returns at the FIRST group. Keep native policy-version
+                # boundaries: never publish weights into unfinished generation.
+                await rollout_executor.wait_for_group_producer()
             await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
             if defer_next_drain:
                 rollout_data_next_future = await eager_create_task(prepare_and_generate(rollout_id + 1))
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
+            if args.streaming_group_packing:
+                if rollout_data_next_future is not None:
+                    await rollout_data_next_future
+                await rollout_executor.wait_for_group_producer()
             await inference_controller.prepare_eval()
             await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
 
