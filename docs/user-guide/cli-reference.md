@@ -43,6 +43,7 @@ rollout_batch_size × n_samples_per_prompt
 |---|---|---|
 | `--rollout-batch-size` | `16 – 256` | Prompts per rollout. |
 | `--n-samples-per-prompt` | `4 – 16` | Responses per prompt (GRPO group size). |
+| `--group-oversampling-extra` | `0` | Extra candidates launched eagerly per prompt; retain the original group size and cancel surplus work. |
 | `--global-batch-size` | derived | Samples per optimizer step. |
 | `--num-steps-per-rollout` | `1` | Optimizer steps per rollout. |
 | `--num-rollout` | `1000 – 10000` | Total rollout iterations. |
@@ -178,6 +179,7 @@ Sections mirror the launch-script argument groups.
 | `--num-rollout` | int | – | Total rollout iterations. If unset, derived from dataset size. |
 | `--rollout-batch-size` | int | – | Prompts per rollout. |
 | `--n-samples-per-prompt` | int | `1` | Responses per prompt. |
+| `--group-oversampling-extra` | int | `0` | Extra eager candidates per training prompt group. They count toward rollout concurrency but not the retained training batch. Requires the class-based rollout API. |
 | `--global-batch-size` | int | derived | Samples per optimizer step. |
 | `--num-steps-per-rollout` | int | – | Optimizer steps per rollout. Alternative to `--global-batch-size`; setting one derives the other. |
 | `--over-sampling-batch-size` | int | – | Oversample size for dynamic sampling (DAPO). |

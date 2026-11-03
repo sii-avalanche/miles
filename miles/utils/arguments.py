@@ -20,6 +20,7 @@ from miles.backends.sglang_utils.arguments import validate_args as sglang_valida
 from miles.dashboard.args import add_dashboard_arguments, validate_dashboard_args
 from miles.ray.specs.train import compute_trainer_ids, external_trainer_controller_addrs
 from miles.rollout.checkpoint_eval import is_checkpoint_eval_fn
+from miles.rollout.submission_scheduler import candidate_group_size
 from miles.utils.audit_utils.event_logger.logger import EVENTS_DIRNAME
 from miles.utils.chat_template_utils.tito_tokenizer import TITOTokenizerType
 from miles.utils.env_report.launcher_report import LAUNCHER_REPORT_ENV_VAR
@@ -842,6 +843,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "the sampling granularity is always determined by this value. "
                     "If this value is None, rollout_batch_size will be used as the default over_sampling_batch_size."
                 ),
+            )
+            parser.add_argument(
+                "--group-oversampling-extra",
+                type=int,
+                default=0,
+                help="Extra training candidates per prompt group; keep the first usable group.",
             )
             parser.add_argument(
                 "--dynamic-sampling-filter-path",
@@ -3874,11 +3881,17 @@ def miles_validate_args(args):
         )
 
     if args.async_max_concurrent_samples is not None:
-        assert args.async_max_concurrent_samples >= args.n_samples_per_prompt, (
+        live_group_size = candidate_group_size(args.n_samples_per_prompt, args.group_oversampling_extra)
+        assert args.async_max_concurrent_samples >= live_group_size, (
             f"--async-max-concurrent-samples ({args.async_max_concurrent_samples}) must be at least "
-            f"--n-samples-per-prompt ({args.n_samples_per_prompt}): the worker submits whole groups, "
-            f"so one group already puts n_samples_per_prompt trajectories in flight"
+            f"the effective group size ({live_group_size}): the worker submits whole groups, "
+            "including their eager oversampling candidates"
         )
+
+    assert args.group_oversampling_extra >= 0, "--group-oversampling-extra must be non-negative"
+    assert not args.group_oversampling_extra or not use_legacy_rollout_v1(), (
+        "--group-oversampling-extra requires the class-based rollout API; " "unset MILES_USE_LEGACY_ROLLOUT_V1"
+    )
 
     _resolve_rollout_functions(args)
 

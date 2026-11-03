@@ -37,6 +37,9 @@ __all__ = ["AvaCoreRollout", "generate"]
 
 logger = logging.getLogger(__name__)
 
+_CANDIDATE_SLOT = "_group_oversampling_candidate_slot"
+_CANDIDATE_WIDTH = "_group_oversampling_candidate_width"
+
 
 class AvaCoreRollout:
     def __init__(self, args: Namespace, config: Mapping[str, Any]) -> None:
@@ -56,7 +59,11 @@ class AvaCoreRollout:
     async def generate(
         self, sample: Sample, sampling_params: dict[str, Any], *, evaluation: bool = False
     ) -> list[Sample]:
-        row = Row({**sample.metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: sample.index)
+        metadata = {
+            key: value for key, value in sample.metadata.items() if key not in {_CANDIDATE_SLOT, _CANDIDATE_WIDTH}
+        }
+        row_key = sample.metadata.get("_index", sample.index)
+        row = Row({**metadata, "prompt": sample.prompt, "label": sample.label}, key=lambda _: row_key)
         replay = {"return_routed_experts": True} if self.args.use_rollout_routing_replay else {}
         if getattr(self.args, "rollout_top_logprobs_num", 0) and not evaluation:
             request = {"sampling_params": dict(sampling_params)}
@@ -154,7 +161,28 @@ class AvaCoreRollout:
             assert sample.epoch is not None and sample.index is not None
             n = self.args.n_samples_per_prompt
             query_id = str(sample.metadata["_index"])
-            trial_id = sample.epoch * n + sample.index % n
+            metadata = {
+                "weight_version": next(
+                    (
+                        node.message.metadata["weight_version"]
+                        for node in reversed(traces[0].prefixes)
+                        if node.generated and "weight_version" in node.message.metadata
+                    ),
+                    None,
+                ),
+                "weight_versions": [
+                    v
+                    for trace in traces
+                    for node in trace.prefixes
+                    if node.generated and (v := node.message.metadata.get("weight_version")) is not None
+                ],
+            }
+            if (slot := sample.metadata.get(_CANDIDATE_SLOT)) is not None:
+                width = int(sample.metadata[_CANDIDATE_WIDTH])
+                trial_id = sample.epoch * width + int(slot)
+                metadata |= {_CANDIDATE_SLOT: int(slot), _CANDIDATE_WIDTH: width}
+            else:
+                trial_id = sample.epoch * n + sample.index % n
             if self.run is None:
                 self.run = asyncio.create_task(self.open(sampling_params))
             run = await self.run
@@ -165,22 +193,7 @@ class AvaCoreRollout:
                 traces=traces,
                 reward=reward,
                 status="completed",
-                metadata={
-                    "weight_version": next(
-                        (
-                            node.message.metadata["weight_version"]
-                            for node in reversed(traces[0].prefixes)
-                            if node.generated and "weight_version" in node.message.metadata
-                        ),
-                        None,
-                    ),
-                    "weight_versions": [
-                        v
-                        for t in traces
-                        for n in t.prefixes
-                        if n.generated and (v := n.message.metadata.get("weight_version")) is not None
-                    ],
-                },
+                metadata=metadata,
             )
         except Exception as error:
             self.failed_writes += 1
