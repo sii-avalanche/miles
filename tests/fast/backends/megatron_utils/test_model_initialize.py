@@ -168,7 +168,7 @@ def _patch_initialize_side_effects(stack: ExitStack) -> None:
 def test_initialize_does_not_step_scheduler_restored_from_checkpoint():
     from miles.backends.megatron_utils.model import LoadCheckpointOutput, initialize_model_and_optimizer
 
-    args = Namespace(use_checkpoint_opt_param_scheduler=True, global_batch_size=8, finetune=False)
+    args = Namespace(use_checkpoint_opt_param_scheduler=True, no_load_optim=False, global_batch_size=8, finetune=False)
     model = [_FakeModelChunk()]
     optimizer = object()
     opt_param_scheduler = MagicMock()
@@ -196,7 +196,7 @@ def test_initialize_does_not_step_scheduler_restored_from_checkpoint():
 def test_initialize_steps_scheduler_when_checkpoint_did_not_restore_it():
     from miles.backends.megatron_utils.model import LoadCheckpointOutput, initialize_model_and_optimizer
 
-    args = Namespace(use_checkpoint_opt_param_scheduler=False, global_batch_size=8, finetune=False)
+    args = Namespace(use_checkpoint_opt_param_scheduler=False, no_load_optim=True, global_batch_size=8, finetune=False)
     model = [_FakeModelChunk()]
     optimizer = object()
     opt_param_scheduler = MagicMock()
@@ -221,6 +221,33 @@ def test_initialize_steps_scheduler_when_checkpoint_did_not_restore_it():
     opt_param_scheduler.step.assert_called_once_with(increment=800)
 
 
+def test_initialize_does_not_double_step_restored_scheduler_with_default_hyperparameters():
+    from miles.backends.megatron_utils.model import initialize_model_and_optimizer
+
+    args = Namespace(use_checkpoint_opt_param_scheduler=False, no_load_optim=False, global_batch_size=256, finetune=False)
+    model = [_FakeModelChunk()]
+    scheduler = MagicMock()
+    scheduler.num_steps = 0
+
+    def load(*args, **kwargs):
+        scheduler.num_steps += 20480
+        return 79, 0, False
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "miles.backends.megatron_utils.model.setup_model_and_optimizer",
+                return_value=(model, object(), scheduler),
+            )
+        )
+        stack.enter_context(patch("miles.backends.megatron_utils.model.load_checkpoint", side_effect=load))
+        _patch_initialize_side_effects(stack)
+        initialize_model_and_optimizer(args)
+
+    assert scheduler.num_steps == 20480
+    scheduler.step.assert_not_called()
+
+
 def _load_model_state_with(
     *, tmp_path: Path, finetune: bool, iteration: int, lora_rank: int = 0
 ) -> "LoadCheckpointOutput":
@@ -238,6 +265,7 @@ def _load_model_state_with(
         return load_model_state(
             Namespace(
                 use_checkpoint_opt_param_scheduler=True,
+                no_load_optim=False,
                 global_batch_size=8,
                 finetune=finetune,
                 lora_rank=lora_rank,
