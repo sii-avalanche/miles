@@ -6,6 +6,7 @@ import torch
 
 from miles.backends.training_utils.data.context_parallel import (
     all_gather_with_cp,
+    get_drgrpo_pgloss_reducer,
     get_local_response_loss_masks,
     get_sum_of_sample_mean,
 )
@@ -309,6 +310,17 @@ def policy_loss_function(
             args.calculate_per_token_loss,
             args.qkv_format,
             max_seq_lens,
+        )
+    elif getattr(args, "rl_algorithm", None) == "dr_grpo" and not args.calculate_per_token_loss:
+        # Explicit custom or per-token settings override the preset's fixed divisor.
+        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        pg_loss_reducer = get_drgrpo_pgloss_reducer(
+            total_lengths,
+            response_lengths,
+            pg_loss_masks,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
+            divisor=args.rollout_max_response_len,
         )
     else:
         pg_loss_reducer = sum_of_sample_mean

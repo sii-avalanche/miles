@@ -333,6 +333,26 @@ def _normalize_rewards_by_rollout(
     return normalized_rewards.tolist()
 
 
+def _penalize_overlong_rewards(args, samples: list[Sample], rewards: list[float]) -> list[float]:
+    """Penalize each rollout's generated length once; siblings share the same shaped reward."""
+    keys = [
+        ("rollout", sample.rollout_id)
+        if sample.rollout_id is not None
+        else ("sample", sample.index if sample.index is not None else i)
+        for i, sample in enumerate(samples)
+    ]
+    lengths = {}
+    for key, sample in zip(keys, samples, strict=True):
+        length = sum(sample.loss_mask) if sample.loss_mask is not None else sample.response_length
+        lengths[key] = lengths.get(key, 0) + length
+    buffer = args.overlong_buffer_length
+    safe_length = args.rollout_max_response_len - buffer
+    return [
+        reward - args.overlong_penalty_strength * min(1.0, max(0.0, (lengths[key] - safe_length) / buffer))
+        for key, reward in zip(keys, rewards, strict=True)
+    ]
+
+
 def _post_process_rewards(
     args,
     samples: list[Sample] | list[list[Sample]],
@@ -343,14 +363,17 @@ def _post_process_rewards(
         return f(args, samples)
 
     raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    rewards = raw_rewards
+    if getattr(args, "overlong_reward_mode", "none") == "soft_penalty":
+        rewards = _penalize_overlong_rewards(args, samples, raw_rewards)
     if (
         args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline", "cispo"]
         and args.rewards_normalization
     ):
-        normalized_rewards = _normalize_rewards_by_rollout(args, samples, raw_rewards, prompt_group_sizes)
+        normalized_rewards = _normalize_rewards_by_rollout(args, samples, rewards, prompt_group_sizes)
         return raw_rewards, normalized_rewards
 
-    return raw_rewards, raw_rewards
+    return raw_rewards, rewards
 
 
 def split_train_data_by_dp(args, data: dict[str, Any], train_parallel_config: dict | None):
