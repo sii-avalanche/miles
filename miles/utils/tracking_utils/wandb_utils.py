@@ -22,7 +22,7 @@ _WORKER_METRICS = {
     """,
     "rollout": """
         raw_reward raw_reward_unfiltered episode_raw_reward rewards response_lengths total_lengths
-        num_training_samples episode_total_response_length/mean group_acceptance_rate
+        num_training_samples group_acceptance_rate
         repetition_frac truncated_ratio group_reward_variance_min group_reward_variance_mean group_reward_variance_max
         zero_std/all_zero_percentage zero_std/all_one_percentage
         log_probs ref_log_probs rollout_log_probs teacher_log_probs entropy correct_entropy
