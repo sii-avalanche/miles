@@ -123,6 +123,12 @@ class WeightUpdater:
     @torch.no_grad()
     def update_weights(self) -> None:
         """Run one weight sync: session frame + base-bucket stream + adapter pushes for LoRA."""
+        retries = getattr(self.args, "update_weight_sync_retries", 0)
+        if retries:
+            # The recovery path depends on the optional broadcast protocol.
+            from miles.backends.training_utils.weight_update.recovery import update_weights_with_retry
+
+            return update_weights_with_retry(self, retries=retries)
         protocol = self.protocol
         if not protocol.begin_sync(self.weight_version + 1, self._iter_base_buckets):
             return

@@ -1093,6 +1093,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--update-weight-sync-retries",
+                type=int,
+                default=0,
+                help=(
+                    "Full sync retries after lost HTTP replies on completed NCCL transfers; "
+                    "non-colocated base-model broadcast with PP=1 only."
+                ),
+            )
+            parser.add_argument(
                 "--update-weight-transfer-mode",
                 choices=["broadcast", "broadcast_packed", "p2p", "disk-delta"],
                 default="broadcast",
@@ -3341,6 +3350,17 @@ def miles_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+
+    retries = getattr(args, "update_weight_sync_retries", 0)
+    if retries < 0:
+        raise ValueError("update_weight_sync_retries must be nonnegative")
+    if retries and (
+        args.update_weight_transfer_mode not in ("broadcast", "broadcast_packed")
+        or args.colocate
+        or getattr(args, "pipeline_model_parallel_size", 1) != 1
+        or getattr(args, "lora_rank", 0) > 0
+    ):
+        raise ValueError("Weight sync retries require non-colocated base-model broadcast with PP=1")
 
     mode = args.update_weight_transfer_mode
     if mode not in ("broadcast", "broadcast_packed", "p2p", "disk-delta"):

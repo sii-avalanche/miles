@@ -333,7 +333,7 @@ class SGLangApiClient:
         return await self._make_request("update_weights_from_disk", payload)
 
     async def init_weights_update_group(
-        self, master_address, master_port, rank_offset, world_size, group_name, backend
+        self, master_address, master_port, rank_offset, world_size, group_name, backend, *, timeout=None
     ):
         return await self._make_request(
             "init_weights_update_group",
@@ -345,17 +345,21 @@ class SGLangApiClient:
                 "group_name": group_name,
                 "backend": backend,
             },
+            **({"timeout": timeout} if timeout is not None else {}),
         )
 
-    async def destroy_weights_update_group(self, group_name):
+    async def destroy_weights_update_group(self, group_name, *, strict=False):
         try:
             return await self._make_request(
                 "destroy_weights_update_group",
                 {
                     "group_name": group_name,
                 },
+                **({"timeout": 60.0} if strict else {}),
             )
         except httpx.HTTPError:
+            if strict:
+                raise
             # catch the case there the engine is just created and does not have the group.
             pass
 
@@ -410,6 +414,10 @@ class SGLangApiClient:
         """Open a weight-update session on the engine. sync_base=False declares an
         adapter-only session (no quant unpack; base tensors rejected)."""
         return await self._make_request("begin_weight_update", {"selector": selector, "sync_base": sync_base})
+
+    async def abort_weight_update(self):
+        """Close an incomplete session without publishing its pending version."""
+        return await self._make_request("end_weight_update", {"abort": True}, timeout=60.0)
 
     async def end_weight_update(self, expected_lora_checksums=None):
         """Close the weight-update session: re-finalize base weights (sync_base

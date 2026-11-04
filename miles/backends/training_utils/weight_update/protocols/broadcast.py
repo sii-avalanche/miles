@@ -3,7 +3,9 @@ from argparse import Namespace
 from collections.abc import Sequence
 from concurrent.futures import Future
 from contextlib import AbstractContextManager, nullcontext
+from datetime import timedelta
 
+import httpx
 import ray
 import torch
 import torch.distributed as dist
@@ -16,6 +18,10 @@ from miles.backends.training_utils.weight_update.utils import get_data_replica_r
 from miles.utils import async_utils
 from miles.utils.distributed_lock import create_world_ticket_lock
 from miles.utils.distributed_utils import init_process_group
+
+
+class WeightSyncResponseError(RuntimeError):
+    """All NCCL sends completed, but one or more HTTP replies were lost."""
 
 
 class UpdateWeightFromDistributed(WeightTransferProtocol):
@@ -68,6 +74,21 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
                 self.args, self.group_name, rollout_engines, engine_gpu_counts=engine_gpu_counts
             )
 
+    def recover_connection(self) -> None:
+        """Recreate the completed transfer group while engines remain paused."""
+        if self.is_sender:
+            disconnect_rollout_engines_from_distributed(
+                self.args, self.group_name, self._model_update_groups, self.rollout_engines, strict=True
+            )
+            self._model_update_groups = None
+            self._model_update_groups = connect_rollout_engines_from_distributed(
+                self.args,
+                self.group_name,
+                self.rollout_engines,
+                engine_gpu_counts=self._engine_gpu_counts,
+                timeout=60.0,
+            )
+
     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None:
         """Lock → broadcast → clear → unlock. Lock prevents NCCL deadlock."""
         with self._engine_lock:
@@ -79,7 +100,25 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
                 selector=self._selector,
                 transfer_mode=getattr(self.args, "update_weight_transfer_mode", "broadcast"),
             )
-            async_utils.wait_futures(futures)
+            if getattr(self.args, "update_weight_sync_retries", 0):
+                # Work.wait() can only order CUDA streams. Confirm the sends have
+                # actually completed before treating a lost reply as recoverable.
+                torch.cuda.current_stream().synchronize()
+                # Every future must settle before replacing either HTTP or NCCL connections.
+                errors = []
+                for future in futures:
+                    try:
+                        result = future.result()
+                        if isinstance(result, dict) and result.get("success") is False:
+                            raise RuntimeError(f"Weight receiver rejected bucket: {result}")
+                    except Exception as error:
+                        errors.append(error)
+                if errors:
+                    if all(isinstance(error, httpx.ReadError) for error in errors):
+                        raise WeightSyncResponseError("Lost reply after completed NCCL transfer") from errors[0]
+                    raise next(error for error in errors if not isinstance(error, httpx.ReadError))
+            else:
+                async_utils.wait_futures(futures)
             bucket.clear()
 
 
@@ -88,6 +127,7 @@ def connect_rollout_engines_from_distributed(
     group_name: str,
     rollout_engines: Sequence[SGLangApiClient],
     engine_gpu_counts: Sequence[int] | None = None,
+    timeout: float | None = None,
 ) -> dist.ProcessGroup:
     """
     Create NCCL group: training rank 0 + all engine GPUs. Blocks until joined.
@@ -116,6 +156,7 @@ def connect_rollout_engines_from_distributed(
                     world_size,
                     group_name,
                     backend="nccl",
+                    **({"timeout": timeout} if timeout is not None else {}),
                 )
             )
         )
@@ -126,21 +167,33 @@ def connect_rollout_engines_from_distributed(
         world_size=world_size,
         rank=0,
         group_name=group_name,
+        **({"timeout": timedelta(seconds=timeout)} if timeout is not None else {}),
     )
-    async_utils.wait_futures(futures)
+    results = async_utils.wait_futures(futures)
+    if getattr(args, "update_weight_sync_retries", 0) and any(
+        not isinstance(result, dict) or result.get("success") is not True for result in results
+    ):
+        raise RuntimeError(f"Cannot confirm transfer group initialization: {results}")
     return model_update_groups
 
 
-def disconnect_rollout_engines_from_distributed(args, group_name, model_update_groups, rollout_engines):
+def disconnect_rollout_engines_from_distributed(
+    args, group_name, model_update_groups, rollout_engines, *, strict=False
+):
     """
     Destroy NCCL on training and engines.
     """
-    futures = [async_utils.submit(client.destroy_weights_update_group(group_name)) for client in rollout_engines]
+    futures = [
+        async_utils.submit(client.destroy_weights_update_group(group_name, **({"strict": True} if strict else {})))
+        for client in rollout_engines
+    ]
     try:
         if model_update_groups is not None:
             dist.destroy_process_group(model_update_groups)
     finally:
-        async_utils.wait_futures(futures)
+        results = async_utils.wait_futures(futures)
+        if strict and any(not isinstance(result, dict) or result.get("success") is not True for result in results):
+            raise RuntimeError(f"Cannot confirm transfer group destruction: {results}")
 
 
 def update_weights_from_distributed(
