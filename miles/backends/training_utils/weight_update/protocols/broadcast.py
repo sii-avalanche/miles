@@ -77,16 +77,15 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
     def recover_connection(self) -> None:
         """Recreate the completed transfer group while engines remain paused."""
         if self.is_sender:
-            disconnect_rollout_engines_from_distributed(
-                self.args, self.group_name, self._model_update_groups, self.rollout_engines, strict=True
+            results = disconnect_rollout_engines_from_distributed(
+                self.args, self.group_name, self._model_update_groups, self.rollout_engines, timeout=60.0
             )
+            if any(not isinstance(result, dict) or result.get("success") is not True for result in results):
+                raise RuntimeError(f"Cannot confirm transfer group destruction: {results}")
             self._model_update_groups = None
             self._model_update_groups = connect_rollout_engines_from_distributed(
-                self.args,
-                self.group_name,
-                self.rollout_engines,
-                engine_gpu_counts=self._engine_gpu_counts,
-                timeout=60.0,
+                self.args, self.group_name, self.rollout_engines,
+                engine_gpu_counts=self._engine_gpu_counts, timeout=60.0,
             )
 
     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None:
@@ -177,14 +176,13 @@ def connect_rollout_engines_from_distributed(
     return model_update_groups
 
 
-def disconnect_rollout_engines_from_distributed(
-    args, group_name, model_update_groups, rollout_engines, *, strict=False
-):
+def disconnect_rollout_engines_from_distributed(args, group_name, model_update_groups, rollout_engines, *, timeout=None):
     """
-    Destroy NCCL on training and engines.
+    Destroy NCCL on training and engines, returning the engine acknowledgements.
     """
+    request_kwargs = {"timeout": timeout} if timeout is not None else {}
     futures = [
-        async_utils.submit(client.destroy_weights_update_group(group_name, **({"strict": True} if strict else {})))
+        async_utils.submit(client.destroy_weights_update_group(group_name, **request_kwargs))
         for client in rollout_engines
     ]
     try:
@@ -192,8 +190,7 @@ def disconnect_rollout_engines_from_distributed(
             dist.destroy_process_group(model_update_groups)
     finally:
         results = async_utils.wait_futures(futures)
-        if strict and any(not isinstance(result, dict) or result.get("success") is not True for result in results):
-            raise RuntimeError(f"Cannot confirm transfer group destruction: {results}")
+    return results
 
 
 def update_weights_from_distributed(

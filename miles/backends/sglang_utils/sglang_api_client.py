@@ -348,18 +348,16 @@ class SGLangApiClient:
             **({"timeout": timeout} if timeout is not None else {}),
         )
 
-    async def destroy_weights_update_group(self, group_name, *, strict=False):
+    async def destroy_weights_update_group(self, group_name, *, timeout=None):
         try:
             return await self._make_request(
                 "destroy_weights_update_group",
                 {
                     "group_name": group_name,
                 },
-                **({"timeout": 60.0} if strict else {}),
+                **({"timeout": timeout} if timeout is not None else {}),
             )
         except httpx.HTTPError:
-            if strict:
-                raise
             # catch the case there the engine is just created and does not have the group.
             pass
 
