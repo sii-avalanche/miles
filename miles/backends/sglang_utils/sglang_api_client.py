@@ -371,6 +371,8 @@ class SGLangApiClient:
         weight_version: str | None = None,
         selector: str = "all",
         load_format: str | None = None,
+        *,
+        timeout: float | None = None,
     ):
         payload = {
             "names": names,
@@ -387,6 +389,7 @@ class SGLangApiClient:
         return await self._make_request(
             "update_weights_from_distributed",
             payload,
+            **({"timeout": timeout} if timeout is not None else {}),
         )
 
     async def pause_generation(self, mode: str = "retract"):

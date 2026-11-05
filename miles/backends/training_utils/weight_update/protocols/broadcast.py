@@ -1,4 +1,5 @@
 import socket
+import time
 from argparse import Namespace
 from collections.abc import Sequence
 from concurrent.futures import Future
@@ -18,6 +19,8 @@ from miles.backends.training_utils.weight_update.utils import get_data_replica_r
 from miles.utils import async_utils
 from miles.utils.distributed_lock import create_world_ticket_lock
 from miles.utils.distributed_utils import init_process_group
+
+_WEIGHT_SYNC_TIMEOUT_SECONDS = 60.0
 
 
 class WeightSyncResponseError(RuntimeError):
@@ -71,25 +74,20 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
                 self.args, self.group_name, self._model_update_groups, self.rollout_engines
             )
             self._model_update_groups = connect_rollout_engines_from_distributed(
-                self.args, self.group_name, rollout_engines, engine_gpu_counts=engine_gpu_counts
-            )
-
-    def recover_connection(self) -> None:
-        """Recreate the completed transfer group while engines remain paused."""
-        if self.is_sender:
-            results = disconnect_rollout_engines_from_distributed(
-                self.args, self.group_name, self._model_update_groups, self.rollout_engines, timeout=60.0
-            )
-            if any(not isinstance(result, dict) or result.get("success") is not True for result in results):
-                raise RuntimeError(f"Cannot confirm transfer group destruction: {results}")
-            self._model_update_groups = None
-            self._model_update_groups = connect_rollout_engines_from_distributed(
-                self.args, self.group_name, self.rollout_engines,
-                engine_gpu_counts=self._engine_gpu_counts, timeout=60.0,
+                self.args,
+                self.group_name,
+                rollout_engines,
+                engine_gpu_counts=engine_gpu_counts,
+                **(
+                    {"timeout": _WEIGHT_SYNC_TIMEOUT_SECONDS}
+                    if getattr(self.args, "update_weight_sync_retries", 0)
+                    else {}
+                ),
             )
 
     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None:
         """Lock → broadcast → clear → unlock. Lock prevents NCCL deadlock."""
+        retry_enabled = bool(getattr(self.args, "update_weight_sync_retries", 0))
         with self._engine_lock:
             futures = update_weights_from_distributed(
                 self.group_name,
@@ -98,27 +96,42 @@ class UpdateWeightFromDistributed(WeightTransferProtocol):
                 bucket,
                 selector=self._selector,
                 transfer_mode=getattr(self.args, "update_weight_transfer_mode", "broadcast"),
+                **({"timeout": _WEIGHT_SYNC_TIMEOUT_SECONDS} if retry_enabled else {}),
             )
-            if getattr(self.args, "update_weight_sync_retries", 0):
-                # Work.wait() can only order CUDA streams. Confirm the sends have
-                # actually completed before treating a lost reply as recoverable.
-                torch.cuda.current_stream().synchronize()
-                # Every future must settle before replacing either HTTP or NCCL connections.
-                errors = []
-                for future in futures:
-                    try:
-                        result = future.result()
-                        if isinstance(result, dict) and result.get("success") is False:
-                            raise RuntimeError(f"Weight receiver rejected bucket: {result}")
-                    except Exception as error:
-                        errors.append(error)
-                if errors:
-                    if all(isinstance(error, httpx.ReadError) for error in errors):
-                        raise WeightSyncResponseError("Lost reply after completed NCCL transfer") from errors[0]
-                    raise next(error for error in errors if not isinstance(error, httpx.ReadError))
+            if retry_enabled:
+                _wait_for_bucket(futures, timeout=_WEIGHT_SYNC_TIMEOUT_SECONDS + 5.0)
             else:
                 async_utils.wait_futures(futures)
             bucket.clear()
+
+
+def _wait_for_bucket(futures: Sequence[Future], *, timeout: float) -> None:
+    """A lost reply is recoverable only after GPU completion and settled RPCs."""
+    # Work.wait() orders this stream after NCCL; synchronize() could block forever.
+    completed = torch.cuda.Event()
+    completed.record(torch.cuda.current_stream())
+    deadline = time.monotonic() + timeout
+    while not (completed.query() and all(future.done() for future in futures)):
+        if time.monotonic() >= deadline:
+            pending = [index for index, future in enumerate(futures) if not future.done()]
+            raise RuntimeError(
+                f"Weight transfer did not settle within {timeout}s (pending HTTP receivers={pending}); "
+                "do not retry or drain CUDA gathers; restart the affected workers"
+            )
+        time.sleep(0.001)
+    errors = []
+    for future in futures:
+        try:
+            result = future.result()
+            if not isinstance(result, dict) or result.get("success") is not True:
+                raise RuntimeError(f"Cannot confirm weight bucket receipt: {result}")
+        except Exception as error:
+            errors.append(error)
+    if errors:
+        lost_reply = (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError)
+        if all(isinstance(error, lost_reply) for error in errors):
+            raise WeightSyncResponseError("Lost reply after completed NCCL transfer") from errors[0]
+        raise next(error for error in errors if not isinstance(error, lost_reply))
 
 
 def connect_rollout_engines_from_distributed(
@@ -176,7 +189,9 @@ def connect_rollout_engines_from_distributed(
     return model_update_groups
 
 
-def disconnect_rollout_engines_from_distributed(args, group_name, model_update_groups, rollout_engines, *, timeout=None):
+def disconnect_rollout_engines_from_distributed(
+    args, group_name, model_update_groups, rollout_engines, *, timeout=None
+):
     """
     Destroy NCCL on training and engines, returning the engine acknowledgements.
     """
@@ -200,6 +215,8 @@ def update_weights_from_distributed(
     converted_named_tensors: Sequence[tuple[str, torch.Tensor]],
     selector: str = "all",
     transfer_mode: str = "broadcast",
+    *,
+    timeout: float | None = None,
 ) -> list[Future]:
     """
     Send metadata (HTTP), broadcast tensors (NCCL rank 0 → engines).
@@ -224,6 +241,7 @@ def update_weights_from_distributed(
                 selector=selector,
                 group_name=group_name,
                 **format_kwargs,
+                **({"timeout": timeout} if timeout is not None else {}),
             )
         )
         for client in rollout_engines

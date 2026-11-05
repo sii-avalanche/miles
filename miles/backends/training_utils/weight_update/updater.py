@@ -6,10 +6,13 @@ buckets (senders transmit, other ranks join the gathers), and orchestrates
 LoRA adapter pushes.
 """
 
+import asyncio
 import logging
 import random
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import wait
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import torch
@@ -203,7 +206,8 @@ class WeightUpdater:
                 )
             )
             try:
-                self._stream_weights_for_retry()
+                with timer("update_weights_implementation"):
+                    self._stream_weights_for_retry()
             except WeightSyncResponseError:
                 if attempt == retries:
                     raise
@@ -213,10 +217,10 @@ class WeightUpdater:
                     attempt + 1,
                     exc_info=True,
                 )
-                # All sends have settled; reset HTTP, abort the session, then rebuild NCCL.
-                _collective_call(lambda: async_utils.run(GeneralHttpClientProvider.reset()))
+                # Completed sends do not poison NCCL. Keep that group; tearing it down
+                # adds another collective failure point while peer ranks wait on Gloo.
+                _collective_call(lambda: async_utils.run(asyncio.wait_for(GeneralHttpClientProvider.reset(), 60.0)))
                 _collective_call(lambda: _abort_session(protocol.rollout_engines) if driver else None)
-                _collective_call(protocol.recover_connection)
             else:
                 break
         # No retry after commit/resume: that would require coordinating partially resumed engines.
@@ -228,6 +232,8 @@ class WeightUpdater:
         protocol.after_engines_resumed()
 
     def _stream_weights_for_retry(self):
+        from miles.backends.training_utils.weight_update.protocols.broadcast import WeightSyncResponseError
+
         protocol = self.protocol
         error = None
         # Non-senders join iterator gathers but yield no buckets. After a failed send,
@@ -238,7 +244,8 @@ class WeightUpdater:
             if protocol.is_sender and error is None:
                 try:
                     protocol.send_bucket(bucket)
-                except Exception as caught:
+                except WeightSyncResponseError as caught:
+                    # Only proven-complete transfers may drain subsequent CUDA gathers.
                     error = caught
 
         def finish():
@@ -286,7 +293,9 @@ def _collective_call(action):
         dtype=torch.int32,
         device="cpu",
     )
-    dist.all_reduce(status, op=dist.ReduceOp.MAX, group=get_gloo_group())
+    work = dist.all_reduce(status, op=dist.ReduceOp.MAX, group=get_gloo_group(), async_op=True)
+    # Peers may reach agreement before the sender finishes its 65s bucket/abort budget.
+    work.wait(timeout=timedelta(seconds=150))
     if status.item() == 2:
         raise RuntimeError("Weight synchronization failed; recovery is unsafe") from error
     if status.item() == 1:
@@ -294,7 +303,11 @@ def _collective_call(action):
 
 
 def _abort_session(engines):
-    results = async_utils.wait_futures([async_utils.submit(engine.abort_weight_update()) for engine in engines])
+    futures = [async_utils.submit(engine.abort_weight_update()) for engine in engines]
+    _, pending = wait(futures, timeout=65.0)
+    if pending:
+        raise RuntimeError("Weight session abort did not settle; engines must remain paused")
+    results = async_utils.wait_futures(futures)
     for result in results:
         if not isinstance(result, dict) or result.get("success") is not True:
             raise RuntimeError(f"Cannot confirm weight session abort: {result}")
