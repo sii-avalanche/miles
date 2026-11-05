@@ -159,7 +159,7 @@ def _decode_compact_candidates(payload, rows: int, width: int):
         raise ValueError("Unsupported compact candidate version or shape")
     result = []
     for key, dtype in (("ids_i32_le", "<i4"), ("logps_f32_le", "<f4")):
-        raw = pybase64.b64decode(payload[key], validate=True)
+        raw = payload[key] if isinstance(payload[key], bytes) else pybase64.b64decode(payload[key], validate=True)
         if len(raw) != rows * width * 4:
             raise ValueError("Compact candidate byte length mismatch")
         result.append(np.frombuffer(raw, dtype=dtype).reshape(rows, width))
