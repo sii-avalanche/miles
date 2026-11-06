@@ -180,7 +180,10 @@ class WeightUpdater:
     def _update_weights_with_retry(self, *, retries):
         """Keep one target version and replay the entire iterator after reconnecting."""
         # Keep optional broadcast dependencies out of other transfer modes.
-        from miles.backends.training_utils.weight_update.protocols.broadcast import WeightSyncResponseError
+        from miles.backends.training_utils.weight_update.protocols.broadcast import (
+            WeightSyncResponseError,
+            WeightSyncTransportError,
+        )
 
         args, protocol = self.args, self.protocol
         if retries < 1:
@@ -208,7 +211,7 @@ class WeightUpdater:
             try:
                 with timer("update_weights_implementation"):
                     self._stream_weights_for_retry()
-            except WeightSyncResponseError:
+            except WeightSyncResponseError as error:
                 if attempt == retries:
                     raise
                 logger.warning(
@@ -217,10 +220,12 @@ class WeightUpdater:
                     attempt + 1,
                     exc_info=True,
                 )
-                # Completed sends do not poison NCCL. Keep that group; tearing it down
-                # adds another collective failure point while peer ranks wait on Gloo.
+                # Lost HTTP replies retain the healthy group; confirmed NCCL aborts
+                # rebuild it only after all ranks have drained their iterator.
                 _collective_call(lambda: async_utils.run(asyncio.wait_for(GeneralHttpClientProvider.reset(), 60.0)))
                 _collective_call(lambda: _abort_session(protocol.rollout_engines) if driver else None)
+                if isinstance(error, WeightSyncTransportError):
+                    _collective_call(protocol.recover_connection)
             else:
                 break
         # No retry after commit/resume: that would require coordinating partially resumed engines.
@@ -245,7 +250,7 @@ class WeightUpdater:
                 try:
                     protocol.send_bucket(bucket)
                 except WeightSyncResponseError as caught:
-                    # Only proven-complete transfers may drain subsequent CUDA gathers.
+                    # Completed or confirmed-aborted transfers may drain subsequent CUDA gathers.
                     error = caught
 
         def finish():
@@ -281,7 +286,10 @@ class WeightUpdater:
 def _collective_call(action):
     """Agree on failure before any rank enters another iterator collective."""
     # The error type belongs to the optional broadcast protocol.
-    from miles.backends.training_utils.weight_update.protocols.broadcast import WeightSyncResponseError
+    from miles.backends.training_utils.weight_update.protocols.broadcast import (
+        WeightSyncResponseError,
+        WeightSyncTransportError,
+    )
 
     error = None
     try:
@@ -289,15 +297,25 @@ def _collective_call(action):
     except Exception as caught:
         error = caught
     status = torch.tensor(
-        0 if error is None else 1 if isinstance(error, WeightSyncResponseError) else 2,
+        (
+            0
+            if error is None
+            else (
+                3
+                if isinstance(error, WeightSyncTransportError)
+                else 1 if isinstance(error, WeightSyncResponseError) else 4
+            )
+        ),
         dtype=torch.int32,
         device="cpu",
     )
     work = dist.all_reduce(status, op=dist.ReduceOp.MAX, group=get_gloo_group(), async_op=True)
     # Peers may reach agreement before the sender finishes its 65s bucket/abort budget.
     work.wait(timeout=timedelta(seconds=150))
-    if status.item() == 2:
+    if status.item() == 4:
         raise RuntimeError("Weight synchronization failed; recovery is unsafe") from error
+    if status.item() == 3:
+        raise WeightSyncTransportError("Aborted weight-transfer group on a training rank") from error
     if status.item() == 1:
         raise WeightSyncResponseError("Lost weight-sync response on a training rank") from error
 

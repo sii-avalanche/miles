@@ -333,7 +333,16 @@ class SGLangApiClient:
         return await self._make_request("update_weights_from_disk", payload)
 
     async def init_weights_update_group(
-        self, master_address, master_port, rank_offset, world_size, group_name, backend, *, timeout=None
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend,
+        *,
+        timeout=None,
+        recoverable_timeout=None,
     ):
         return await self._make_request(
             "init_weights_update_group",
@@ -344,6 +353,7 @@ class SGLangApiClient:
                 "world_size": world_size,
                 "group_name": group_name,
                 "backend": backend,
+                **({"recoverable_timeout": recoverable_timeout} if recoverable_timeout is not None else {}),
             },
             **({"timeout": timeout} if timeout is not None else {}),
         )

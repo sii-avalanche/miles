@@ -252,3 +252,65 @@ class TestUpdateWeightsFromDistributed:
         assert [handle.waited for handle in handles] == [True, True]
         assert [tensor.is_contiguous() for tensor in broadcast_tensors] == [True, True]
         assert torch.equal(broadcast_tensors[1], _BASE_NAMED_TENSORS[1][1])
+
+
+class TestRecoverableNccl:
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_receiver_abort_requires_opt_in(self, enabled):
+        from concurrent.futures import Future
+        import httpx
+        from miles.backends.training_utils.weight_update.protocols import broadcast
+
+        request = httpx.Request("POST", "http://engine/update_weights_from_distributed")
+        response = httpx.Response(400, request=request, json={"message": "WEIGHT_SYNC_NCCL_ABORTED: timeout"})
+        future = Future()
+        future.set_exception(httpx.HTTPStatusError("receive failed", request=request, response=response))
+        event = MagicMock()
+        event.query.return_value = True
+        expected = broadcast.WeightSyncTransportError if enabled else httpx.HTTPStatusError
+        with patch.object(torch.cuda, "Event", return_value=event), patch.object(torch.cuda, "current_stream"):
+            with pytest.raises(expected):
+                broadcast._wait_for_bucket([future], timeout=1, recover_nccl=enabled)
+
+    def test_receiver_validation_error_is_not_retried(self):
+        from concurrent.futures import Future
+        import httpx
+        from miles.backends.training_utils.weight_update.protocols import broadcast
+
+        request = httpx.Request("POST", "http://engine/update_weights_from_distributed")
+        response = httpx.Response(400, request=request, json={"message": "invalid tensor shape"})
+        future = Future()
+        future.set_exception(httpx.HTTPStatusError("receive failed", request=request, response=response))
+        event = MagicMock()
+        event.query.return_value = True
+        with patch.object(torch.cuda, "Event", return_value=event), patch.object(torch.cuda, "current_stream"):
+            with pytest.raises(httpx.HTTPStatusError):
+                broadcast._wait_for_bucket([future], timeout=1, recover_nccl=True)
+
+    def test_group_settings_restore_original_policy_on_error(self, monkeypatch):
+        import os
+        from miles.backends.training_utils.weight_update.protocols import broadcast
+
+        monkeypatch.setenv("TORCH_NCCL_ASYNC_ERROR_HANDLING", "3")
+        monkeypatch.delenv("TORCH_NCCL_BLOCKING_WAIT", raising=False)
+        with pytest.raises(ValueError):
+            with broadcast._recoverable_nccl_settings():
+                assert os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] == "2"
+                assert os.environ["TORCH_NCCL_BLOCKING_WAIT"] == "1"
+                raise ValueError("construction failed")
+        assert os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] == "3"
+        assert "TORCH_NCCL_BLOCKING_WAIT" not in os.environ
+
+    def test_poisoned_cuda_is_not_classified_as_recoverable(self):
+        from miles.backends.training_utils.weight_update.protocols import broadcast
+
+        group = MagicMock()
+        event = MagicMock()
+        event.query.side_effect = RuntimeError("CUDA context lost")
+        with (
+            patch.object(torch.cuda, "Event", return_value=event),
+            patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            with pytest.raises(RuntimeError, match="CUDA context lost"):
+                broadcast._abort_transfer_group(group)
+        group._get_backend.return_value.abort.assert_called_once()

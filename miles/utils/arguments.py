@@ -1102,6 +1102,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--update-weight-sync-recover-nccl",
+                action="store_true",
+                help="Rebuild an aborted weight-transfer NCCL group and replay the current weights; "
+                "requires --update-weight-sync-retries and compatible SGLang receivers.",
+            )
+            parser.add_argument(
                 "--update-weight-transfer-mode",
                 choices=["broadcast", "broadcast_packed", "p2p", "disk-delta"],
                 default="broadcast",
@@ -3352,6 +3358,8 @@ def miles_validate_args(args):
             setattr(args, k, v)
 
     retries = getattr(args, "update_weight_sync_retries", 0)
+    if getattr(args, "update_weight_sync_recover_nccl", False) and not retries:
+        raise ValueError("NCCL weight sync recovery requires a positive retry budget")
     if retries < 0:
         raise ValueError("update_weight_sync_retries must be nonnegative")
     if retries and (
