@@ -3000,3 +3000,32 @@ class TestWeightTransferModeSelection:
         args = self._parse(["--custom-config-path", str(config), *extra])
         with pytest.raises(ValueError, match=error):
             miles_validate_args(args)
+
+
+class TestRpcAttemptLimitValidation:
+    @pytest.mark.parametrize("skip", [False, True])
+    @pytest.mark.parametrize("flag", ["--train-max-attempts", "--weight-update-max-attempts"])
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_invalid_limits_reach_the_full_native_guard(self, tmp_path, skip, flag, value):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        args = parser.parse_args(
+            ["--hf-checkpoint", str(tmp_path), "--num-rollout", "1", flag, str(value)] + REQUIRED_ARGS
+        )
+        args.skip_actor_forward_only = skip
+        with pytest.raises(ValueError, match=flag.removeprefix("--").replace("-", "_")):
+            miles_validate_args(args)
+
+    @pytest.mark.parametrize("skip", [False, True])
+    def test_default_and_single_attempt_limits_are_validated(self, tmp_path, skip):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        for options, expected in (([], 30), (["--train-max-attempts", "1", "--weight-update-max-attempts", "1"], 1)):
+            args = parser.parse_args(
+                ["--hf-checkpoint", str(tmp_path), "--num-rollout", "1"] + REQUIRED_ARGS + options
+            )
+            args.skip_actor_forward_only = skip
+            with patch("miles.utils.arguments.validate_skip_actor_forward_only") as scoring_guard:
+                miles_validate_args(args)
+            assert (args.train_max_attempts, args.weight_update_max_attempts) == (expected, expected)
+            assert scoring_guard.call_count == int(skip)

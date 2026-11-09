@@ -34,8 +34,7 @@ def get_rollout_data(
     args: Namespace,
     rollout_data_ref: Box,
     witness_info: WitnessInfo | None = None,
-    batch_context: dict | None = None,
-    validator_factory=None,
+    validator=None,
 ) -> tuple[RolloutBatch, ObjectStoreGetResult]:
     parallel_state = get_parallel_state()
     # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
@@ -47,9 +46,9 @@ def get_rollout_data(
         parallel_state.effective_dp.size,
         witness_info=witness_info,
     )
-    if validator_factory is not None:
+    if validator is not None:
         try:
-            validator_factory.validate_received(args, batch_context, rollout_data)
+            validator.validate_received(rollout_data)
         except BaseException:
             # The caller cannot enter the returned owner context after failure.
             with store_get_result:

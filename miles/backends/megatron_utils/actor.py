@@ -252,8 +252,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.rollout_data_postprocess = None
         if (x := self.args.rollout_data_postprocess_path) is not None:
-            from miles.utils.function_registry import load_function
-
             self.rollout_data_postprocess = load_function(x)
 
         if self.args.offload_train:
@@ -593,19 +591,14 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with ExitStack() as stack:
             validator_factory = getattr(self, "_train_validator_factory", None)
-            validator = None
+            validator = validator_factory(self.args, batch_context) if validator_factory is not None else None
             with timer("data_preprocess"):
-                validator_kwargs = (
-                    {}
-                    if validator_factory is None
-                    else dict(validator_factory=validator_factory, batch_context=batch_context)
-                )
+                validator_kwargs = {} if validator is None else dict(validator=validator)
                 rollout_data, store_get_result = get_rollout_data(
                     self.args, rollout_data_ref, witness_info=witness_info, **validator_kwargs
                 )
                 stack.enter_context(store_get_result)
-                if validator_factory is not None:
-                    validator = validator_factory(self.args, batch_context)
+                if validator is not None:
                     stack.enter_context(train_validator_scope(validator))
                 if self.args.debug_rollout_only:
                     log_rollout_data(rollout_id, self.args, rollout_data)

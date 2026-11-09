@@ -191,14 +191,25 @@ class RolloutExecutor:
             if self._train_validator is None:
                 raise ValueError("Batch receipt requires a training validator")
             self._train_validator.validate_payload(batch_receipt, data, complete=True)
+        bound_receipt = batch_receipt
+        shard_hooks = {}
+        if batch_receipt is not None:
+            if self.args.delay_split_train_data_by_dp:
+                raise ValueError("Training validator receipts require rollout-side DP splitting")
+
+            def bind_native_shards(shards):
+                nonlocal bound_receipt
+                bound_receipt = self._train_validator.bind_shards(batch_receipt, shards)
+
+            shard_hooks["on_shards"] = bind_native_shards
         sample_indices = data.get("sample_indices")
         if self.args.delay_split_train_data_by_dp:
             data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
         else:
             data_ref = split_train_data_by_dp(
-                self.args, data, self._train_parallel_configs_of_model_id[trainer_model_id]
+                self.args, data, self._train_parallel_configs_of_model_id[trainer_model_id], **shard_hooks
             )
-        return RolloutDataPack(sample_indices=sample_indices, data_ref=data_ref, batch_receipt=batch_receipt)
+        return RolloutDataPack(sample_indices=sample_indices, data_ref=data_ref, batch_receipt=bound_receipt)
 
     async def eval(
         self,

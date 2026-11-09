@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -353,7 +354,13 @@ def _post_process_rewards(
     return raw_rewards, raw_rewards
 
 
-def split_train_data_by_dp(args, data: dict[str, Any], train_parallel_config: dict | None):
+def split_train_data_by_dp(
+    args,
+    data: dict[str, Any],
+    train_parallel_config: dict | None,
+    *,
+    on_shards: Callable[[list[dict[str, Any]]], None] | None = None,
+):
     """Split the train data across DP ranks and put the shards into the object store.
 
     When the training backend can consume a rollout-side schedule, the shards
@@ -363,6 +370,8 @@ def split_train_data_by_dp(args, data: dict[str, Any], train_parallel_config: di
         shards = split_train_data_by_dp_scheduled_raw(args, data, train_parallel_config=train_parallel_config)
     else:
         shards = split_train_data_by_dp_raw(args, data, dp_size=train_parallel_config["dp_size"])
+    if on_shards is not None:
+        on_shards(shards)
     store = object_store.get_instance()
     return [store.put(value=shard, value_spec=ROLLOUT_DATA_VALUE_SPEC) for shard in shards]
 

@@ -4092,9 +4092,9 @@ def miles_validate_args(args):
             args.use_dynamic_batch_size is False
         ), "Dynamic batch size is not supported for bshd format. Please specify --micro-batch-size instead."
 
+    validate_rpc_attempt_limits(args)
     if args.skip_actor_forward_only:
         validate_skip_actor_forward_only(args)
-        validate_rpc_attempt_limits(args)
 
     validate_score_centering_args(args)
 
