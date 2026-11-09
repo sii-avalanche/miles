@@ -45,6 +45,8 @@ class _DataIterator:
 
 
 class _Provider(TorchNativeTrainRayActor):
+    backend_name = "test"
+
     def __init__(self):
         self.args = SimpleNamespace(
             micro_batch_size=1,
@@ -139,3 +141,13 @@ def test_moving_optimizer_state_does_not_grow_state_for_parameters_that_have_non
 
     assert model.bias not in optimizer.state
     assert optimizer.state[model.weight]["exp_avg"].device.type == "cpu"
+
+
+class TestOptionalBatchContext:
+    def test_unsupported_validator_context_is_rejected_before_training(self):
+        from miles.utils.retry_utils import NonRetryableError
+
+        actor = _Provider()
+        with pytest.raises(NonRetryableError, match="does not support a training validator"):
+            actor.train(0, None, batch_context={"receipt": {}})
+        actor._heartbeat.bump.assert_not_called()

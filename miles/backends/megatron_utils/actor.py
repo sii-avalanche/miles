@@ -30,6 +30,7 @@ from miles.backends.training_utils.metrics import train_dump
 from miles.backends.training_utils.metrics.log_utils import log_cpu_memory, log_perf_data, log_rollout_data
 from miles.backends.training_utils.replay.data import fill_replay_data, register_replay_list_sequential
 from miles.backends.training_utils.types import TrainStepOutput
+from miles.backends.training_utils.validation import current_train_validator, train_validator_scope
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
 from miles.backends.training_utils.weight_update.snapshot_publisher import SnapshotPublisher
 from miles.backends.training_utils.weight_update.updater import WeightUpdater
@@ -43,6 +44,7 @@ from miles.utils.audit_utils.event_logger.logger import event_logger_context
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.context_utils import with_defer
 from miles.utils.distributed_utils import get_gloo_group
+from miles.utils.function_registry import load_function
 from miles.utils.ft_utils.indep_dp import IndepDPInfo
 from miles.utils.lora.utils import build_lora_config, is_multi_lora_enabled
 from miles.utils.memory_utils import clear_memory, print_memory
@@ -122,6 +124,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self._last_rollout_id: int | None = None
         super()._init_common(args, role, with_ref, with_opd_teacher=with_opd_teacher)
+        validator_path = getattr(args, "custom_train_validator_path", None)
+        self._train_validator_factory = load_function(validator_path) if validator_path else None
 
         for m in all_replay_managers:
             m.register_replay_list_func = register_replay_list_sequential
@@ -569,7 +573,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
     @with_logs
     @event_logger_context(
-        lambda _self, rollout_id, rollout_data_ref, witness_info=None, attempt=0, external_data=None: dict(
+        lambda _self, rollout_id, rollout_data_ref, witness_info=None, attempt=0, external_data=None, batch_context=None: dict(
             rollout_id=rollout_id, attempt=attempt
         )
     )
@@ -580,6 +584,7 @@ class MegatronTrainRayActor(TrainRayActor):
         witness_info: WitnessInfo | None = None,
         attempt: int = 0,
         external_data: TrainStepOutput | None = None,
+        batch_context: dict | None = None,
     ) -> TrainStepOutput:
         self._heartbeat.bump()
         self._last_rollout_id = rollout_id
@@ -587,11 +592,21 @@ class MegatronTrainRayActor(TrainRayActor):
             self.wake_up()
 
         with ExitStack() as stack:
+            validator_factory = getattr(self, "_train_validator_factory", None)
+            validator = None
             with timer("data_preprocess"):
+                validator_kwargs = (
+                    {}
+                    if validator_factory is None
+                    else dict(validator_factory=validator_factory, batch_context=batch_context)
+                )
                 rollout_data, store_get_result = get_rollout_data(
-                    self.args, rollout_data_ref, witness_info=witness_info
+                    self.args, rollout_data_ref, witness_info=witness_info, **validator_kwargs
                 )
                 stack.enter_context(store_get_result)
+                if validator_factory is not None:
+                    validator = validator_factory(self.args, batch_context)
+                    stack.enter_context(train_validator_scope(validator))
                 if self.args.debug_rollout_only:
                     log_rollout_data(rollout_id, self.args, rollout_data)
                     return TrainStepOutput(outcome=TrainStepOutcome.NORMAL)
@@ -608,6 +623,10 @@ class MegatronTrainRayActor(TrainRayActor):
                     attempt=attempt,
                 )
 
+            if validator is not None:
+                return TrainStepOutput(
+                    outcome=result.outcome, values=result.values, commit_receipt=validator.receipt()
+                )
             return result
 
     @with_logs
@@ -750,6 +769,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
+                validator = current_train_validator()
+                if validator is not None:
+                    validator.validate_scores(rollout_data)
                 compute_advantages_and_returns(self.args, rollout_data)
                 log_train_advantage_computation_event(rollout_data)
 

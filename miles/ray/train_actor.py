@@ -220,6 +220,7 @@ class TrainRayActor(NodeProbeMixin):
         witness_info: WitnessInfo | None = None,
         attempt: int = 0,
         external_data: TrainStepOutput | None = None,
+        batch_context: dict | None = None,
     ) -> TrainStepOutput:
         raise NotImplementedError
 

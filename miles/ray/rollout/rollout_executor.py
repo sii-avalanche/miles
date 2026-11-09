@@ -68,6 +68,8 @@ class RolloutExecutor:
         self.args = args
         # set by the training actor after each weight update, keyed by trainer model id (None for one policy)
         self._weight_versions_of_model_id: dict[str | None, int] = {}
+        self._publication_contexts: dict[str | None, dict] = {}
+        self._generation_tasks: set[asyncio.Task] = set()
         self._rollouts_since_publish_of_model_id: dict[str | None, int] = defaultdict(int)
         self._train_parallel_configs_of_model_id: dict[str | None, dict[str, Any]] = {}
         self._router_providers = router_providers
@@ -108,6 +110,8 @@ class RolloutExecutor:
             self.generate_rollout = load_function(self.args.rollout_function_path)
             self.eval_generate_rollout = load_function(self.args.eval_function_path)
         self.custom_reward_post_process_func = None
+        validator_path = getattr(args, "custom_train_validator_path", None)
+        self._train_validator = load_function(validator_path) if validator_path else None
         if (x := self.args.custom_reward_post_process_path) is not None:
             self.custom_reward_post_process_func = load_function(x)
         self.custom_convert_samples_to_train_data_func = None
@@ -129,6 +133,15 @@ class RolloutExecutor:
     # -------------------------- lifecycle -----------------------------
 
     async def dispose(self) -> None:
+        active = getattr(self, "_generation_tasks", set())
+        if active:
+            # to_thread cancellation does not stop the background rollout loop.
+            # Never close its client/source while the real work is still alive.
+            _, pending = await asyncio.wait(
+                active, timeout=getattr(self.args, "sglang_router_request_timeout_secs", 30.0)
+            )
+            if pending:
+                raise RuntimeError("Rollout still active; owning deployment must be torn down")
         if not self.use_legacy_rollout_v1 and self.generate_rollout is not None:
             await maybe_await(self.generate_rollout.dispose())
         if (close := getattr(self.data_source, "close", None)) is not None:
@@ -173,6 +186,11 @@ class RolloutExecutor:
             custom_convert_samples_to_train_data_func=self.custom_convert_samples_to_train_data_func,
             custom_reward_post_process_func=self.custom_reward_post_process_func,
         )
+        batch_receipt = metadata.pop("batch_receipt", None) if metadata is not None else None
+        if batch_receipt is not None:
+            if self._train_validator is None:
+                raise ValueError("Batch receipt requires a training validator")
+            self._train_validator.validate_payload(batch_receipt, data, complete=True)
         sample_indices = data.get("sample_indices")
         if self.args.delay_split_train_data_by_dp:
             data_ref = object_store.get_instance().put(value=data, value_spec=ROLLOUT_DATA_VALUE_SPEC)
@@ -180,7 +198,7 @@ class RolloutExecutor:
             data_ref = split_train_data_by_dp(
                 self.args, data, self._train_parallel_configs_of_model_id[trainer_model_id]
             )
-        return RolloutDataPack(sample_indices=sample_indices, data_ref=data_ref)
+        return RolloutDataPack(sample_indices=sample_indices, data_ref=data_ref, batch_receipt=batch_receipt)
 
     async def eval(
         self,
@@ -260,24 +278,33 @@ class RolloutExecutor:
             metrics = None
         else:
             if not self.use_legacy_rollout_v1:
-                data = await asyncio.to_thread(
-                    call_rollout_function,
-                    self.generate_rollout,
-                    RolloutFnTrainInput(
-                        rollout_id=rollout_id,
-                        weight_version=self._weight_versions_of_model_id.get(trainer_model_id),
-                        trainer_model_id=trainer_model_id,
-                    ),
+                generation = asyncio.create_task(
+                    asyncio.to_thread(
+                        call_rollout_function,
+                        self.generate_rollout,
+                        RolloutFnTrainInput(
+                            rollout_id=rollout_id,
+                            weight_version=self._weight_versions_of_model_id.get(trainer_model_id),
+                            trainer_model_id=trainer_model_id,
+                            publication_context=getattr(self, "_publication_contexts", {}).get(trainer_model_id),
+                        ),
+                    )
                 )
+                self._generation_tasks.add(generation)
+                generation.add_done_callback(self._generation_tasks.discard)
+                data = await asyncio.shield(generation)
             else:
                 data = await asyncio.to_thread(
                     call_rollout_fn, self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False
                 )
             metrics = data.metrics
+            batch_receipt = getattr(data, "batch_receipt", None)
             data = data.samples
             data, metadata = postprocess_rollout_data(
                 self.args, data, train_parallel_config=self._train_parallel_configs_of_model_id[trainer_model_id]
             )
+            if batch_receipt is not None:
+                metadata["batch_receipt"] = batch_receipt
             metrics = {**(metrics or {}), **(metadata.pop("metrics", {}) or {})}
             assert_samples_weight_version_sane(self.args, samples=data)
             if RolloutDataInjectionUtil.should_inject(self.args, rollout_id):
@@ -293,8 +320,11 @@ class RolloutExecutor:
     # -------------------------- checkpointing -----------------------------
 
     # TODO the train and eval rollout functions will become one object, so one save/load is enough here
-    def save(self, rollout_id: int) -> None:
-        self.data_source.save(rollout_id)
+    def save(self, rollout_id: int, checkpoint_context: dict | None = None) -> None:
+        if checkpoint_context is None:
+            self.data_source.save(rollout_id)
+        else:
+            self.data_source.save(rollout_id, checkpoint_context=checkpoint_context)
         if not self.use_legacy_rollout_v1:
             if self.generate_rollout is not None:
                 self.generate_rollout.save(rollout_id)
@@ -316,7 +346,9 @@ class RolloutExecutor:
         assert self.args.rollout_global_dataset
         return len(self.data_source.dataset) // self.args.rollout_batch_size
 
-    def set_weight_version(self, weight_version: int, trainer_model_id: str | None = None) -> None:
+    def set_weight_version(
+        self, weight_version: int, trainer_model_id: str | None = None, publication_context: dict | None = None
+    ) -> None:
         # warning instead of assert when use indep_dp ft
         previous = self._weight_versions_of_model_id.get(trainer_model_id)
         if previous is not None and weight_version < previous:
@@ -324,6 +356,8 @@ class RolloutExecutor:
             assert self.args.indep_dp, message
             logger.warning(message)
         self._weight_versions_of_model_id[trainer_model_id] = weight_version
+        if publication_context is not None:
+            self._publication_contexts[trainer_model_id] = dict(publication_context)
         self._rollouts_since_publish_of_model_id[trainer_model_id] = 0
         if (
             not self.use_legacy_rollout_v1

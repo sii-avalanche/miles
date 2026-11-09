@@ -127,6 +127,18 @@ class TestRouterArgsToArgv:
 
 
 class TestComputeSglangRouterArgs:
+    def test_round_robin_reaches_the_native_router_argv(self) -> None:
+        values = compute_sglang_router_args(
+            _make_miles_args(sglang_router_policy="round_robin"),
+            host="127.0.0.1",
+            port=1234,
+            prometheus_port=4001,
+            has_pd_disaggregation=False,
+        )
+        argv = router_args_to_argv(values)
+        assert argv[argv.index("--policy") + 1] == "round_robin"
+        assert parse_router_args_argv(argv).policy == "round_robin"
+
     def test_call_site_values_override_router_defaults(self) -> None:
         """Host, ports, log level, and timeout are applied in the raw value domain."""
         values = compute_sglang_router_args(

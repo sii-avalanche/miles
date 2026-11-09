@@ -22,7 +22,7 @@ from miles.utils.orchestration_utils import init_orchestration_script
 logger = logging.getLogger(__name__)
 
 
-async def train(args, *, disposer: Disposer):
+async def train(args, *, disposer: Disposer, schedule_adapter=None):
     assert not args.fully_async, "--fully-async requires the async driver: run train_async.py"
     _worker_manager = init_orchestration_script(args, disposer=disposer)
 
@@ -45,7 +45,10 @@ async def train(args, *, disposer: Disposer):
     maybe_start_mini_ft_controller(args)
 
     # always update weight first so that sglang has the loaded weights from training.
-    await update_weights(args, actor_model, rollout_executor, inference_controller)
+    publication = {} if schedule_adapter is None else {"publication_context": schedule_adapter.publication_context()}
+    published = await update_weights(args, actor_model, rollout_executor, inference_controller, **publication)
+    if schedule_adapter is not None:
+        schedule_adapter.published(published)
 
     if args.check_weight_update_equal:
         await inference_controller.check_weights(
@@ -76,6 +79,7 @@ async def train(args, *, disposer: Disposer):
 
     async def save(rollout_id, force_sync=False):
         force_sync = force_sync or rollout_id == args.num_rollout - 1
+        context = schedule_adapter.before_save(rollout_id) if schedule_adapter is not None else None
 
         async def save_training_model(model):
             if args.use_critic and args.offload_train:
@@ -88,7 +92,10 @@ async def train(args, *, disposer: Disposer):
             await save_training_model(actor_model)
         if args.use_critic:
             await save_training_model(critic_model)
-        await rollout_executor.save(rollout_id)
+        kwargs = {} if context is None else {"checkpoint_context": context}
+        await rollout_executor.save(rollout_id, **kwargs)
+        if schedule_adapter is not None:
+            schedule_adapter.saved(rollout_id)
 
     if args.num_rollout > args.start_rollout_id and args.eval_interval is not None and not args.skip_eval_before_train:
         await inference_controller.prepare_eval()
@@ -100,8 +107,13 @@ async def train(args, *, disposer: Disposer):
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
+        if schedule_adapter is not None:
+            schedule_adapter.rollout_started(rollout_id)
         await inference_controller.prepare_rollout(rollout_id)
         rollout_data_pack = await rollout_executor.get(rollout_id)
+        if schedule_adapter is not None:
+            schedule_adapter.received(rollout_data_pack)
+            schedule_adapter.before_train(rollout_id, rollout_data_pack)
 
         if args.offload_rollout:
             if args.colocate_memory_peak_device == "gpu":
@@ -126,7 +138,12 @@ async def train(args, *, disposer: Disposer):
                     await actor_model.offload()
             remove_train_output_refs(values)
         else:
-            await actor_model.train(rollout_id, rollout_data_pack)
+            outputs = await actor_model.train(rollout_id, rollout_data_pack)
+            if schedule_adapter is not None:
+                try:
+                    schedule_adapter.after_train(rollout_id, rollout_data_pack, outputs)
+                finally:
+                    remove_train_output_refs(outputs)
         remove_rollout_data_refs(args, rollout_data_pack)
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
@@ -150,7 +167,14 @@ async def train(args, *, disposer: Disposer):
                 await offload_train()
                 if args.offload_rollout:
                     await inference_controller.onload_weights()
-            await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
+            publication = (
+                {} if schedule_adapter is None else {"publication_context": schedule_adapter.publication_context()}
+            )
+            published = await update_weights(
+                args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id, **publication
+            )
+            if schedule_adapter is not None:
+                schedule_adapter.published(published)
             if args.offload_rollout:
                 await inference_controller.onload_kv()
 

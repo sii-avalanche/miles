@@ -300,7 +300,8 @@ async def update_weights(
     *,
     rollout_id: int | None = None,
     trainer_model_id: str | None = None,
-) -> None:
+    publication_context: dict | None = None,
+) -> dict | None:
     orchestration_executor = FTTestActionOrchestrationExecutor.from_args(args, trainer_model_id=trainer_model_id)
     if rollout_id is not None:
         await orchestration_executor.run_after_step(rollout_id=rollout_id)
@@ -318,7 +319,18 @@ async def update_weights(
     )
 
     if weight_version is not None:
-        await rollout_executor.set_weight_version(weight_version, trainer_model_id=trainer_model_id)
+        kwargs = {} if publication_context is None else {"publication_context": publication_context}
+        await rollout_executor.set_weight_version(weight_version, trainer_model_id=trainer_model_id, **kwargs)
+    if publication_context is not None:
+        if weight_version is None:
+            raise RuntimeError("Publication did not return an actual weight version")
+        return {
+            **publication_context,
+            "weight_version": weight_version,
+            "published": True,
+            "engine_count": len(info.rollout_engines),
+            "engine_cells": sorted(info.snapshot_cell_id_to_hashes),
+        }
 
 
 async def _maybe_log_inference_engine_weight_checksums(

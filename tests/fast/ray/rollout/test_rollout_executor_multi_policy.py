@@ -42,6 +42,11 @@ def _make_executor() -> RolloutExecutor:
         lora_rank=0,
         update_weights_interval=1,
     )
+    executor.use_legacy_rollout_v1 = False
+    executor.generate_rollout = None
+    executor._generation_tasks = set()
+    executor._publication_contexts = {}
+    executor._train_validator = None
     executor.data_source = Namespace()
     executor.custom_convert_samples_to_train_data_func = None
     executor.custom_reward_post_process_func = None
@@ -71,7 +76,7 @@ def _record_postprocess_configs(monkeypatch) -> list[dict[str, Any]]:
 
     def _postprocess_rollout_data(args, data, *, train_parallel_config: dict[str, Any]):
         seen.append(train_parallel_config)
-        return data, None
+        return data, {}
 
     monkeypatch.setattr(rollout_executor_module, "postprocess_rollout_data", _postprocess_rollout_data)
     return seen

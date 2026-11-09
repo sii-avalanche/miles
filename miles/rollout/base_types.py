@@ -36,6 +36,7 @@ class RolloutFnTrainInput(RolloutFnBaseInput):
     weight_version: int | None = None
     # which policy model asked for this rollout; None when the run trains one policy
     trainer_model_id: str | None = None
+    publication_context: dict[str, Any] | None = None
 
     @property
     def evaluation(self):
@@ -58,6 +59,7 @@ class RolloutFnEvalInput(RolloutFnBaseInput):
 class RolloutFnTrainOutput:
     samples: list[list[Sample]]
     metrics: dict[str, Any] | None = None
+    batch_receipt: dict[str, Any] | None = None
 
 
 # TODO make it frozen

@@ -38,6 +38,7 @@ from miles.backends.training_utils.metrics.log_utils import (
     log_train_step,
 )
 from miles.backends.training_utils.types import TrainStepOutcome
+from miles.backends.training_utils.validation import current_train_validator
 from miles.backends.training_utils.weight_update.snapshot_publisher import SnapshotPublisher
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
@@ -487,6 +488,7 @@ def run_forward_backward_pass(
                 "loss_weights",
                 "target_tokens",
                 "sample_indices",
+                *(["teacher_log_probs"] if current_train_validator() is not None else []),
                 *sampling_mask_keys,
             ],
             args.data_pad_size_multiplier,
@@ -593,6 +595,9 @@ def train_one_step(
     losses_reduced = run_forward_backward_pass(
         args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
     )
+    validator = current_train_validator()
+    if validator is not None:
+        validator.before_update(opt_param_scheduler, optimizer_disabled=disable_optimizer)
 
     outcome = TrainStepOutcome.NORMAL
     grad_norm = 0.0
@@ -661,6 +666,7 @@ def train_one_step(
     if outcome == TrainStepOutcome.NORMAL:
         dumper_phase_util.finalize(model)
 
+    update_applied = False
     if not disable_optimizer and valid_step and not skip_update:
         if exclude_mtp_grad:
             update_successful, grad_norm, num_zeros_in_grad, mtp_grad_norm = optimizer_step_excluding_mtp(
@@ -670,6 +676,10 @@ def train_one_step(
             update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         assert update_successful
         opt_param_scheduler.step(increment=num_rollouts)
+        update_applied = True
+
+    if validator is not None:
+        validator.after_update(opt_param_scheduler, applied=update_applied)
 
     _zero_grads(model, optimizer, disable_optimizer)
 

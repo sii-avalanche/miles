@@ -39,6 +39,7 @@ from miles.utils.flops_utils import flops_args_from_hf_config, fwd_tflops_per_gp
 from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.object_store import StoreObjectRef
 from miles.utils.profile_utils import TrainProfiler
+from miles.utils.retry_utils import NonRetryableError
 from miles.utils.timer import inverse_timer, timer
 
 logger = logging.getLogger(__name__)
@@ -145,7 +146,10 @@ class TorchNativeTrainRayActor(TrainRayActor):
         witness_info: WitnessInfo | None = None,
         attempt: int = 0,
         external_data: TrainStepOutput | None = None,
+        batch_context: dict | None = None,
     ) -> TrainStepOutput:
+        if batch_context is not None:
+            raise NonRetryableError(f"The {self.backend_name} backend does not support a training validator")
         assert witness_info is None and attempt == 0
         assert (
             external_data is None

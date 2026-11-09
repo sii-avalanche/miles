@@ -23,6 +23,7 @@ from miles.backends.training_utils.loss.hub.math_utils import (
 )
 from miles.backends.training_utils.loss.hub.score_centering_loss import score_centering_loss_function
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.backends.training_utils.validation import current_train_validator
 from miles.utils.function_registry import load_function
 from miles.utils.types import RolloutBatch
 
@@ -130,6 +131,9 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    validator = current_train_validator()
+    if validator is not None:
+        validator.observe(batch, log_probs)
     if args.skip_actor_forward_only:
         trainer_scored_log_probs = [log_prob.detach() for log_prob in log_probs]
     else:

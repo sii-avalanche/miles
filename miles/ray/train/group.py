@@ -196,6 +196,11 @@ class TrainerController:
                     witness_info=witness_info,
                     attempt=attempt,
                     external_data=external_data,
+                    **(
+                        {}
+                        if getattr(rollout_data_pack, "training_context", None) is None
+                        else {"batch_context": rollout_data_pack.training_context}
+                    ),
                 ),
                 debug_name="execute_all_alive_and_catch#train",
                 check_recoverable=False,
@@ -221,7 +226,7 @@ class TrainerController:
 
             return worker_results
 
-        worker_results = await retry(_fn, max_attempts=_RETRY_MAX_ATTEMPTS)
+        worker_results = await retry(_fn, max_attempts=getattr(self.args, "train_max_attempts", _RETRY_MAX_ATTEMPTS))
 
         await self._test_action_executor.run_after_step(rollout_id=rollout_id)
 
@@ -394,7 +399,7 @@ class TrainerController:
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
         weight_versions = await retry(
             lambda _: self._execute_first_alive("update_weights", info=info),
-            max_attempts=_RETRY_MAX_ATTEMPTS,
+            max_attempts=getattr(self.args, "weight_update_max_attempts", _RETRY_MAX_ATTEMPTS),
         )
         return weight_versions[0]
 

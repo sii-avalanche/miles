@@ -1383,6 +1383,21 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "`rollout_batch_size * n_samples_per_prompt // num_steps_per_rollout`."
                 ),
             )
+            parser.add_argument(
+                "--train-max-attempts",
+                type=int,
+                default=30,
+                help="Maximum training RPC attempts; 1 forbids uncertain-update retries.",
+            )
+            parser.add_argument(
+                "--weight-update-max-attempts", type=int, default=30, help="Maximum weight publication RPC attempts."
+            )
+            parser.add_argument(
+                "--custom-train-validator-path",
+                type=str,
+                default=None,
+                help="Optional per-batch validator factory; scores and commit hooks are read-only.",
+            )
             # mbs for the training, will be ignored if `use_dynamic_batch_size` is set.
             reset_arg(parser, "--micro-batch-size", type=int, default=1)
             parser.add_argument(
@@ -4079,6 +4094,7 @@ def miles_validate_args(args):
 
     if args.skip_actor_forward_only:
         validate_skip_actor_forward_only(args)
+        validate_rpc_attempt_limits(args)
 
     validate_score_centering_args(args)
 
@@ -4091,6 +4107,13 @@ def miles_validate_args(args):
         raise ValueError("--mini-ft-controller-enable requires --api-server-port to be set (non-zero)")
 
     _validate_deploy_component(args)
+
+
+def validate_rpc_attempt_limits(args) -> None:
+    for name in ("train_max_attempts", "weight_update_max_attempts"):
+        value = getattr(args, name, 30)
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
 
 
 def validate_skip_actor_forward_only(args) -> None:

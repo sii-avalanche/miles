@@ -18,3 +18,4 @@ class TrainStepOutcome(StrEnum):
 class TrainStepOutput:
     outcome: TrainStepOutcome
     values: StoreObjectRef | None = None
+    commit_receipt: dict | None = None

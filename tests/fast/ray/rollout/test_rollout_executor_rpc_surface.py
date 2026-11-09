@@ -53,3 +53,20 @@ class TestThePackTheTrainerControllerIsGiven:
 
         assert decoded["rollout_data_pack"] == pack
         assert isinstance(decoded["rollout_data_pack"].data_ref, _MooncakeStoreObjectRef)
+
+
+class TestOptionalBatchReceipts:
+    def test_receipt_and_training_context_survive_the_real_rpc_serializer(self):
+        pack = RolloutDataPack(
+            sample_indices=[4],
+            data_ref=_MooncakeStoreObjectRef(payload={"key": "store/4"}),
+            batch_receipt={"digests": {"4": "hash"}, "session_id": "new-session"},
+            training_context={"train_updates_before": 7, "objective": "current_scored_tis"},
+        )
+        restored = _round_trip(pack)
+        assert restored == pack
+        spec = collect_rpc_method_specs(TrainerController)["train"]
+        decoded = spec.serializer.decode_query(
+            spec.serializer.encode_query(dict(rollout_id=7, rollout_data_pack=restored))
+        )
+        assert decoded["rollout_data_pack"].training_context == pack.training_context
