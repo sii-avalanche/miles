@@ -6,10 +6,13 @@ buckets (senders transmit, other ranks join the gathers), and orchestrates
 LoRA adapter pushes.
 """
 
+import asyncio
 import logging
 import random
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import wait
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,6 +34,7 @@ from miles.backends.training_utils.weight_update.session import (
 from miles.backends.training_utils.weight_update.utils import record_lora_checksums
 from miles.utils import async_utils
 from miles.utils.distributed_utils import get_gloo_group
+from miles.utils.http_utils import GeneralHttpClientProvider
 from miles.utils.lora.utils import LORA_ADAPTER_NAME
 from miles.utils.timer import timer
 
@@ -123,6 +127,9 @@ class WeightUpdater:
     @torch.no_grad()
     def update_weights(self) -> None:
         """Run one weight sync: session frame + base-bucket stream + adapter pushes for LoRA."""
+        retries = getattr(self.args, "update_weight_sync_retries", 0)
+        if retries:
+            return self._update_weights_with_retry(retries=retries)
         protocol = self.protocol
         if not protocol.begin_sync(self.weight_version + 1, self._iter_base_buckets):
             return
@@ -170,6 +177,92 @@ class WeightUpdater:
             dist.barrier(group=get_gloo_group())
         protocol.after_engines_resumed()
 
+    def _update_weights_with_retry(self, *, retries):
+        """Keep one target version and replay the entire iterator after reconnecting."""
+        # Keep optional broadcast dependencies out of other transfer modes.
+        from miles.backends.training_utils.weight_update.protocols.broadcast import (
+            WeightSyncResponseError,
+            WeightSyncTransportError,
+        )
+
+        args, protocol = self.args, self.protocol
+        if retries < 1:
+            raise ValueError("Weight sync recovery requires a positive retry budget")
+        if (
+            self.is_lora
+            or args.colocate
+            or args.update_weight_transfer_mode not in ("broadcast", "broadcast_packed")
+            or self.parallel_state.pp.size != 1
+        ):
+            raise ValueError("Weight sync recovery requires non-colocated base-model broadcast with PP=1")
+        driver = dist.get_rank() == 0
+        target_version = self.weight_version + 1
+        _collective_call(lambda: pause_engines(args, protocol.rollout_engines) if driver else None)
+        for attempt in range(retries + 1):
+            _collective_call(
+                lambda: (
+                    begin_weight_update(
+                        protocol.rollout_engines, self._hf_weight_iterator.weight_update_selector, strict=True
+                    )
+                    if driver
+                    else None
+                )
+            )
+            try:
+                with timer("update_weights_implementation"):
+                    self._stream_weights_for_retry()
+            except WeightSyncResponseError as error:
+                if attempt == retries:
+                    raise
+                logger.warning(
+                    "Weight sync version=%s attempt=%s failed; reconnecting and replaying all buckets",
+                    target_version,
+                    attempt + 1,
+                    exc_info=True,
+                )
+                # Lost HTTP replies retain the healthy group; confirmed NCCL aborts
+                # rebuild it only after all ranks have drained their iterator.
+                _collective_call(lambda: async_utils.run(asyncio.wait_for(GeneralHttpClientProvider.reset(), 60.0)))
+                _collective_call(lambda: _abort_session(protocol.rollout_engines) if driver else None)
+                if isinstance(error, WeightSyncTransportError):
+                    _collective_call(protocol.recover_connection)
+            else:
+                break
+        # No retry after commit/resume: that would require coordinating partially resumed engines.
+        _collective_call(lambda: end_weight_update(protocol.rollout_engines) if driver else None)
+        _collective_call(lambda: set_weight_version(protocol.rollout_engines, target_version) if driver else None)
+        _collective_call(lambda: _verify_versions(protocol.rollout_engines, target_version) if driver else None)
+        _collective_call(lambda: resume_engines(protocol.rollout_engines) if driver else None)
+        self.weight_version = target_version
+        protocol.after_engines_resumed()
+
+    def _stream_weights_for_retry(self):
+        from miles.backends.training_utils.weight_update.protocols.broadcast import WeightSyncResponseError
+
+        protocol = self.protocol
+        error = None
+        # Non-senders join iterator gathers but yield no buckets. After a failed send,
+        # drain those gathers without further engine writes before agreeing to retry.
+        for bucket in self._hf_weight_iterator.iter_hf_weights(
+            self.weights_getter(), include_base=True, adapters=[], materialize=protocol.is_sender
+        ):
+            if protocol.is_sender and error is None:
+                try:
+                    protocol.send_bucket(bucket)
+                except WeightSyncResponseError as caught:
+                    # Completed or confirmed-aborted transfers may drain subsequent CUDA gathers.
+                    error = caught
+
+        def finish():
+            if error is not None:
+                raise error
+            protocol.after_base_weights()
+
+        # Non-senders may finish their iterator while the sender still has many
+        # buckets to transmit. Bound this whole-stream wait by the Gloo group's
+        # timeout, not the short control-operation budget.
+        _collective_call(finish, timeout=None)
+
     def _iter_base_buckets(self, *, materialize: bool):
         return self._hf_weight_iterator.iter_hf_weights(self.weights_getter(), materialize=materialize)
 
@@ -191,3 +284,59 @@ class WeightUpdater:
                 config = config | {"r": adapter.rank, "lora_alpha": adapter.alpha}
             register_lora_adapter(rollout_engines, lora_name=lora_name, lora_config=config)
             self._registered_adapters.add(lora_name)
+
+
+def _collective_call(action, *, timeout: timedelta | None = timedelta(seconds=150)):
+    """Agree on failure; None retains the process group's bounded timeout."""
+    # The error type belongs to the optional broadcast protocol.
+    from miles.backends.training_utils.weight_update.protocols.broadcast import (
+        WeightSyncResponseError,
+        WeightSyncTransportError,
+    )
+
+    error = None
+    try:
+        action()
+    except Exception as caught:
+        error = caught
+    status = torch.tensor(
+        (
+            0
+            if error is None
+            else (
+                3
+                if isinstance(error, WeightSyncTransportError)
+                else 1 if isinstance(error, WeightSyncResponseError) else 4
+            )
+        ),
+        dtype=torch.int32,
+        device="cpu",
+    )
+    work = dist.all_reduce(status, op=dist.ReduceOp.MAX, group=get_gloo_group(), async_op=True)
+    if timeout is None:
+        work.wait()
+    else:
+        work.wait(timeout=timeout)
+    if status.item() == 4:
+        raise RuntimeError("Weight synchronization failed; recovery is unsafe") from error
+    if status.item() == 3:
+        raise WeightSyncTransportError("Aborted weight-transfer group on a training rank") from error
+    if status.item() == 1:
+        raise WeightSyncResponseError("Lost weight-sync response on a training rank") from error
+
+
+def _abort_session(engines):
+    futures = [async_utils.submit(engine.abort_weight_update()) for engine in engines]
+    _, pending = wait(futures, timeout=65.0)
+    if pending:
+        raise RuntimeError("Weight session abort did not settle; engines must remain paused")
+    results = async_utils.wait_futures(futures)
+    for result in results:
+        if not isinstance(result, dict) or result.get("success") is not True:
+            raise RuntimeError(f"Cannot confirm weight session abort: {result}")
+
+
+def _verify_versions(engines, target_version):
+    versions = async_utils.wait_futures([async_utils.submit(engine.get_weight_version()) for engine in engines])
+    if any(str(version) != str(target_version) for version in versions):
+        raise RuntimeError(f"Weight version verification failed: expected {target_version}, got {versions}")
