@@ -258,7 +258,10 @@ class WeightUpdater:
                 raise error
             protocol.after_base_weights()
 
-        _collective_call(finish)
+        # Non-senders may finish their iterator while the sender still has many
+        # buckets to transmit. Bound this whole-stream wait by the Gloo group's
+        # timeout, not the short control-operation budget.
+        _collective_call(finish, timeout=None)
 
     def _iter_base_buckets(self, *, materialize: bool):
         return self._hf_weight_iterator.iter_hf_weights(self.weights_getter(), materialize=materialize)
@@ -283,8 +286,8 @@ class WeightUpdater:
             self._registered_adapters.add(lora_name)
 
 
-def _collective_call(action):
-    """Agree on failure before any rank enters another iterator collective."""
+def _collective_call(action, *, timeout: timedelta | None = timedelta(seconds=150)):
+    """Agree on failure; None retains the process group's bounded timeout."""
     # The error type belongs to the optional broadcast protocol.
     from miles.backends.training_utils.weight_update.protocols.broadcast import (
         WeightSyncResponseError,
@@ -310,8 +313,10 @@ def _collective_call(action):
         device="cpu",
     )
     work = dist.all_reduce(status, op=dist.ReduceOp.MAX, group=get_gloo_group(), async_op=True)
-    # Peers may reach agreement before the sender finishes its 65s bucket/abort budget.
-    work.wait(timeout=timedelta(seconds=150))
+    if timeout is None:
+        work.wait()
+    else:
+        work.wait(timeout=timeout)
     if status.item() == 4:
         raise RuntimeError("Weight synchronization failed; recovery is unsafe") from error
     if status.item() == 3:
