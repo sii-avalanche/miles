@@ -46,6 +46,11 @@ class SampleBackfillSubmission:
             # a group returned without spawning its sample tasks, or a stub skipped the callback
             logger.warning(f"samples_in_flight={self.samples_in_flight} with no pending groups; resetting to 0")
             self.samples_in_flight = 0
+        # A single-sample group keeps its slot until the FIFO accepts it,
+        # including completed tasks blocked on a full buffer.
+        if self.group_size == 1 and pending_groups >= group_budget:
+            self._sample_done.clear()
+            return False
         if self.samples_in_flight + self.group_size <= group_budget * self.group_size:
             return True
         self._sample_done.clear()
