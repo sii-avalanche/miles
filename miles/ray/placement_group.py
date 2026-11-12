@@ -243,9 +243,9 @@ async def create_training_models(
             f"{critic_info.restored_rollout_id}"
         )
     else:
-        assert (
-            not critic_configs
-        ), f"a run without --use-critic needs no critic, but the trainer configs are {trainer_configs}"
+        assert not critic_configs, (
+            f"a run without --use-critic needs no critic, but the trainer configs are {trainer_configs}"
+        )
 
     args.start_rollout_id = actor_info.start_rollout_id
 
@@ -286,9 +286,9 @@ def _assert_external_trainer_in_run(identity: DeploymentIdentity, *, args, train
         f"trainer {trainer_id!r} answers as deployment {identity.deploy_instance_id!r}; "
         f"{TRAINER_CONTROLLER_ADDRS_FLAG} entries are keyed by trainer id"
     )
-    assert (
-        identity.trainer_id == trainer_id
-    ), f"{TRAINER_CONTROLLER_ADDRS_FLAG} keys trainer {identity.trainer_id!r} under {trainer_id!r}"
+    assert identity.trainer_id == trainer_id, (
+        f"{TRAINER_CONTROLLER_ADDRS_FLAG} keys trainer {identity.trainer_id!r} under {trainer_id!r}"
+    )
 
 
 # TODO: move (when reorganizing files)
@@ -318,19 +318,21 @@ async def update_weights(
         args, inference_controller=inference_controller, rollout_id=rollout_id, trainer_model_id=trainer_model_id
     )
 
-    if weight_version is not None:
-        kwargs = {} if publication_context is None else {"publication_context": publication_context}
-        await rollout_executor.set_weight_version(weight_version, trainer_model_id=trainer_model_id, **kwargs)
+    acknowledgement = None
     if publication_context is not None:
         if weight_version is None:
             raise RuntimeError("Publication did not return an actual weight version")
-        return {
+        acknowledgement = {
             **publication_context,
             "weight_version": weight_version,
             "published": True,
             "engine_count": len(info.rollout_engines),
             "engine_cells": sorted(info.snapshot_cell_id_to_hashes),
         }
+    if weight_version is not None:
+        kwargs = {} if acknowledgement is None else {"publication_context": acknowledgement}
+        await rollout_executor.set_weight_version(weight_version, trainer_model_id=trainer_model_id, **kwargs)
+    return acknowledgement
 
 
 async def _maybe_log_inference_engine_weight_checksums(

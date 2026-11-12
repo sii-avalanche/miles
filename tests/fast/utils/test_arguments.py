@@ -114,7 +114,6 @@ def make_function_without_add_arguments():
 
 @pytest.mark.parametrize("path_arg", PATH_ARGS)
 class TestAddArgumentsSupport:
-
     @pytest.mark.parametrize("fn_factory", [make_class_with_add_arguments, make_function_with_add_arguments])
     def test_add_arguments_is_called_and_arg_is_parsed(self, path_arg, fn_factory):
         fn = fn_factory()
@@ -518,10 +517,13 @@ def test_the_flag_and_a_matching_path_agree():
 
 
 def test_the_flag_still_rejects_a_different_rollout_function():
-    """Two different selections remain a misconfiguration."""
-    args = _fully_async_candidate_args(fully_async=True, rollout_function_path="pkg.CustomRolloutFn")
+    """A synchronous plugin cannot silently replace the continuous producer."""
+    args = _fully_async_candidate_args(
+        fully_async=True,
+        rollout_function_path="miles.rollout.inference_rollout.inference_rollout_common.InferenceRolloutFn",
+    )
 
-    with pytest.raises(AssertionError, match="pass only one"):
+    with pytest.raises(ValueError, match="must subclass FullyAsyncRolloutFn"):
         _resolve_rollout_functions(args)
 
 
@@ -557,7 +559,6 @@ def test_fully_async_rejects_abort_pause_mode():
 
 
 class TestClusterBackend:
-
     def _parse(self, extra):
         parser = argparse.ArgumentParser()
         get_miles_extra_args_provider()(parser)

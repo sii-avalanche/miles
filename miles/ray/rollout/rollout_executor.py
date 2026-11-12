@@ -332,6 +332,8 @@ class RolloutExecutor:
 
     # TODO the train and eval rollout functions will become one object, so one save/load is enough here
     def save(self, rollout_id: int, checkpoint_context: dict | None = None) -> None:
+        if not self.use_legacy_rollout_v1 and (prepare := getattr(self.generate_rollout, "prepare_checkpoint", None)):
+            prepare(rollout_id, checkpoint_context)
         if checkpoint_context is None:
             self.data_source.save(rollout_id)
         else:
@@ -374,7 +376,11 @@ class RolloutExecutor:
             not self.use_legacy_rollout_v1
             and (notify := getattr(self.generate_rollout, "set_weight_version", None)) is not None
         ):
-            notify(weight_version, trainer_model_id=trainer_model_id)
+            acknowledge = getattr(self.generate_rollout, "acknowledge_publication", None)
+            if acknowledge is not None:
+                acknowledge(weight_version, publication_context, trainer_model_id=trainer_model_id)
+            else:
+                notify(weight_version, trainer_model_id=trainer_model_id)
 
     def set_train_parallel_config(self, config: dict[str, Any], trainer_model_id: str | None = None) -> None:
         self._train_parallel_configs_of_model_id[trainer_model_id] = config

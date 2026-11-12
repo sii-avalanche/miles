@@ -77,6 +77,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
             self._recycle if input.args.async_unused_samples_handler == "retry" else (lambda prompt_group: None)
         )
         self._sample_filter = load_function(input.args.rollout_sample_filter_path)
+        self._active: dict[asyncio.Task, list[Sample]] = {}
         self._worker: asyncio.Task | None = None
         self._eval_prompt_dataset_cache: dict = {}
         self._producer_resumed = asyncio.Event()
@@ -93,23 +94,27 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         if input.evaluation:
             return await self._call_eval(input)
         if self._worker is None:
-            default_buffer_cls = (
-                DefaultMultiDataBuffer if resolve_megatron_config(self.args).is_multi_policy else DefaultDataBuffer
-            )
-            buffer_cls = load_function(self.args.custom_async_data_buffer_path) or default_buffer_cls
-            self._output = buffer_cls(
-                DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused)
-            )
+            self._output = self._create_buffer()
             for model_id, version in self._published_versions.items():
                 self._output.report_pool("weight_published", current_version=version, trainer_model_id=model_id)
             self._worker = asyncio.create_task(self._worker_loop())
             logger.info("Started fully-async rollout worker")
         return await self._drain(input)
 
+    def _create_buffer(self) -> DataBuffer:
+        default_cls = (
+            DefaultMultiDataBuffer if resolve_megatron_config(self.args).is_multi_policy else DefaultDataBuffer
+        )
+        buffer_cls = load_function(self.args.custom_async_data_buffer_path) or default_cls
+        return buffer_cls(DataBufferConstructorInput(args=self.args, unused_handler_fn=self._handle_unused))
+
     async def dispose(self) -> None:
         if (worker := self._worker) is None:
             return
-        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_end_worker(worker), worker.get_loop()))
+        if asyncio.get_running_loop() is worker.get_loop():
+            await _end_worker(worker)
+        else:
+            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_end_worker(worker), worker.get_loop()))
 
     async def _call_eval(self, input: RolloutFnEvalInput) -> RolloutFnOutput:
         if input.generate_state is not None:
@@ -150,16 +155,27 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         return DataBufferInput(prompt_group=prompt_group, group=result)
 
     async def _worker_loop(self) -> None:
-        active: dict[asyncio.Task, list[Sample]] = {}
-        while True:
-            await self._producer_resumed.wait()
-            while self._scheduler.has_capacity(pending_groups=len(active), group_budget=self._max_in_flight_groups()):
-                task, prompt_group = self._submit_one_group()
-                active[task] = prompt_group
-            done, _ = await self._scheduler.wait_for_progress(set(active))
-            for task in done:
-                entry = self._collect_group_result(task, active.pop(task))
-                await self._output.put(entry)
+        active = self._active
+        try:
+            while True:
+                await self._producer_resumed.wait()
+                while self._scheduler.has_capacity(
+                    pending_groups=len(active), group_budget=self._max_in_flight_groups()
+                ):
+                    task, prompt_group = self._submit_one_group()
+                    active[task] = prompt_group
+                done, _ = await self._scheduler.wait_for_progress(set(active))
+                for task in done:
+                    entry = self._collect_group_result(task, active[task])
+                    # Keep completed-but-blocked puts visible to checkpoint adapters.
+                    await self._output.put(entry)
+                    del active[task]
+        finally:
+            for task in active:
+                task.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+            active.clear()
 
     def _collect_group_result(self, task: asyncio.Task, prompt_group: list[Sample]) -> DataBufferInput:
         if not task.cancelled():
@@ -200,6 +216,7 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
         finally:
             if not queue_get.done():
                 queue_get.cancel()
+                await asyncio.gather(queue_get, return_exceptions=True)
 
     async def _drain(self, input: RolloutFnTrainInput) -> RolloutFnTrainOutput:
         args = self.args
@@ -251,4 +268,4 @@ class FullyAsyncRolloutFn(BaseRolloutFn):
 
 async def _end_worker(worker: asyncio.Task) -> None:
     worker.cancel()
-    await asyncio.wait({worker})
+    await asyncio.gather(worker, return_exceptions=True)

@@ -8,6 +8,7 @@ Every group-level decision lives here — what to keep, what to hand to
 """
 
 import asyncio
+import copy
 import logging
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
@@ -22,7 +23,6 @@ from miles.rollout.filter_hub.common_filters import (
     GroupWeightVersionStats,
     apply_aborted_filter,
     apply_missing_reward_filter,
-    group_staleness,
     group_weight_version_stats,
 )
 from miles.utils.function_registry import load_function
@@ -164,6 +164,29 @@ class DefaultDataBuffer(DataBuffer):
         self._metric_selected_samples = 0
         self._metric_selected_versioned_samples = 0
 
+    def _version_stats(self, group: Group) -> GroupWeightVersionStats:
+        """Override interpretation without replacing FIFO/filtering or mutating samples."""
+        return group_weight_version_stats(group)
+
+    def state_dict(self) -> dict:
+        """Detached finished entries; call on the owning loop without yielding."""
+        return dict(format=1, entries=copy.deepcopy(self._buffer))
+
+    def load_state_dict(self, state: dict) -> None:
+        if state.get("format") != 1 or self._buffer:
+            raise ValueError("Invalid or nonempty data buffer restore")
+        entries = copy.deepcopy(state["entries"])
+        if len(entries) > self._capacity or any(not isinstance(e, DataBufferInput) for e in entries):
+            raise ValueError("Restored data buffer exceeds capacity or has invalid entries")
+        self._buffer = entries
+        if self._dashboard_enabled:
+            for entry in entries:
+                stats = self._version_stats(entry.group)
+                mixed = int(stats.oldest_version != stats.newest_version)
+                self._queued_versions.append((stats.oldest_version, mixed))
+                self._version_counts[stats.oldest_version] += 1
+                self._mixed_groups += mixed
+
     def report_pool(self, event: str, *, trainer_model_id: str | None = None, **details) -> None:
         if event == "weight_published":
             self._published_version = details.pop("current_version")
@@ -188,7 +211,7 @@ class DefaultDataBuffer(DataBuffer):
                 await self._cond.wait()
             self._buffer.append(input)
             if self._dashboard_enabled:
-                stats = group_weight_version_stats(input.group)
+                stats = self._version_stats(input.group)
                 mixed = int(stats.oldest_version != stats.newest_version)
                 self._queued_versions.append((stats.oldest_version, mixed))
                 self._version_counts[stats.oldest_version] += 1
@@ -235,7 +258,7 @@ class DefaultDataBuffer(DataBuffer):
                     self.report_pool("get")
                 self._cond.notify_all()  # wake producers blocked on a full buffer
 
-                version_stats = group_weight_version_stats(entry.group)
+                version_stats = self._version_stats(entry.group)
                 staleness = version_stats.oldest_lag(current_version)
                 if staleness is not None:
                     if self._args.max_weight_staleness is not None and staleness > self._args.max_weight_staleness:
@@ -294,7 +317,9 @@ class DefaultDataBuffer(DataBuffer):
                 self._metric_selected_versioned_samples / self._metric_selected_samples
             )
         buffered = [
-            s for entry in self._buffer if (s := group_staleness(entry.group, self._current_version)) is not None
+            s
+            for entry in self._buffer
+            if (s := self._version_stats(entry.group).oldest_lag(self._current_version)) is not None
         ]
         if buffered:
             metrics[f"{prefix}buffer_avg_staleness"] = sum(buffered) / len(buffered)

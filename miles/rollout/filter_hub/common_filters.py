@@ -34,7 +34,7 @@ class GroupWeightVersionStats:
         return current_version - self.token_version_sum / self.versioned_token_count
 
 
-def group_weight_version_stats(group: Group) -> GroupWeightVersionStats:
+def group_weight_version_stats(group: Group, *, version_resolver=None) -> GroupWeightVersionStats:
     sample_count = 0
     versioned_sample_count = 0
     versioned_token_count = 0
@@ -46,9 +46,12 @@ def group_weight_version_stats(group: Group) -> GroupWeightVersionStats:
         sample_count += 1
         sample_has_version = False
         for span in sample.all_weight_version_spans:
-            if not str(span.version).isdigit():
-                continue
-            version = int(span.version)
+            if version_resolver is not None:
+                version = version_resolver(sample, span.version)
+            else:
+                if not str(span.version).isdigit():
+                    continue
+                version = int(span.version)
             token_count = span.abs_end - span.abs_start
             versioned_token_count += token_count
             token_version_sum += version * token_count

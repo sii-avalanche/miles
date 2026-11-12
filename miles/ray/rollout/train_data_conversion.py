@@ -469,6 +469,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "opd_reverse_kl",
             "seq_witness_ids",
             "weight_versions",
+            "metadata",
             "adapter_slots",
             "loss_weights",
             "advantages",
