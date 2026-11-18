@@ -51,7 +51,7 @@ class TurnReward:
 
     def scores(self, traces: tuple[Trace, ...], reward: Reward) -> dict[Trace, float]:
         # Only this opt-in mode requires AvaCore's AvaAudit reward plugin.
-        from ava_core.rewards.avaaudit import resolve_turn_tags
+        from ava_core.core.avaaudit import resolve_turn_tags
 
         tags = resolve_turn_tags(traces, reward.metadata["audit"])
         unknown = {tag for names in tags.values() for tag in names if tag not in self.tag_scores}
