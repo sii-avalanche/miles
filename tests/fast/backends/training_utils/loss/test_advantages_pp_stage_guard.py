@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from miles.backends.training_utils.loss.objective import compute_advantages_and_returns
@@ -63,13 +64,14 @@ def test_last_pp_stage_computes_advantages_with_rollout_log_probs() -> None:
     assert rollout_data["advantages"][0].shape == (4,)
 
 
-def test_grpo_turn_offsets_survive_zero_outcome_advantage():
+@pytest.mark.parametrize("grpo_advantage", [0.8, -0.8, 0.0])
+def test_grpo_turn_weights_scale_outcome_advantage(grpo_advantage):
     make_parallel_state()
     data = _rollout_data("rollout_log_probs", with_values=False)
-    data["rewards"] = [0.0]
-    offsets = torch.tensor([0.15, 0.15, 0.0, -0.2])
-    data["turn_advantage_offsets"] = [offsets]
+    data["rewards"] = [grpo_advantage]
+    data["turn_advantage_weights"] = [[0.65, 0.65, 0.5, 0.3]]
     args = make_args(advantage_estimator="grpo", use_rollout_logprobs=True, kl_coef=0.0, normalize_advantages=False)
     compute_advantages_and_returns(args, data)
-    torch.testing.assert_close(data["advantages"][0], offsets)
-    torch.testing.assert_close(data["returns"][0], torch.zeros_like(offsets))
+    expected = torch.tensor([0.52, 0.52, 0.40, 0.24]) * (grpo_advantage / 0.8)
+    torch.testing.assert_close(data["advantages"][0], expected)
+    torch.testing.assert_close(data["returns"][0], torch.full_like(expected, grpo_advantage))

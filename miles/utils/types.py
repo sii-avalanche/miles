@@ -87,6 +87,7 @@ class Sample:
     reward: float | dict[str, Any] | None = None
     loss_mask: list[int] | None = None
     weight_versions: list[WeightVersionsPerCall] = field(default_factory=list)
+    # Per-response-token turn scores in raw outcome reward units. None disables weighting.
     turn_advantage_offsets: list[float] | None = field(default=None, kw_only=True)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     rollout_topk_token_ids: numpy.ndarray | None = None  # [response_length, k], int32; -1 pads unused slots

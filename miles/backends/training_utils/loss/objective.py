@@ -125,19 +125,19 @@ def compute_advantages_and_returns(
     if args.normalize_advantages:
         advantages = normalize_advantages(args, advantages, loss_masks, total_lengths, response_lengths, max_seq_lens)
 
-    if "turn_advantage_offsets" in rollout_data:
-        offsets = rollout_data["turn_advantage_offsets"]
+    if "turn_advantage_weights" in rollout_data:
+        weights = rollout_data["turn_advantage_weights"]
         # Slice after any multimodal expansion, using the same response coordinates as policy logprobs.
         shaped = []
-        for i, (adv, offset, total, response) in enumerate(
-            zip(advantages, offsets, total_lengths, response_lengths, strict=True)
+        for i, (adv, weight, total, response) in enumerate(
+            zip(advantages, weights, total_lengths, response_lengths, strict=True)
         ):
             local = slice_log_prob_with_cp(
-                torch.as_tensor(offset), total, response, args.qkv_format, max_seq_lens[i] if max_seq_lens else None
+                torch.as_tensor(weight), total, response, args.qkv_format, max_seq_lens[i] if max_seq_lens else None
             )
             if adv.shape != local.shape:
                 raise ValueError("Turn credit and local advantages must have the same shape")
-            shaped.append(adv + local.to(device=adv.device, dtype=adv.dtype))
+            shaped.append(adv * local.to(device=adv.device, dtype=adv.dtype))
         advantages = shaped
 
     rollout_data["advantages"] = advantages

@@ -241,11 +241,11 @@ def expand_multimodal_rollout_data_in_place(
             token_or_mask_changed = token_or_mask_changed or (
                 (new_tokens.size(0) != token_tensor.size(0)) or (new_loss_mask.size(0) != loss_mask_tensor.size(0))
             )
-            if "turn_advantage_offsets" in rollout_data and new_loss_mask.numel() != loss_mask_tensor.numel():
-                offsets = rollout_data["turn_advantage_offsets"]
+            if "turn_advantage_weights" in rollout_data and new_loss_mask.numel() != loss_mask_tensor.numel():
+                weights = rollout_data["turn_advantage_weights"]
                 # Insert zero credit at expanded response-side media positions just like the loss mask.
-                _, offsets[i] = _expand_image_tokens_for_sample(
-                    token_tensor, torch.as_tensor(offsets[i]), mm_inputs_list[i]["grid_thws"], media_token_id
+                _, weights[i] = _expand_image_tokens_for_sample(
+                    token_tensor, torch.as_tensor(weights[i]), mm_inputs_list[i]["grid_thws"], media_token_id
                 )
             expanded_tokens.append(new_tokens)
             expanded_loss_masks.append(new_loss_mask)
