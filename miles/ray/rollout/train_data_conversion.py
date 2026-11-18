@@ -26,6 +26,7 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
     "rollout_sampling_mask_ids": "int32",
     "rollout_sampling_mask_offsets": "int64",
     "teacher_log_probs": "float32",
+    "turn_advantage_offsets": "float32",
     "opd_reverse_kl": "float32",
     "rollout_routed_experts": "int32",
     "rollout_indexer_topk": "int32",
@@ -105,6 +106,16 @@ def convert_samples_to_train_data(
             sample.loss_mask = [0] * sample.response_length
         loss_masks.append(sample.loss_mask)
     train_data["loss_masks"] = loss_masks
+    if any(s.turn_advantage_offsets is not None for s in samples):
+        offsets = []
+        for sample in samples:
+            values = sample.turn_advantage_offsets
+            if values is None:
+                values = [0.0] * sample.response_length
+            if len(values) != sample.response_length:
+                raise ValueError("Turn credit must align with the complete response")
+            offsets.append(values)
+        train_data["turn_advantage_offsets"] = offsets
 
     train_data["rollout_mask_sums"] = _compute_rollout_mask_sums(train_data["rollout_ids"], loss_masks)
 
@@ -457,6 +468,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "rollout_indexer_topk",
             "prompt",
             "teacher_log_probs",
+            "turn_advantage_offsets",
             "opd_reverse_kl",
             "seq_witness_ids",
             "weight_versions",

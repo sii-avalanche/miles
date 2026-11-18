@@ -5,7 +5,7 @@ import os
 from argparse import Namespace
 from collections.abc import Iterator, Mapping
 from contextlib import AsyncExitStack
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -40,6 +40,26 @@ __all__ = ["AvaCoreRollout", "generate"]
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class TurnReward:
+    tag_scores: dict[str, float]
+    weight: float = 1.0
+
+    def __post_init__(self):
+        if not self.tag_scores or not all(isfinite(x) for x in (*self.tag_scores.values(), self.weight)):
+            raise ValueError("turn_reward requires finite tag_scores and weight")
+
+    def scores(self, traces: tuple[Trace, ...], reward: Reward) -> dict[Trace, float]:
+        # Only this opt-in mode requires AvaCore's AvaAudit reward plugin.
+        from ava_core.rewards.avaaudit import resolve_turn_tags
+
+        tags = resolve_turn_tags(traces, reward.metadata["audit"])
+        unknown = {tag for names in tags.values() for tag in names if tag not in self.tag_scores}
+        if unknown:
+            raise ValueError(f"Missing turn_reward.tag_scores for {sorted(unknown)}")
+        return {node: self.weight * sum(self.tag_scores[tag] for tag in names) for node, names in tags.items()}
+
+
 class AvaCoreRollout:
     def __init__(self, args: Namespace, config: Mapping[str, Any]) -> None:
         os.environ["SGLANG_ROUTER_URL"] = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
@@ -51,6 +71,9 @@ class AvaCoreRollout:
         reward = interpolated(self.config["reward"])
         self.grouped = reward["kind"] in GroupRewardFunction.kinds
         self.reward_fn = conv.structure(reward, GroupRewardFunction if self.grouped else RewardFunction)
+        self.turn_reward = TurnReward(**config["turn_reward"]) if "turn_reward" in config else None
+        if self.turn_reward and (args.advantage_estimator != "grpo" or args.loss_type != "policy_loss"):
+            raise ValueError("turn_reward requires GRPO with policy_loss")
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
@@ -72,7 +95,9 @@ class AvaCoreRollout:
             return [sample]
         row, traces, sampling_params = rolled
         try:
-            reward = await self.reward_fn(traces[0], row)
+            # Older AvaCore scorers only accept the final tip.
+            score_rollout = getattr(self.reward_fn, "evaluate_rollout", None)
+            reward = await score_rollout(traces, row) if score_rollout else await self.reward_fn(traces[0], row)
         except RECOVERABLE_ERRORS as error:
             logger.warning("AvaCore reward of sample %s failed: %r", sample.index, error)
             sample.status = Sample.Status.ABORTED
@@ -183,6 +208,11 @@ class AvaCoreRollout:
         assert any(
             node.segments for node in iter_trace_nodes(traces)
         ), "AvaCore rollouts must drive the policy through a token-level client"
+        turn_scores = (
+            await asyncio.to_thread(self.turn_reward.scores, traces, reward)
+            if self.turn_reward and not evaluation
+            else None
+        )
         owned: set[Trace] = set()
         samples = []
         for trace in conversation_tips(traces):
@@ -198,6 +228,7 @@ class AvaCoreRollout:
                         trace,
                         reward.score,
                         owned=set(owned),
+                        turn_scores=turn_scores,
                         evaluation=evaluation,
                     )
                 )
@@ -310,6 +341,7 @@ def filled(
     reward: float,
     *,
     owned: set[Trace] | None = None,
+    turn_scores: dict[Trace, float] | None = None,
     evaluation: bool = False,
 ) -> Sample:
     owned = owned or set()
@@ -328,6 +360,13 @@ def filled(
         for _ in segment.tokens
     ]
     sample.loss_mask = mask[prompt_length:length]
+    if turn_scores is not None:
+        credit = []
+        for node in trace.prefixes:
+            score = turn_scores.get(node, 0.0) if node not in owned else 0.0
+            for segment in node.segments:
+                credit.extend([score if segment.is_generated else 0.0] * len(segment.tokens))
+        sample.turn_advantage_offsets = credit[prompt_length:length]
     for segment in segments:
         if segment.is_generated and (
             len(segment.log_probs) != len(segment.tokens)

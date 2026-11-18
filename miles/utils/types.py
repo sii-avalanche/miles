@@ -87,6 +87,7 @@ class Sample:
     reward: float | dict[str, Any] | None = None
     loss_mask: list[int] | None = None
     weight_versions: list[WeightVersionsPerCall] = field(default_factory=list)
+    turn_advantage_offsets: list[float] | None = field(default=None, kw_only=True)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     rollout_topk_token_ids: numpy.ndarray | None = None  # [response_length, k], int32; -1 pads unused slots
     rollout_topk_log_probs: numpy.ndarray | None = None  # [response_length, k], float32; -inf pads unused slots
@@ -252,6 +253,8 @@ class Sample:
             assert (
                 len(self.loss_mask) == self.response_length
             ), f"loss_mask length ({len(self.loss_mask)}) != response_length ({self.response_length})"
+        if self.turn_advantage_offsets is not None:
+            assert len(self.turn_advantage_offsets) == self.response_length
         if self.rollout_log_probs is not None:
             assert (
                 len(self.rollout_log_probs) == self.response_length
@@ -310,6 +313,8 @@ class Sample:
         ), f"cannot strip {n} tokens: only {self.response_length} output tokens available"
         self.tokens = self.tokens[:-n]
         self.response_length -= n
+        if self.turn_advantage_offsets is not None:
+            self.turn_advantage_offsets = self.turn_advantage_offsets[:-n]
         if self.rollout_topk_token_ids is not None:
             self.rollout_topk_token_ids = self.rollout_topk_token_ids[:-n]
             self.rollout_topk_log_probs = self.rollout_topk_log_probs[:-n]
@@ -353,6 +358,7 @@ class Sample:
         self.reward = None
         self.loss_mask = None
         self.weight_versions = []
+        self.turn_advantage_offsets = None
         self.rollout_log_probs = None
         self.rollout_topk_token_ids = None
         self.rollout_topk_log_probs = None

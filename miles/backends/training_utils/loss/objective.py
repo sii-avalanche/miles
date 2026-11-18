@@ -2,7 +2,11 @@ from argparse import Namespace
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from miles.backends.training_utils.data.context_parallel import get_local_response_loss_masks, get_sum_of_sample_mean
+from miles.backends.training_utils.data.context_parallel import (
+    get_local_response_loss_masks,
+    get_sum_of_sample_mean,
+    slice_log_prob_with_cp,
+)
 from miles.backends.training_utils.loss.hub.advantages import compute_advantages, normalize_advantages
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values  # noqa: F401
 from miles.backends.training_utils.loss.hub.losses import get_loss_function
@@ -120,6 +124,21 @@ def compute_advantages_and_returns(
 
     if args.normalize_advantages:
         advantages = normalize_advantages(args, advantages, loss_masks, total_lengths, response_lengths, max_seq_lens)
+
+    if "turn_advantage_offsets" in rollout_data:
+        offsets = rollout_data["turn_advantage_offsets"]
+        # Slice after any multimodal expansion, using the same response coordinates as policy logprobs.
+        shaped = []
+        for i, (adv, offset, total, response) in enumerate(
+            zip(advantages, offsets, total_lengths, response_lengths, strict=True)
+        ):
+            local = slice_log_prob_with_cp(
+                torch.as_tensor(offset), total, response, args.qkv_format, max_seq_lens[i] if max_seq_lens else None
+            )
+            if adv.shape != local.shape:
+                raise ValueError("Turn credit and local advantages must have the same shape")
+            shaped.append(adv + local.to(device=adv.device, dtype=adv.dtype))
+        advantages = shaped
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns

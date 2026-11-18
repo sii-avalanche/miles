@@ -61,3 +61,15 @@ def test_last_pp_stage_computes_advantages_with_rollout_log_probs() -> None:
     assert len(rollout_data["advantages"]) == 1
     assert len(rollout_data["returns"]) == 1
     assert rollout_data["advantages"][0].shape == (4,)
+
+
+def test_grpo_turn_offsets_survive_zero_outcome_advantage():
+    make_parallel_state()
+    data = _rollout_data("rollout_log_probs", with_values=False)
+    data["rewards"] = [0.0]
+    offsets = torch.tensor([0.15, 0.15, 0.0, -0.2])
+    data["turn_advantage_offsets"] = [offsets]
+    args = make_args(advantage_estimator="grpo", use_rollout_logprobs=True, kl_coef=0.0, normalize_advantages=False)
+    compute_advantages_and_returns(args, data)
+    torch.testing.assert_close(data["advantages"][0], offsets)
+    torch.testing.assert_close(data["returns"][0], torch.zeros_like(offsets))
