@@ -2,11 +2,7 @@ from argparse import Namespace
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from miles.backends.training_utils.data.context_parallel import (
-    get_local_response_loss_masks,
-    get_sum_of_sample_mean,
-    slice_log_prob_with_cp,
-)
+from miles.backends.training_utils.data.context_parallel import get_local_response_loss_masks, get_sum_of_sample_mean
 from miles.backends.training_utils.loss.hub.advantages import compute_advantages, normalize_advantages
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values  # noqa: F401
 from miles.backends.training_utils.loss.hub.losses import get_loss_function
@@ -125,20 +121,14 @@ def compute_advantages_and_returns(
     if args.normalize_advantages:
         advantages = normalize_advantages(args, advantages, loss_masks, total_lengths, response_lengths, max_seq_lens)
 
-    if "turn_advantage_weights" in rollout_data:
-        weights = rollout_data["turn_advantage_weights"]
-        # Slice after any multimodal expansion, using the same response coordinates as policy logprobs.
-        shaped = []
-        for i, (adv, weight, total, response) in enumerate(
-            zip(advantages, weights, total_lengths, response_lengths, strict=True)
-        ):
-            local = slice_log_prob_with_cp(
-                torch.as_tensor(weight), total, response, args.qkv_format, max_seq_lens[i] if max_seq_lens else None
-            )
-            if adv.shape != local.shape:
-                raise ValueError("Turn credit and local advantages must have the same shape")
-            shaped.append(adv * local.to(device=adv.device, dtype=adv.dtype))
-        advantages = shaped
+    if (weights := rollout_data.get("turn_advantage_weights")) is not None:
+        local_weights = get_local_response_loss_masks(
+            total_lengths, response_lengths, [torch.as_tensor(w) for w in weights], args.qkv_format, max_seq_lens
+        )
+        pairs = list(zip(advantages, local_weights, strict=True))
+        if any(adv.shape != weight.shape for adv, weight in pairs):
+            raise ValueError("Turn credit and local advantages must have the same shape")
+        advantages = [adv * weight.to(adv) for adv, weight in pairs]
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
