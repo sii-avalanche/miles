@@ -57,8 +57,7 @@ class AvaCoreRollout:
                 raise ValueError("turn_reward requires an audited reward")
             if "turn_reward" in scorer:
                 raise ValueError("Configure turn_reward only once")
-            scorer = {**scorer, "turn_reward": interpolated(config["turn_reward"])}
-            reward = {**reward, "reward": scorer} if reward["kind"] == "remote_reward" else scorer
+            scorer["turn_reward"] = interpolated(config["turn_reward"])
         self.grouped = reward["kind"] in GroupRewardFunction.kinds
         self.reward_fn = conv.structure(reward, GroupRewardFunction if self.grouped else RewardFunction)
         self.turn_reward = bool(scorer and scorer.get("turn_reward") is not None)
@@ -343,20 +342,18 @@ def filled(
     sample.tokens = trace.tokens[:length]
     sample.response = "".join(segment.template for segment in segments[1:])
     sample.response_length = length - prompt_length
-    mask = [
-        int(segment.is_generated and node not in owned)
-        for node in trace.prefixes
-        for segment in node.segments
-        for _ in segment.tokens
-    ]
+    mask = []
+    offsets = []
+    for node in trace.prefixes:
+        score = turn_scores.get(node, 0.0) if turn_scores is not None else 0.0
+        for segment in node.segments:
+            trained = segment.is_generated and node not in owned
+            mask.extend([int(trained)] * len(segment.tokens))
+            if turn_scores is not None:
+                offsets.extend([score if trained else 0.0] * len(segment.tokens))
     sample.loss_mask = mask[prompt_length:length]
     if turn_scores is not None:
-        credit = []
-        for node in trace.prefixes:
-            score = turn_scores.get(node, 0.0) if node not in owned else 0.0
-            for segment in node.segments:
-                credit.extend([score if segment.is_generated else 0.0] * len(segment.tokens))
-        sample.turn_advantage_offsets = credit[prompt_length:length]
+        sample.turn_advantage_offsets = offsets[prompt_length:length]
     for segment in segments:
         if segment.is_generated and (
             len(segment.log_probs) != len(segment.tokens)
