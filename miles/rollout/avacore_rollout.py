@@ -5,7 +5,7 @@ import os
 from argparse import Namespace
 from collections.abc import Iterator, Mapping
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -40,26 +40,6 @@ __all__ = ["AvaCoreRollout", "generate"]
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class TurnReward:
-    tag_scores: dict[str, float]
-    weight: float = 1.0
-
-    def __post_init__(self):
-        if not self.tag_scores or not all(isfinite(x) for x in (*self.tag_scores.values(), self.weight)):
-            raise ValueError("turn_reward requires finite tag_scores and weight")
-
-    def scores(self, traces: tuple[Trace, ...], reward: Reward) -> dict[Trace, float]:
-        # Only this opt-in mode requires AvaCore's AvaAudit reward plugin.
-        from ava_core.core.avaaudit import resolve_turn_tags
-
-        tags = resolve_turn_tags(traces, reward.metadata["audit"])
-        unknown = {tag for names in tags.values() for tag in names if tag not in self.tag_scores}
-        if unknown:
-            raise ValueError(f"Missing turn_reward.tag_scores for {sorted(unknown)}")
-        return {node: self.weight * sum(self.tag_scores[tag] for tag in names) for node, names in tags.items()}
-
-
 class AvaCoreRollout:
     def __init__(self, args: Namespace, config: Mapping[str, Any]) -> None:
         os.environ["SGLANG_ROUTER_URL"] = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
@@ -69,9 +49,19 @@ class AvaCoreRollout:
         conv = launch_converter()
         self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
         reward = interpolated(self.config["reward"])
+        # AvaTrain passes the full TOML. Forward the legacy top-level table
+        # to the audited scorer, including when it runs in the remote service.
+        scorer = reward.get("reward") if reward["kind"] == "remote_reward" else reward
+        if "turn_reward" in config:
+            if not scorer or scorer["kind"] not in ("audited", "avaaudit"):
+                raise ValueError("turn_reward requires an audited reward")
+            if "turn_reward" in scorer:
+                raise ValueError("Configure turn_reward only once")
+            scorer = {**scorer, "turn_reward": interpolated(config["turn_reward"])}
+            reward = {**reward, "reward": scorer} if reward["kind"] == "remote_reward" else scorer
         self.grouped = reward["kind"] in GroupRewardFunction.kinds
         self.reward_fn = conv.structure(reward, GroupRewardFunction if self.grouped else RewardFunction)
-        self.turn_reward = TurnReward(**config["turn_reward"]) if "turn_reward" in config else None
+        self.turn_reward = bool(scorer and scorer.get("turn_reward") is not None)
         if self.turn_reward and (args.advantage_estimator != "grpo" or args.loss_type != "policy_loss"):
             raise ValueError("turn_reward requires GRPO with policy_loss")
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
@@ -208,11 +198,11 @@ class AvaCoreRollout:
         assert any(
             node.segments for node in iter_trace_nodes(traces)
         ), "AvaCore rollouts must drive the policy through a token-level client"
-        turn_scores = (
-            await asyncio.to_thread(self.turn_reward.scores, traces, reward)
-            if self.turn_reward and not evaluation
-            else None
-        )
+        turn_scores = None
+        if self.turn_reward and not evaluation:
+            from ava_core.rewards.audited import resolve_turn_scores
+
+            turn_scores = await asyncio.to_thread(resolve_turn_scores, traces, reward.metadata["audit"])
         owned: set[Trace] = set()
         samples = []
         for trace in conversation_tips(traces):
