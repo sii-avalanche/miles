@@ -174,6 +174,10 @@ class TrainerController:
     ) -> list[TrainStepOutput]:
         """Do one rollout training"""
 
+        if getattr(self.args, "debug_rollout_only", False):
+            # The executor returns an empty pack; do not dispatch it to training workers.
+            return []
+
         assert (
             external_data is None or len(self._cells) == 1
         ), "external_data is only supported for a single cell, i.e. without independent DP"

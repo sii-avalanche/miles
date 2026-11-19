@@ -166,6 +166,13 @@ class RolloutExecutor:
         log_rollout_data(
             rollout_id, self.args, data, metrics, time.time() - start_time, trainer_model_id=trainer_model_id
         )
+        if self.args.debug_rollout_only:
+            # Rollout-only runs need no training tensors or DP-aligned microbatches.
+            logger.info(
+                "Rollout-only batch completed: rollout_id=%s; skipping training data and DP scheduling", rollout_id
+            )
+            return RolloutDataPack()
+
         data = convert_samples_to_train_data(
             self.args,
             data,
