@@ -5,7 +5,6 @@ from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
-import pybase64
 
 from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sampling
 from miles.utils.sampling_mask import RolloutSamplingMask
@@ -43,7 +42,7 @@ def configure_rollout_topk_logprobs_request(args: Namespace, request: dict[str, 
 def append_rollout_topk_logprobs(
     sample: Sample, meta: Mapping[str, Any], k: int, *, sampling_logprobs_mode: str = "selected"
 ) -> None:
-    """Append compact [response, k] arrays after appending generated tokens.
+    """Append [response, k] arrays after appending generated tokens.
 
     No rescoring is allowed: with stale rollouts it would replace the behavior
     policy. Slots unavailable from the server are represented by ID -1/logp -inf.
@@ -55,11 +54,9 @@ def append_rollout_topk_logprobs(
     n = len(meta.get("output_token_logprobs") or [])
     support_mode = sampling_logprobs_mode == "support"
     field = "output_token_sampling_logprobs" if support_mode else "output_top_logprobs"
-    compact = meta.get("output_top_logprobs_compact")
-    if compact is not None:
-        if support_mode or meta.get(field) is not None:
-            raise ValueError("Compact candidates require selected mode and no duplicate legacy field")
-        ids, logps = _decode_compact_candidates(compact, n, k)
+    payload = meta.get(field)
+    if not support_mode and isinstance(payload, dict):
+        ids, logps = _decode_binary_candidates(payload, n, k)
         for name, values in (("rollout_topk_token_ids", ids), ("rollout_topk_log_probs", logps)):
             previous = getattr(sample, name)
             setattr(sample, name, values if previous is None else np.concatenate((previous, values)))
@@ -154,18 +151,20 @@ def merge_rollout_topk_logprobs_field(first: Sample, second: Sample, field: str,
     return np.concatenate((a, np.full((gap, a.shape[1]), fill, dtype=a.dtype), b))
 
 
-def _decode_compact_candidates(payload, rows: int, width: int):
+def _decode_binary_candidates(payload, rows: int, width: int):
     if payload.get("version") != 1 or payload.get("shape") != [rows, width]:
-        raise ValueError("Unsupported compact candidate version or shape")
+        raise ValueError("Unsupported binary candidate version or shape")
     result = []
     for key, dtype in (("ids_i32_le", "<i4"), ("logps_f32_le", "<f4")):
-        raw = pybase64.b64decode(payload[key], validate=True)
+        raw = payload[key]
+        if not isinstance(raw, bytes):
+            raise ValueError("Binary candidate arrays must be bytes")
         if len(raw) != rows * width * 4:
-            raise ValueError("Compact candidate byte length mismatch")
+            raise ValueError("Binary candidate byte length mismatch")
         result.append(np.frombuffer(raw, dtype=dtype).reshape(rows, width))
     ids, logps = result
     if np.any(ids < -1) or np.isnan(logps).any() or np.isposinf(logps).any():
-        raise ValueError("Invalid compact candidate values")
+        raise ValueError("Invalid binary candidate values")
     if np.any((ids == -1) & ~np.isneginf(logps)):
-        raise ValueError("Invalid compact candidate padding")
+        raise ValueError("Invalid binary candidate padding")
     return ids, logps
