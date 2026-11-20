@@ -49,8 +49,20 @@ class AvaCoreRollout:
         conv = launch_converter()
         self.generate_fn = conv.structure(interpolated(self.config["generate"]), GenerateFunction)
         reward = interpolated(self.config["reward"])
+        # AvaTrain passes the full TOML. Forward the legacy top-level table
+        # to the audited scorer, including when it runs in the remote service.
+        scorer = reward.get("reward") if reward["kind"] == "remote_reward" else reward
+        if "turn_reward" in config:
+            if not scorer or scorer["kind"] not in ("audited", "avaaudit"):
+                raise ValueError("turn_reward requires an audited reward")
+            if "turn_reward" in scorer:
+                raise ValueError("Configure turn_reward only once")
+            scorer["turn_reward"] = interpolated(config["turn_reward"])
         self.grouped = reward["kind"] in GroupRewardFunction.kinds
         self.reward_fn = conv.structure(reward, GroupRewardFunction if self.grouped else RewardFunction)
+        self.turn_reward = bool(scorer and scorer.get("turn_reward") is not None)
+        if self.turn_reward and (args.advantage_estimator != "grpo" or args.loss_type != "policy_loss"):
+            raise ValueError("turn_reward requires GRPO with policy_loss")
         self.recording = interpolated(self.config["record"]) if "record" in self.config else None
         self.run: asyncio.Task[Run] | None = None
         self.stack = AsyncExitStack()
@@ -72,7 +84,7 @@ class AvaCoreRollout:
             return [sample]
         row, traces, sampling_params = rolled
         try:
-            reward = await self.reward_fn(traces[0], row)
+            reward = await self.reward_fn.evaluate(traces, row)
         except RECOVERABLE_ERRORS as error:
             logger.warning("AvaCore reward of sample %s failed: %r", sample.index, error)
             sample.status = Sample.Status.ABORTED
@@ -174,6 +186,11 @@ class AvaCoreRollout:
         assert any(
             node.segments for node in iter_trace_nodes(traces)
         ), "AvaCore rollouts must drive the policy through a token-level client"
+        turn_scores = None
+        if self.turn_reward and not evaluation:
+            from ava_core.rewards.audited import resolve_turn_scores
+
+            turn_scores = await asyncio.to_thread(resolve_turn_scores, traces, reward.metadata["audit"])
         owned: set[Trace] = set()
         samples = []
         for trace in conversation_tips(traces):
@@ -189,6 +206,7 @@ class AvaCoreRollout:
                         trace,
                         reward.score,
                         owned=set(owned),
+                        turn_scores=turn_scores,
                         evaluation=evaluation,
                     )
                 )
@@ -301,6 +319,7 @@ def filled(
     reward: float,
     *,
     owned: set[Trace] | None = None,
+    turn_scores: dict[Trace, float] | None = None,
     evaluation: bool = False,
 ) -> Sample:
     owned = owned or set()
@@ -312,13 +331,18 @@ def filled(
     sample.tokens = trace.tokens[:length]
     sample.response = "".join(segment.template for segment in segments[1:])
     sample.response_length = length - prompt_length
-    mask = [
-        int(segment.is_generated and node not in owned)
-        for node in trace.prefixes
-        for segment in node.segments
-        for _ in segment.tokens
-    ]
+    mask = []
+    offsets = []
+    for node in trace.prefixes:
+        score = turn_scores.get(node, 0.0) if turn_scores is not None else 0.0
+        for segment in node.segments:
+            trained = segment.is_generated and node not in owned
+            mask.extend([int(trained)] * len(segment.tokens))
+            if turn_scores is not None:
+                offsets.extend([score if trained else 0.0] * len(segment.tokens))
     sample.loss_mask = mask[prompt_length:length]
+    if turn_scores is not None:
+        sample.turn_advantage_offsets = offsets[prompt_length:length]
     for segment in segments:
         if segment.is_generated and (
             len(segment.log_probs) != len(segment.tokens)

@@ -121,6 +121,15 @@ def compute_advantages_and_returns(
     if args.normalize_advantages:
         advantages = normalize_advantages(args, advantages, loss_masks, total_lengths, response_lengths, max_seq_lens)
 
+    if (weights := rollout_data.get("turn_advantage_weights")) is not None:
+        local_weights = get_local_response_loss_masks(
+            total_lengths, response_lengths, [torch.as_tensor(w) for w in weights], args.qkv_format, max_seq_lens
+        )
+        pairs = list(zip(advantages, local_weights, strict=True))
+        if any(adv.shape != weight.shape for adv, weight in pairs):
+            raise ValueError("Turn credit and local advantages must have the same shape")
+        advantages = [adv * weight.to(adv) for adv, weight in pairs]
+
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
 
