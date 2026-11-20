@@ -84,9 +84,7 @@ class AvaCoreRollout:
             return [sample]
         row, traces, sampling_params = rolled
         try:
-            # Older AvaCore scorers only accept the final tip.
-            score_rollout = getattr(self.reward_fn, "evaluate_rollout", None)
-            reward = await score_rollout(traces, row) if score_rollout else await self.reward_fn(traces[0], row)
+            reward = await self.reward_fn.evaluate(traces, row)
         except RECOVERABLE_ERRORS as error:
             logger.warning("AvaCore reward of sample %s failed: %r", sample.index, error)
             sample.status = Sample.Status.ABORTED
