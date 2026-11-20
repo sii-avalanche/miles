@@ -9,10 +9,11 @@
   <body>
     <header id="topbar">
       <a class="brand" href="#/"><img src="/static/miles_logo.png" alt="miles" /></a>
-      <nav id="crumbs"></nav>
+      <a id="all-runs" href="/" hidden>All runs</a><nav id="crumbs"></nav>
       <span id="runinfo"></span>
     </header>
     <main id="view"><p class="muted">loading…</p></main>
+    <script>document.querySelector("#all-runs").hidden = !location.pathname.startsWith("/runs/");</script>
     <script type="module" src="/static/app.js"></script>
   </body>
 </html>

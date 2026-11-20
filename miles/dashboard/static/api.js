@@ -1,7 +1,7 @@
 const RETRIES_503 = 3;
 
 async function fetchOk(path, params, { retry503 = true } = {}) {
-  const url = new URL(path, location.origin);
+  const url = new URL((location.pathname.match(/^\/runs\/[^/]+/)?.[0] ?? "") + path, location.origin);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) url.searchParams.set(k, v);
   }
