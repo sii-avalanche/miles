@@ -182,6 +182,13 @@ class GeneralHttpClientProvider:
     _clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
 
     @classmethod
+    async def reset(cls) -> None:
+        """Discard connections on the owning loop after a settled failed sync."""
+        client = cls._clients.pop(asyncio.get_running_loop(), None)
+        if client is not None:
+            await client.aclose()
+
+    @classmethod
     def client(cls) -> httpx.AsyncClient:
         loop = asyncio.get_running_loop()
         client = cls._clients.get(loop)

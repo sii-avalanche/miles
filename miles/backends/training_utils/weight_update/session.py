@@ -28,16 +28,19 @@ def resume_engines(rollout_engines: Sequence[SGLangApiClient]) -> None:
 
 
 def begin_weight_update(
-    rollout_engines: Sequence[SGLangApiClient], selector: str = "all", *, sync_base: bool = True
+    rollout_engines: Sequence[SGLangApiClient], selector: str = "all", *, sync_base: bool = True, strict: bool = False
 ) -> None:
     """Open a weight-update session on the selected engines. ``sync_base=False``
     declares an adapter-only session: no quant unpack, base tensors rejected."""
-    async_utils.wait_futures(
+    results = async_utils.wait_futures(
         [
             async_utils.submit(client.begin_weight_update(selector=selector, sync_base=sync_base))
             for client in rollout_engines
         ]
     )
+
+    if strict:
+        check_weight_sync_results(results, is_lora=False)
 
 
 def end_weight_update(
