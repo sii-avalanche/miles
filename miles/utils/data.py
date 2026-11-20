@@ -27,6 +27,7 @@ except ImportError:
 from miles.utils import chat_template_utils
 from miles.utils.types import MultimodalTypes, Sample
 
+
 __all__ = ["Dataset"]
 
 logger = logging.getLogger(__name__)
@@ -337,6 +338,7 @@ def process_rollout_data(
 
 class RolloutDataPack(StrictBaseModel):
     sample_indices: list[int] | None = None
+    group_stream: str | None = None
     data_ref: object_store.StoreObjectRef | list[object_store.StoreObjectRef] | None = None
 
     @property
@@ -350,6 +352,11 @@ def remove_rollout_data_refs(args, rollout_data_pack: RolloutDataPack) -> None:
     store = object_store.get_instance()
     for ref in rollout_data_pack.data_refs:
         store.remove(ref)
+    if rollout_data_pack.group_stream is not None:
+        # Local import avoids the stream publisher -> RolloutDataPack cycle.
+        from miles.ray.rollout.group_publisher import release_group_stream
+
+        release_group_stream(args, rollout_data_pack.group_stream)
 
 
 def remove_train_output_refs(train_outputs: Sequence["TrainStepOutput"]) -> None:
