@@ -77,3 +77,15 @@ producers (Timer sinks / rollout hooks / NVML samplers / sglang scraper)
 dump .pt + dashboard_columns/*.parquet + trajectory/*.jsonl   [written by training]
     -> serve.py: MetricStore + DumpReader -> FastAPI -> static SPA
 ```
+
+### Browse multiple runs
+
+To browse dashboards under a shared runs directory, start the multi-run server:
+
+```bash
+python -m miles.dashboard.multi_run --runs /path/to/runs --host 127.0.0.1 --port 7788
+```
+
+The catalogue refreshes every 15 seconds and links each run to its own dashboard.
+The service reads the run directory and does not provide authentication. Use a
+trusted network or an authenticated proxy when exposing it remotely.
