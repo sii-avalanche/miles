@@ -1,10 +1,12 @@
 """Read-only multi-run entry for the current Miles dashboard."""
+import argparse
 import asyncio
 import hashlib
 import json
 import os
 import threading
 import time
+import tomllib
 from collections import OrderedDict
 from pathlib import Path
 
@@ -63,7 +65,7 @@ def get_app(key):
         app, store, updated = cache[key]
         if time.monotonic() - updated >= 2:
             store.follow()
-            cache[key] = (app, store, time.monotonic())
+            cache[key] = app, store, time.monotonic()
         cache.move_to_end(key)
         return app
 
@@ -85,15 +87,12 @@ def runs():
     missing = []
     known = {str((ROOT / r['path']).resolve()) for r in available}
     for config in ROOT.glob('*/run_*/config.toml'):
-        import tomllib
         try:
             settings = tomllib.loads(config.read_text())
             paths = [v.get('dump_details') for v in settings.values() if isinstance(v, dict)]
-            if any(p and str(Path(p).resolve()) in known for p in paths):
-                continue
-            if any(str(p.resolve()) in known for p in (config.parent, config.parent/'logs', config.parent/'details')):
-                continue
-            missing.append(str(config.parent.relative_to(ROOT)))
+            paths += [config.parent, config.parent / 'logs', config.parent / 'details']
+            if not any(str(Path(p).resolve()) in known for p in paths if p):
+                missing.append(str(config.parent.relative_to(ROOT)))
         except (OSError, ValueError):
             continue
     return {'runs': available, 'without_telemetry': sorted(missing, reverse=True)}
@@ -114,8 +113,6 @@ async def app(scope, receive, send):
 
 
 def main():
-    import argparse
-
     global ROOT
     parser = argparse.ArgumentParser(description="Serve dashboards for runs in a directory")
     parser.add_argument("--runs", type=Path, default=ROOT)
