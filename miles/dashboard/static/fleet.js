@@ -1,6 +1,6 @@
 import { api } from "./api.js";
 import { el, fmtNum } from "./app.js";
-import { hideTooltip, showTooltip } from "./charts.js";
+import { hideTooltip, showTooltip, timelinePreview } from "./charts.js";
 
 // margins match views_timeline/carpet so all overview panes share an x domain
 const M_LEFT = 96;
@@ -20,11 +20,16 @@ export function createFleet(opts) {
   let data = null;
   const composition = el("canvas", { style: `width: 100%; height: ${PANE_H}px; display: block` });
   const band = el("canvas", { style: `width: 100%; height: ${PANE_H}px; display: block` });
+  const previews = [composition, band].map(c => timelinePreview(c, M_LEFT, M_RIGHT));
   const header = el("div", { class: "controls" }, [el("span", { class: "muted" }, ["fleet overview"])]);
   const root = el("div", { class: "panel" }, [header, composition, band]);
 
+  let requestId = 0;
   async function refresh(range = {}) {
-    data = await api("/api/timeline/fleet", { x_buckets: X_BUCKETS, t0: range.t0, t1: range.t1 });
+    const request = ++requestId;
+    const next = await api("/api/timeline/fleet", { x_buckets: X_BUCKETS, t0: range.t0, t1: range.t1 });
+    if (request !== requestId) return;
+    data = next;
     header.replaceChildren(
       el("span", { class: "muted" }, [`fleet overview · ${data.lanes} lanes`]),
       el("span", { class: "muted", style: "margin-left: auto" }, [
@@ -48,6 +53,12 @@ export function createFleet(opts) {
     if (!data) return;
     drawComposition();
     drawBand();
+    for (const preview of previews) preview.capture(data.t0, data.t1);
+    pan();
+  }
+  function pan() {
+    const range = opts.viewport?.();
+    if (range) for (const preview of previews) preview.show(range.t0, range.t1);
   }
 
   function drawComposition() {
@@ -120,7 +131,10 @@ export function createFleet(opts) {
 
   const bucketAt = (canvas, clientX) => {
     const rect = canvas.getBoundingClientRect();
-    const x = Math.floor(((clientX - rect.left - M_LEFT) / (rect.width - M_LEFT - M_RIGHT)) * data.x_buckets);
+    const fraction = (clientX - rect.left - M_LEFT) / (rect.width - M_LEFT - M_RIGHT);
+    if (fraction < 0 || fraction >= 1) return null;
+    const t = +canvas.dataset.t0 + fraction * (canvas.dataset.t1 - canvas.dataset.t0);
+    const x = Math.floor((t - data.t0) / (data.t1 - data.t0) * data.x_buckets);
     return x >= 0 && x < data.x_buckets ? x : null;
   };
   composition.onmousemove = (ev) => {
@@ -154,5 +168,5 @@ export function createFleet(opts) {
   composition.onmouseleave = hideTooltip;
   band.onmouseleave = hideTooltip;
 
-  return { root, refresh, redraw };
+  return { root, refresh, redraw, pan };
 }

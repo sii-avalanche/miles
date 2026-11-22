@@ -452,3 +452,37 @@ export function drawMultiLine(canvas, seriesList, opts = {}) {
     hover,
   });
 }
+
+// Pan the saved plot while new samples load, keeping the axis labels fixed.
+export function timelinePreview(canvas, left, right, top = 0) {
+  const saved = document.createElement("canvas");
+  let start, end;
+  function capture(a, b) {
+    start = a;
+    end = b;
+    saved.width = canvas.width;
+    saved.height = canvas.height;
+    saved.getContext("2d").drawImage(canvas, 0, 0);
+    Object.assign(canvas.dataset, {t0: a, t1: b});
+  }
+  function show(a, b) {
+    if (!(b > a && end > start) || !canvas.clientWidth) return false;
+    if (+canvas.dataset.t0 === a && +canvas.dataset.t1 === b) return false;
+    const scale = canvas.width / canvas.clientWidth;
+    const x = left * scale, y = top * scale;
+    const w = canvas.width - x - right * scale, h = canvas.height - y;
+    if (w <= 0 || h <= 0) return false;
+    const ctx = canvas.getContext("2d");
+    ctx.save();
+    ctx.resetTransform();
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.clip();
+    ctx.clearRect(x, y, w, h);
+    ctx.drawImage(saved, x, y, w, h, x + w * (start - a) / (b - a), y, w * (end - start) / (b - a), h);
+    ctx.restore();
+    Object.assign(canvas.dataset, {t0: a, t1: b});
+    return true;
+  }
+  return { capture, show };
+}

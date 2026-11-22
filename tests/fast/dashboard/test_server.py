@@ -102,11 +102,9 @@ def test_meta_reports_latest_data_buffer_length(dump_dir):
 
 
 def test_advisory_endpoint(client):
-    resp = client.get("/api/advisory")
-    assert resp.status_code == 200
-    # no engine series in the fixture, but the reader-side rules see the
-    # dummy dump's newest rollout, where a quarter of the samples truncate
-    [advisory] = resp.json()["advisories"]
+    assert client.get("/api/advisory").json()["advisories"] == []
+    assert client.get("/api/rollout/1/summary").status_code == 200
+    [advisory] = client.get("/api/advisory").json()["advisories"]
     assert advisory["level"] == "warning"
     assert "truncated" in advisory["message"]
     assert client.get("/api/advisory", params={"t0": 5, "t1": 1}).status_code == 400
