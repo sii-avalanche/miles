@@ -101,12 +101,16 @@ def test_meta_reports_latest_data_buffer_length(dump_dir):
     assert client.get("/api/meta").json()["data_buffer_length"] == 6
 
 
-def test_advisory_endpoint(client):
-    assert client.get("/api/advisory").json()["advisories"] == []
+def test_advisory_endpoint(client, dump_dir):
+    response = client.get("/api/advisory")
+    assert response.status_code == 200
+    assert response.json()["advisories"] == []
     assert client.get("/api/rollout/1/summary").status_code == 200
     [advisory] = client.get("/api/advisory").json()["advisories"]
     assert advisory["level"] == "warning"
     assert "truncated" in advisory["message"]
+    (dump_dir / "dashboard/cache/rollout_1.sources.json").write_text("{}")
+    assert client.get("/api/advisory").json()["advisories"] == []
     assert client.get("/api/advisory", params={"t0": 5, "t1": 1}).status_code == 400
 
 

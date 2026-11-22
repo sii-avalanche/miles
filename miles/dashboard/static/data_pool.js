@@ -13,12 +13,11 @@ export function createDataPool(meta, runStart = () => meta.start_ts, absolute = 
   const canvas = el("canvas", {style: "width:100%;display:block"});
   const preview = timelinePreview(canvas, LEFT, RIGHT, TOP);
   const table = el("tbody");
-  const progress = el("p", {class: "muted"});
   const root = el("div", {class: "panel"}, [
     el("h3", {}, ["Rollout, data pool, training and weight sync"]),
     el("p", {class: "muted"}, ["Engine green = requests running; gray = observed idle; gaps = no sample. Pool counts are queued groups, bucketed by oldest weight version relative to the last publication. Phase bars reuse the recorded Miles timers."]),
     el("div", {class: "legend"}, LABELS.map((label, i) => el("span", {style: `color:${COLORS[i]};margin-right:12px`}, [`■ ${label}`]))),
-    progress, canvas, el("details", {}, [el("summary", {}, ["Latest pool events"]), el("table", {}, [table])]),
+    canvas, el("details", {}, [el("summary", {}, ["Latest pool events"]), el("table", {}, [table])]),
   ]);
   let state = null, hits = [];
   let requestId = 0;
@@ -47,7 +46,7 @@ export function createDataPool(meta, runStart = () => meta.start_ts, absolute = 
     if (preview.show(t0, t1)) {
       drawTicks(canvas.getContext("2d"), canvas.clientWidth, t0, t1);
       const pending = state.range.t0 !== t0 || state.range.t1 !== t1;
-      table.hidden = progress.hidden = pending;
+      table.hidden = pending;
     }
   }
   function redraw() {
@@ -56,11 +55,6 @@ export function createDataPool(meta, runStart = () => meta.start_ts, absolute = 
     const [a, b] = [range.t0 ?? meta.time_range?.[0], range.t1 ?? meta.time_range?.[1]];
     if (!(b > a)) return;
     const pools = [...new Set(events.map(e => e.trainer_model_id ?? "all"))];
-    progress.textContent = pools.map(pool => {
-      const latest = events.filter(e => (e.trainer_model_id ?? "all") === pool).at(-1);
-      if (latest?.batch_groups == null) return `Pool ${pool}: batch assembly progress was not recorded by this worker.`;
-      return `Pool ${pool}: queued ${latest.length}; last batch collection ${latest.batch_groups} / ${latest.batch_target_groups ?? "?"} groups (not a training-step count).`;
-    }).join(" · ");
     const rows = [...engines.map((s, i) => ({label: `Engine ${i + 1}`, engine: s})),
       ...Object.entries(STAGES).map(([name, [label, color]]) => ({name, label, color})),
       ...pools.map(pool => ({label: `Pool ${pool}`, pool})), {label: "Batch ready", event: "batch_ready"}, {label: "Rejected", event: "reject"}];
@@ -113,7 +107,7 @@ export function createDataPool(meta, runStart = () => meta.start_ts, absolute = 
     });
     table.replaceChildren(...events.filter(e => e.ts >= a && e.ts <= b && !["put", "get", "snapshot"].includes(e.event)).slice(-100).reverse().map(e =>
       el("tr", {}, [new Date(e.ts * 1000).toLocaleTimeString(), e.event, e.trainer_model_id ?? "all", `queued ${e.length}`, e.rollout_id ?? "", e.reason ?? ""].map(v => el("td", {}, [String(v)])))));
-    table.hidden = progress.hidden = false;
+    table.hidden = false;
     preview.capture(a, b);
     pan();
   }

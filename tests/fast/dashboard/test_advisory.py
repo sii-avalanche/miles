@@ -1,5 +1,4 @@
 import polars as pl
-import pytest
 from tests.fast.dashboard.dummy_dump import blank_samples, dump_dummy_run
 
 from miles.dashboard.advisory import compute_advisories
@@ -444,19 +443,4 @@ def test_blank_newest_step_does_not_break_rollout_advisories(tmp_path):
     store = _store(tmp_path, args={}, engine_samples=[])
     reader = DumpReader(dump_dir)
     reader.summary(1)
-    assert compute_advisories(store, reader) == []
-
-
-def test_advisories_never_build_missing_or_stale_summary(tmp_path, monkeypatch):
-    dump_dir = tmp_path / "dump"
-    dump_dummy_run(dump_dir, steps=1, with_eval=False)
-    reader = DumpReader(dump_dir)
-    store = _store(tmp_path, args={}, engine_samples=[])
-    with monkeypatch.context() as patch:
-        patch.setattr(reader, "_torch_load", lambda *a, **kw: pytest.fail("unexpected tensor load"))
-        assert compute_advisories(store, reader) == []
-    reader.summary(0)
-    assert reader.cached_summary(0) is not None
-    (reader.cache_dir / "rollout_0.sources.json").write_text("{}")
-    monkeypatch.setattr(reader, "_torch_load", lambda *a, **kw: pytest.fail("unexpected tensor load"))
     assert compute_advisories(store, reader) == []
