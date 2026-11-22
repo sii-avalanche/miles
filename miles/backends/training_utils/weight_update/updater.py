@@ -29,6 +29,7 @@ from miles.backends.training_utils.weight_update.session import (
     set_weight_version,
 )
 from miles.backends.training_utils.weight_update.utils import record_lora_checksums
+from miles.backends.training_utils.weight_update.version import acknowledge_versions
 from miles.utils import async_utils
 from miles.utils.distributed_utils import get_gloo_group
 from miles.utils.lora.utils import LORA_ADAPTER_NAME
@@ -112,9 +113,7 @@ class WeightUpdater:
         if not rollout_engines or self.weight_version == 0:
             return
         engine = random.choice(list(rollout_engines))
-        engine_version = async_utils.run(engine.get_weight_version())
-        if str(engine_version) != str(self.weight_version):
-            raise RuntimeError(f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_version}")
+        async_utils.run(acknowledge_versions([engine], self.weight_version, timeout=None))
 
     def pop_metrics(self) -> dict[str, float]:
         """Return and clear the protocol's metrics; the actor drains them onto the step log."""
