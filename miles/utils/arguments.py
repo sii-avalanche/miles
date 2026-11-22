@@ -751,6 +751,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--loss-mask-max-response-len",
+                type=int,
+                default=None,
+                help=(
+                    "Zero the training loss mask after this many response positions per sample. "
+                    "Generation and reward calculation still use the full response."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-skip-special-tokens",
                 action="store_true",
                 default=False,
@@ -3341,6 +3350,13 @@ def miles_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+
+    loss_mask_max_response_len = getattr(args, "loss_mask_max_response_len", None)
+    if loss_mask_max_response_len is not None:
+        if type(loss_mask_max_response_len) is not int or loss_mask_max_response_len <= 0:
+            raise ValueError("--loss-mask-max-response-len must be a positive integer")
+        if args.custom_convert_samples_to_train_data_path:
+            raise ValueError("--loss-mask-max-response-len requires the built-in training data converter")
 
     mode = args.update_weight_transfer_mode
     if mode not in ("broadcast", "broadcast_packed", "p2p", "disk-delta"):

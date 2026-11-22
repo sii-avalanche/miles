@@ -104,6 +104,7 @@ def convert_samples_to_train_data(
     # loss mask
     # TODO: compress the loss mask
     loss_masks = []
+    max_response_len = getattr(args, "loss_mask_max_response_len", None)
     for sample in samples:
         # always instantiate loss_mask if not provided
         if sample.loss_mask is None:
@@ -114,7 +115,10 @@ def convert_samples_to_train_data(
         ), f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
         if sample.remove_sample:
             sample.loss_mask = [0] * sample.response_length
-        loss_masks.append(sample.loss_mask)
+        loss_mask = sample.loss_mask
+        if max_response_len is not None and sample.response_length > max_response_len:
+            loss_mask = loss_mask[:max_response_len] + [0] * (sample.response_length - max_response_len)
+        loss_masks.append(loss_mask)
     train_data["loss_masks"] = loss_masks
     if any(s.turn_advantage_offsets is not None for s in samples):
         train_data["turn_advantage_weights"] = [_turn_weights(args, sample) for sample in samples]

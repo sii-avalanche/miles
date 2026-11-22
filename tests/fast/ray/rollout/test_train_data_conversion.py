@@ -92,6 +92,41 @@ class TestConvertSamplesToTrainData:
         )
         assert out["loss_masks"][0] == [0, 0, 0, 0]
 
+    def test_loss_mask_response_limit_preserves_alignment_and_group_rewards(self):
+        args = make_args(grpo_std_normalization=True)
+        samples = [
+            make_sample(index=0, group_index=0, response_length=5, reward=1.0, loss_mask=[1, 0, 1, 1, 1]),
+            make_sample(index=1, group_index=0, response_length=4, reward=0.0, loss_mask=None),
+            make_sample(index=2, group_index=0, response_length=3, reward=1.0),
+            make_sample(index=3, group_index=0, response_length=4, reward=0.0, remove_sample=True),
+        ]
+        for sample in samples:
+            sample.rollout_log_probs = [-0.1] * sample.response_length
+        baseline = convert_samples_to_train_data(
+            args,
+            samples,
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+        assert baseline["loss_masks"][0] == [1, 0, 1, 1, 1]
+
+        args.loss_mask_max_response_len = 3
+        samples[1].loss_mask = None
+        out = convert_samples_to_train_data(
+            args,
+            samples,
+            metadata={},
+            custom_convert_samples_to_train_data_func=None,
+            custom_reward_post_process_func=None,
+        )
+
+        assert out["loss_masks"] == [[1, 0, 1, 0, 0], [1, 1, 1, 0], [1, 1, 1], [0, 0, 0, 0]]
+        assert out["rollout_mask_sums"] == [2, 3, 3, 0]
+        assert samples[0].loss_mask == [1, 0, 1, 1, 1]
+        for key in ("tokens", "response_lengths", "raw_reward", "rewards", "rollout_log_probs"):
+            assert out[key] == baseline[key]
+
     def test_loss_mask_length_mismatch_asserts(self):
         args = make_args(rewards_normalization=False)
         s = make_sample(response_length=4)
