@@ -25,6 +25,7 @@ from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.processing_utils import load_processor, load_tokenizer
 from miles.utils.types import Sample
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -225,7 +226,7 @@ class InferenceRolloutFn(BaseRolloutFn):
         from miles.rollout.inference_rollout.inference_rollout_train import generate_rollout_async
 
         output, aborted_samples = await generate_rollout_async(
-            self.state, input.rollout_id, self.data_source.get_samples
+            self.state, input.rollout_id, self.data_source.get_samples, on_group_ready=input.on_group_ready
         )
         self.data_source.add_samples(aborted_samples)
         return output
