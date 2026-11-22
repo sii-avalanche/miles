@@ -84,6 +84,19 @@ class TorchNativeTrainRayActor(TrainRayActor):
     def _after_rollout(self, rollout_id: int, rollout_data: dict) -> None:
         pass
 
+    def _before_optimizer_steps(self, rollout_id: int, rollout_data: dict) -> None:
+        """Release backend-specific forward-only state before training."""
+        del rollout_id, rollout_data
+
+    def _actor_train_context(self, rollout_data: dict) -> AbstractContextManager:
+        return timer("actor_train")
+
+    def _extra_perf_metrics(self) -> dict | None:
+        return None
+
+    def _after_optimizer_step(self, microbatches: int) -> None:
+        pass
+
     @property
     def train_parallel_config(self) -> dict:
         return {"dp_size": get_parallel_state().intra_dp.size}
@@ -166,6 +179,7 @@ class TorchNativeTrainRayActor(TrainRayActor):
             args=self.args,
             is_primary_rank=dist.get_rank() == 0,
             compute_total_fwd_flops=self._fwd_tflops,
+            extra_metrics=self._extra_perf_metrics(),
         )
         self._heartbeat.bump()
         return TrainStepOutput(outcome=TrainStepOutcome.NORMAL)
@@ -193,8 +207,9 @@ class TorchNativeTrainRayActor(TrainRayActor):
 
         compute_advantages_and_returns(self.args, rollout_data)
         log_rollout_data(rollout_id, self.args, rollout_data)
+        self._before_optimizer_steps(rollout_id, rollout_data)
 
-        with routing_replay.stage(routing_replay.REPLAY_BACKWARD), timer("actor_train"):
+        with routing_replay.stage(routing_replay.REPLAY_BACKWARD), self._actor_train_context(rollout_data):
             self._optimizer_steps(runner, data_iterator, num_microbatches, rollout_id)
         routing_replay.reset()
 
@@ -249,6 +264,7 @@ class TorchNativeTrainRayActor(TrainRayActor):
             batches = self._fetch_batches(self.prof.iterate_train_actor(progress), data_iterator, keys)
             losses_reduced = runner.forward_backward_step(batches, partial(_step_loss, args, microbatches))
             metrics = runner.apply_step()
+            self._after_optimizer_step(microbatches)
 
             if args.ci_test:
                 check_grad_norm(
@@ -289,10 +305,14 @@ class TorchNativeTrainRayActor(TrainRayActor):
         print_memory("before update_weights")
         self.weight_updater.update_weights()
         print_memory("after update_weights")
-        if self.args.ci_test:
-            self.weight_updater.verify_engine_version(info.rollout_engines)
+        self._verify_weight_version(info.rollout_engines)
         clear_memory()
         return self.weight_updater.weight_version
+
+    def _verify_weight_version(self, engines):
+        if self.args.ci_test:
+            self.weight_updater.verify_engine_version(engines)
+
 
 
 def _step_loss(args, num_microbatches: int, logits: torch.Tensor, batch: dict) -> tuple[torch.Tensor, dict]:

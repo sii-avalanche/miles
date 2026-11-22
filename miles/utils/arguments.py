@@ -440,7 +440,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--train-backend",
                 type=str,
-                choices=["megatron", "fsdp", "torchtitan"],
+                choices=["megatron", "fsdp", "torchtitan", "dmodel"],
                 default="megatron",
                 help="The backend for training.",
             )
@@ -1445,6 +1445,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                     "The maximum number of tokens per GPU for dynamic batch size. "
                     "Note that when enabling context parallel (CP), the max tokens per gpu should be around "
                     "`max_response_len // cp_size` instead of `max_response_len`."
+                ),
+            )
+            parser.add_argument(
+                "--agent-fleet-segment-max-tokens",
+                type=int,
+                default=0,
+                help=(
+                    "Split Agent Fleet SETA trajectories into overlapping next-token windows of at most "
+                    "this many tokens. Zero preserves the original segments. Causal attention restarts "
+                    "at window boundaries."
                 ),
             )
             parser.add_argument(
@@ -2950,6 +2960,10 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
             from miles.backends.torchtitan_utils.arguments import load_torchtitan_args
 
             args = load_torchtitan_args(extra_args_provider=add_miles_arguments)
+        elif backend == "dmodel":
+            from miles.backends.dmodel_utils.arguments import load_dmodel_args
+
+            args = load_dmodel_args(extra_args_provider=add_miles_arguments)
         else:
             from miles.backends.fsdp_utils.arguments import load_fsdp_args
 
@@ -2959,7 +2973,12 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
         args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
 
         if args.hf_checkpoint:
-            args.num_layers = resolve_fsdp_num_layers(load_hf_config(args.hf_checkpoint))
+            hf_config = load_hf_config(args.hf_checkpoint)
+            args.num_layers = resolve_fsdp_num_layers(hf_config)
+            if backend == "dmodel":
+                from miles.backends.dmodel_utils.arguments import bind_dmodel_hf_args
+
+                bind_dmodel_hf_args(args, hf_config)
 
         if backend == "fsdp":
             assert args.context_parallel_size == 1, "Context parallelism is not supported for FSDP backend."
@@ -2994,6 +3013,10 @@ def parse_args(add_custom_arguments=None, entry="train", preprocess_args=None):
         from miles.backends.torchtitan_utils.arguments import validate_torchtitan_args
 
         validate_torchtitan_args(args)
+    elif backend == "dmodel":
+        from miles.backends.dmodel_utils.arguments import validate_dmodel_args
+
+        validate_dmodel_args(args)
     else:
         from miles.backends.fsdp_utils.arguments import validate_hybrid_shard_args, validate_kernel_backend_args
 

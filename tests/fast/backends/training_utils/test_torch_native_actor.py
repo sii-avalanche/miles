@@ -62,9 +62,13 @@ class _Provider(TorchNativeTrainRayActor):
         self.runner = object()
         self.align_token_side_channel = lambda t, pad: t
         self._heartbeat = MagicMock()
+        self.before_optimizer_steps = MagicMock()
 
     def _step_runner(self):
         return self.runner
+
+    def _before_optimizer_steps(self, rollout_id, rollout_data):
+        self.before_optimizer_steps(rollout_id, rollout_data)
 
 
 @pytest.fixture
@@ -124,6 +128,7 @@ def test_the_rollout_step_runs_ref_then_actor_then_optimizer_under_the_right_sta
     ]
     assert step["log_probs"] == [(actor.ref_runner, "ref_"), (actor.runner, "")]
     assert step["steps"] == [actor.runner]
+    actor.before_optimizer_steps.assert_called_once_with(3, rollout_data)
     assert rollout_data == {"ref_log_probs": [1], "log_probs": [1], "adv": True}
     assert step["replay"].fill.call_args.kwargs["align"] is actor.align_token_side_channel
 

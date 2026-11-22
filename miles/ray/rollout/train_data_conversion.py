@@ -43,6 +43,7 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "sample_indices": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_mask_sums": ValueSpec(codec="ndarray", dtype="int64"),
+    "sample_weights": ValueSpec(codec="ndarray", dtype="float32"),
     "multimodal_train_inputs": ValueSpec(codec="ragged_tensor_dict"),
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
@@ -79,13 +80,18 @@ def convert_samples_to_train_data(
     if (f := custom_convert_samples_to_train_data_func) is not None:
         return f(args, samples)
 
-    raw_rewards, rewards = _post_process_rewards(
+    raw_rewards, rewards = post_process_rewards(
         args,
         samples,
         custom_reward_post_process_func=custom_reward_post_process_func,
         prompt_group_sizes=metadata.get("prompt_group_sizes"),
     )
 
+    return build_train_data(args, samples, metadata, raw_rewards, rewards)
+
+
+def build_train_data(args, samples, metadata, raw_rewards, rewards):
+    """Build the shared Miles training batch with already computed rewards."""
     assert len(raw_rewards) == len(samples)
     assert len(rewards) == len(samples)
 
@@ -350,7 +356,7 @@ def _normalize_rewards_by_rollout(
     return normalized_rewards.tolist()
 
 
-def _post_process_rewards(
+def post_process_rewards(
     args,
     samples: list[Sample] | list[list[Sample]],
     custom_reward_post_process_func,
@@ -464,6 +470,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "sample_indices",
             "rollout_ids",
             "rollout_mask_sums",
+            "sample_weights",
             "rollout_log_probs",
             "rollout_topk_token_ids",
             "rollout_topk_lengths",
@@ -495,6 +502,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
             "prompt_group_sizes",
             "loss_fn",
             "loss_fn_config",
+            "training_token_counts",
         ]:
             if key not in data:
                 continue

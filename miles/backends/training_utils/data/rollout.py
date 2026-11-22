@@ -2,6 +2,7 @@ import logging
 from argparse import Namespace
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -10,7 +11,6 @@ from miles.backends.training_utils.data.context_parallel import slice_log_prob_w
 from miles.backends.training_utils.data.multimodal import expand_multimodal_rollout_data_in_place
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
-from miles.utils.data import get_minimum_num_micro_batch_size, process_rollout_data
 from miles.utils.ft_utils.process_group_utils import GeneralPGUtil
 from miles.utils.object_store import ObjectStoreGetResult
 from miles.utils.ray_utils import Box
@@ -19,6 +19,11 @@ from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from miles.utils.types import RolloutBatch
 
 logger = logging.getLogger(__name__)
+
+
+def _copied_numpy_tensor(value: np.ndarray) -> torch.Tensor:
+    """Own writable storage before exposing replay arrays as Torch tensors."""
+    return torch.from_numpy(np.array(value, copy=True, order="C"))
 
 
 def _rollout_logprob_dtype(args: Namespace) -> torch.dtype:
@@ -35,6 +40,9 @@ def get_rollout_data(
     rollout_data_ref: Box,
     witness_info: WitnessInfo | None = None,
 ) -> tuple[RolloutBatch, ObjectStoreGetResult]:
+    # Loading rollout assets requires runtime dependencies, unlike batch selection.
+    from miles.utils.data import process_rollout_data
+
     parallel_state = get_parallel_state()
     # Fetch data through ray on CPU, not sure if this will be performance bottleneck.
     # Both first pp stage and the last pp stage will receive the data.
@@ -104,11 +112,15 @@ def get_rollout_data(
             ]
     if "rollout_routed_experts" in rollout_data:
         rollout_data["rollout_routed_experts"] = [
-            torch.from_numpy(resolve_routed_experts(r, len(tokens) - 1, args.num_layers, args.moe_router_topk))
+            _copied_numpy_tensor(
+                resolve_routed_experts(r, len(tokens) - 1, args.num_layers, args.moe_router_topk)
+            )
             for r, tokens in zip(rollout_data["rollout_routed_experts"], rollout_data["tokens"], strict=True)
         ]
     if "rollout_indexer_topk" in rollout_data:
-        rollout_data["rollout_indexer_topk"] = [torch.from_numpy(r) for r in rollout_data["rollout_indexer_topk"]]
+        rollout_data["rollout_indexer_topk"] = [
+            _copied_numpy_tensor(r) for r in rollout_data["rollout_indexer_topk"]
+        ]
     return rollout_data, store_get_result
 
 
@@ -158,6 +170,23 @@ def _prepare_loss_masks(
     return loss_mask.unsqueeze(0)
 
 
+def _get_batch_data(data_iterator: "DataIterator", keys: Sequence[str]) -> dict:
+    """Select sample-aligned fields and retain the batch-level loss normalizer."""
+    keys = list(keys)
+    if "adapter_slots" not in keys:
+        keys.append("adapter_slots")
+    if data_iterator.rollout_data.get("sample_weights") is not None:
+        # Weighted segments also need their original denominators after token rejection.
+        for key in ("sample_weights", "rollout_mask_sums"):
+            if key in data_iterator.rollout_data and key not in keys:
+                keys.append(key)
+    batch = data_iterator.get_next(keys)
+    for key in ("dynamic_global_batch_size", "loss_fn", "loss_fn_config"):
+        if key in data_iterator.rollout_data:
+            batch[key] = data_iterator.rollout_data[key]
+    return batch
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -192,11 +221,7 @@ def get_batch(
     parallel_state = get_parallel_state()
 
     assert "tokens" in keys
-    # get_batch consumes adapter_slots itself (per-adapter token counts below);
-    # fetch it here so callers don't have to know. None for non-multi-LoRA runs.
-    if "adapter_slots" not in keys:
-        keys = [*keys, "adapter_slots"]
-    batch = data_iterator.get_next(keys)
+    batch = _get_batch_data(data_iterator, keys)
     if batch.get("multimodal_train_inputs") is not None:
         batch["multimodal_train_inputs"] = [
             (
@@ -206,13 +231,6 @@ def get_batch(
             )
             for mm_dict in batch["multimodal_train_inputs"]
         ]
-
-    if "dynamic_global_batch_size" in data_iterator.rollout_data:
-        batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
-
-    for unit_key in ("loss_fn", "loss_fn_config"):
-        if unit_key in data_iterator.rollout_data:
-            batch[unit_key] = data_iterator.rollout_data[unit_key]
 
     # No-op safety net if batches reach get_batch without rollout-level preprocessing.
     expand_multimodal_rollout_data_in_place(batch, qkv_format=qkv_format)
@@ -473,6 +491,9 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
+    # Keep the CPU-only iterator usable without rollout/tokenizer runtime imports.
+    from miles.utils.data import get_minimum_num_micro_batch_size
+
     expand_multimodal_rollout_data_in_place(rollout_data, qkv_format=args.qkv_format)
 
     parallel_state = get_parallel_state()

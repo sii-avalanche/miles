@@ -206,8 +206,15 @@ class Sample:
 
     prefix_cache_info: PrefixCacheInfo = field(default_factory=PrefixCacheInfo)
 
+    # Additional conversation tips belonging to this single rewarded episode.
+    branches: list["Sample"] = field(default_factory=list)
+
     def to_dict(self):
         value = self.__dict__.copy()
+        if self.branches:
+            value["branches"] = [branch.to_dict() for branch in self.branches]
+        else:
+            value.pop("branches")
         value["status"] = self.status.value
         value["spec_info"] = self.spec_info.to_dict()
         value["prefix_cache_info"] = self.prefix_cache_info.to_dict()
@@ -217,6 +224,8 @@ class Sample:
     @staticmethod
     def from_dict(data: dict):
         data = dict(data)
+        if data.get("branches"):
+            data["branches"] = [Sample.from_dict(branch) for branch in data["branches"]]
         data["status"] = Sample.Status(data["status"])
         data["spec_info"] = Sample.SpecInfo.from_dict(data.get("spec_info", {}))
         data["prefix_cache_info"] = Sample.PrefixCacheInfo.from_dict(data.get("prefix_cache_info", {}))

@@ -357,6 +357,15 @@ def resolve_args_checkpoint_load(args: Namespace) -> None:
     # TODO: refactor
     args.requested_load = args.load
 
+    if getattr(args, "train_backend", None) == "dmodel":
+        # Native restore owns the resume cursor; do not let the creator override it.
+        # Fresh DModel runs keep an explicit start and never use Megatron fallbacks.
+        if args.load is not None:
+            args.start_rollout_id = None
+        elif args.start_rollout_id is None:
+            args.start_rollout_id = 0
+        return
+
     # TODO: During loading, we need to set the start_rollout_id here.
     if args.megatron_to_hf_mode == "bridge":
         # Fresh runs pass a not-yet-created `--load` dir; fall back to the reference

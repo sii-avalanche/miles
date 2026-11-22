@@ -239,6 +239,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
                 "witness_ids",
                 "weight_versions",
                 "metadata",
+                "training_token_counts",
                 "num_microbatches",
                 "micro_batch_indices",
                 "num_rollouts",

@@ -10,7 +10,7 @@ from hypothesis import strategies as st
 from tests.fast.ray.rollout.conftest import make_args, make_sample, make_samples_grouped
 
 from miles.ray.rollout.train_data_conversion import (
-    _post_process_rewards,
+    post_process_rewards,
     can_schedule_on_rollout_side,
     convert_samples_to_train_data,
     split_train_data_by_dp,
@@ -328,14 +328,14 @@ class TestConvertSamplesToTrainData:
         assert out["dynamic_global_batch_size"] == 16
 
 
-# ----------------------------- _post_process_rewards -----------------------------
+# ----------------------------- post_process_rewards -----------------------------
 
 
 class TestPostProcessRewards:
     def test_ppo_path_returns_raw_rewards_unchanged(self):
         args = make_args(advantage_estimator="ppo", rewards_normalization=True)
         samples = make_samples_grouped(2, 4, rewards=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
-        raw, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        raw, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
         assert raw == processed
 
     def test_grpo_normalizes_each_group_to_zero_mean(self):
@@ -347,7 +347,7 @@ class TestPostProcessRewards:
             rollout_batch_size=2,
         )
         samples = make_samples_grouped(2, 4, rewards=[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0])
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
         # group means: 2.5 and 25.0 → centered values
         g1 = processed[:4]
         g2 = processed[4:]
@@ -363,7 +363,7 @@ class TestPostProcessRewards:
             rollout_batch_size=1,
         )
         samples = make_samples_grouped(1, 4, rewards=[1.0, 2.0, 3.0, 4.0])
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
         # Unit std with epsilon — torch.std uses N-1 by default; centered
         # values have std exactly 1.0 after dividing by their own std.
         import numpy as np
@@ -379,7 +379,7 @@ class TestPostProcessRewards:
             rollout_batch_size=1,
         )
         samples = make_samples_grouped(1, 4, rewards=[1.0, 2.0, 3.0, 4.0])
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
         assert abs(sum(processed) / 4) < 1e-5
 
     def test_reinforce_plus_plus_baseline_only_zero_mean_no_std(self):
@@ -391,7 +391,7 @@ class TestPostProcessRewards:
             rollout_batch_size=1,
         )
         samples = make_samples_grouped(1, 4, rewards=[1.0, 2.0, 3.0, 4.0])
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
         # Mean is zero (centering happens) and std is the std of the centered
         # input (no normalization applied) — pin this exactly so a regression
         # that re-enabled the std division is caught.
@@ -412,7 +412,7 @@ class TestPostProcessRewards:
         )
         # rewards length 4 — does not match 8 * 2 = 16; trigger view branch
         samples = make_samples_grouped(1, 4, rewards=[2.0, 4.0, 6.0, 8.0])
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
         # mean is 5.0, after centering: -3, -1, 1, 3
         assert abs(sum(processed)) < 1e-5
 
@@ -434,7 +434,7 @@ class TestPostProcessRewards:
             make_sample(group_index=1, index=3, rollout_id=21, reward=4.0),
         ]
 
-        raw, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        raw, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
         assert raw == [0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 4.0]
         assert processed == pytest.approx([-0.5, 0.5, 0.5, 0.5, -1.0, -1.0, 1.0])
@@ -453,7 +453,7 @@ class TestPostProcessRewards:
             make_sample(group_index=0, index=1, rollout_id=11, reward=1.0),
         ]
 
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
         assert processed == pytest.approx([-(2**-0.5), 2**-0.5, 2**-0.5], abs=1e-5)
 
@@ -475,7 +475,7 @@ class TestPostProcessRewards:
             ValueError,
             match=r"all samples in rollout 11 must share one reward; rows \[1, 2\] have rewards \[2.0, 6.0\]",
         ):
-            _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+            post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
     def test_grpo_shared_reward_ignores_final_training_mask(self):
         args = make_args(
@@ -525,7 +525,7 @@ class TestPostProcessRewards:
             make_sample(group_index=0, index=1, rollout_id=11, reward={"score": 6.0}),
         ]
 
-        raw, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        raw, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
         assert raw == [2.0, 2.0, 6.0]
         assert processed == pytest.approx([-2.0, -2.0, 2.0])
@@ -539,7 +539,7 @@ class TestPostProcessRewards:
             make_sample(group_index=0, rollout_id=21, reward=14.0),
         ]
 
-        _, processed = _post_process_rewards(
+        _, processed = post_process_rewards(
             args,
             samples,
             custom_reward_post_process_func=None,
@@ -557,7 +557,7 @@ class TestPostProcessRewards:
             make_sample(group_index=1, rollout_id=21, reward=14.0),
         ]
 
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
         assert processed == pytest.approx([-1.0, -2.0, 1.0, 2.0])
 
@@ -580,7 +580,7 @@ class TestPostProcessRewards:
             for rollout_id, reward in enumerate(rewards)
         ]
 
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
         assert processed == pytest.approx(expected)
 
@@ -591,21 +591,21 @@ class TestPostProcessRewards:
             make_sample(group_index=0, index=None, rollout_id=None, reward=2.0),
         ]
 
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
         assert processed == pytest.approx([-1.0, 1.0])
 
     def test_empty_rewards_stay_empty(self):
         args = make_args(advantage_estimator="grpo", rewards_normalization=True)
 
-        raw, processed = _post_process_rewards(args, [], custom_reward_post_process_func=None)
+        raw, processed = post_process_rewards(args, [], custom_reward_post_process_func=None)
 
         assert raw == processed == []
 
     def test_custom_reward_post_process_short_circuits(self):
         args = make_args(advantage_estimator="grpo", rewards_normalization=True)
         sentinel = ([0.0], [1.0])
-        raw, processed = _post_process_rewards(
+        raw, processed = post_process_rewards(
             args, [make_sample()], custom_reward_post_process_func=lambda a, s: sentinel
         )
         assert (raw, processed) == sentinel
@@ -644,7 +644,7 @@ class TestPostProcessRewardsProperties:
             rollout_batch_size=n_groups,
         )
         samples = make_samples_grouped(n_groups, group_size, rewards=rewards_list)
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
         assert len(processed) == n_groups * group_size
         for g in range(n_groups):
@@ -688,7 +688,7 @@ class TestPostProcessRewardsProperties:
             rollout_batch_size=n_groups,
         )
         samples = make_samples_grouped(n_groups, group_size, rewards=rewards_list)
-        _, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        _, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
         for g in range(n_groups):
             chunk = processed[g * group_size : (g + 1) * group_size]
@@ -718,7 +718,7 @@ class TestPostProcessRewardsProperties:
             rollout_batch_size=1,
         )
         samples = make_samples_grouped(1, n, rewards=rewards_list)
-        raw, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
+        raw, processed = post_process_rewards(args, samples, custom_reward_post_process_func=None)
         assert raw == processed == rewards_list
 
 

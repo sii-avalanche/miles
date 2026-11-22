@@ -1,5 +1,6 @@
 from argparse import Namespace
 from collections.abc import Iterator, Sequence
+from typing import Protocol, runtime_checkable
 
 import torch
 
@@ -12,6 +13,38 @@ from miles.backends.training_utils.loss.hub.math_utils import calculate_log_prob
 from miles.backends.training_utils.loss.hub.score_centering import selected_log_probs_and_entropy
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.sampling_mask import RolloutSamplingMask
+
+
+@runtime_checkable
+class PolicyScoreSource(Protocol):
+    """Memory-bounded policy output consumed by the common Miles loss path.
+
+    Backends may return this instead of materializing ``[tokens, vocab]``
+    logits. The source owns projection and any backend-specific distributed
+    score assembly while Miles continues to own GRPO/TIS/KL reduction.
+    """
+
+    @property
+    def device(self) -> torch.device:
+        """Device used for scalar metrics and normalizers."""
+
+    def sum(self, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+        """Return a graph-connected scalar for empty/local CP participation."""
+
+    def get_log_probs_and_entropy(
+        self,
+        *,
+        args: Namespace,
+        unconcat_tokens: list[torch.Tensor],
+        total_lengths: list[int],
+        response_lengths: list[int],
+        with_entropy: bool,
+        entropy_requires_grad: bool,
+        non_loss_data: bool,
+        max_seq_lens: list[int] | None,
+        rollout_sampling_mask: Sequence[RolloutSamplingMask] | None,
+    ) -> dict[str, list[torch.Tensor]]:
+        """Return response-aligned per-sample scores."""
 
 
 def _iter_response_chunks(
@@ -61,6 +94,14 @@ def _iter_response_chunks(
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
+    logits = prepare_policy_logits(args, logits)
+    yield from iter_response_rows(
+        logits, args=args, unconcat_tokens=unconcat_tokens, total_lengths=total_lengths,
+        response_lengths=response_lengths, max_seq_lens=max_seq_lens, include_response_indices=include_response_indices,
+    )
+
+
+def prepare_policy_logits(args, logits):
     if args.true_on_policy_mode:
         if logits.size(-1) > 1 and args.rollout_temperature > 0 and args.rollout_temperature != 1.0:
             logits = logits.div(args.rollout_temperature)
@@ -68,7 +109,14 @@ def _iter_response_chunks(
             logits = logits.to(torch.bfloat16)
         elif getattr(args, "fp16", False):
             logits = logits.to(torch.float16)
+    return logits
 
+
+def iter_response_rows(
+    logits, *, args, unconcat_tokens, total_lengths, response_lengths, max_seq_lens=None, include_response_indices=False
+):
+    """Slice flattened token rows and labels identically before or after projection."""
+    qkv_format = args.qkv_format
     parallel_state = get_parallel_state()
     cp_size = parallel_state.cp.size
     end = 0
@@ -193,7 +241,7 @@ def get_responses(
 
 
 def get_log_probs_and_entropy(
-    logits: torch.Tensor,
+    logits: torch.Tensor | PolicyScoreSource,
     *,
     args: Namespace,
     unconcat_tokens: list[torch.Tensor],
@@ -230,6 +278,19 @@ def get_log_probs_and_entropy(
         sample. If `with_entropy` is True, also includes "entropy" key with
         a list of `[R]` tensors.
     """
+    if isinstance(logits, PolicyScoreSource):
+        return logits.get_log_probs_and_entropy(
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            with_entropy=with_entropy,
+            entropy_requires_grad=entropy_requires_grad,
+            non_loss_data=non_loss_data,
+            max_seq_lens=max_seq_lens,
+            rollout_sampling_mask=rollout_sampling_mask,
+        )
+
     assert non_loss_data
     if rollout_sampling_mask is not None:
         for sample_index, (sampling_mask, response_length) in enumerate(
@@ -290,7 +351,7 @@ def get_log_probs_and_entropy(
                 debug_unified_grad_fused_logprob=args.debug_unified_grad_fused_logprob,
             )
 
-        log_probs_list.append(log_prob.squeeze(-1))
+        log_probs_list.append(log_prob.reshape(-1))
         if with_entropy:
             entropy_list.append(entropy)
 

@@ -295,6 +295,7 @@ def policy_loss_function(
             args.qkv_format,
             max_seq_lens,
             denominators=batch.get("rollout_mask_sums", None),
+            sample_weights=batch.get("sample_weights"),
         )
 
     # Determine pg_loss reducer: use custom if specified, otherwise default

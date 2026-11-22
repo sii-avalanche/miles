@@ -1,0 +1,75 @@
+model:
+  attention_backend: varlen
+  chunked_cross_entropy: true
+  lb_loss_coeff: 0.0
+  z_loss_coeff: 0.0
+  expert_bias_coeff: null
+  num_hash_layers: 3
+
+training:
+  enable_validation: false
+  max_grad_norm: 1.0
+  param_mixed_precision: bfloat16
+  reduce_mixed_precision: float32
+  router_dtype: float32
+  seed: 1234
+  manual_gc: true
+  manual_gc_interval: 200
+  gradient_accumulation_sync_grad: true
+
+parallelism:
+  dp_shard: 8
+  dp_replicate: null
+  tp: 1
+  pp: 1
+  cp_ring: 1
+  cp_ulysses: 1
+  ep: 8
+  edp_shard: 8
+  fsdp_cpu_offload: false
+  fsdp_reduce_scatter_max_input_buffers: 1
+
+optimizer:
+  optimizer_type: muon
+  learning_rate: 4.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-8
+  warmup_steps: 800
+  decay_ratio: 0.0
+  muon_lr: 4.0e-4
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
+  muon_adjust_lr_fn: spectral
+  muon_coefficient_type: quintic
+  muon_adamw_exclude: [embed, lm_head, output, norm, bias, router]
+  muon_2d_bucket_max_peak_mb: 2048
+
+ac:
+  mode: op
+  ac_layer_freq: 4
+  preserve_rng_state: false
+
+compile:
+  enable: true
+  backend: inductor
+  recompile_limit: 32
+  components: [model, loss, muon]
+
+operators:
+  config_path: operator_backends_dsv4_flash_rl_resident_4k_pool4.yaml
+
+system:
+  checkpoint_type: none
+  save_final_checkpoint: false
+  save_interval: 100000
+
+logging:
+  log_level: INFO
+  log_frequency: 1
+  enable_tensorboard: false
+  enable_wandb: false
+  enable_file_log: false
+  log_only_on_rank0: true

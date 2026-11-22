@@ -38,6 +38,16 @@ def _make_sample(
     return s
 
 
+def test_episode_branch_round_trip_preserves_flat_sample_format():
+    branch = _make_sample([1, 2], [3], log_probs=True, loss_mask=True)
+    branch.weight_versions = [WeightVersionsPerCall([WeightVersionSpan("2", 2, 3)])]
+    episode = Sample(index=7, branches=[branch])
+    saved = episode.to_dict()
+    assert saved["branches"] == [branch.to_dict()]
+    assert "branches" not in saved["branches"][0]
+    assert Sample.from_dict(saved) == episode
+
+
 @pytest.fixture
 def tokenizer():
     tok = MagicMock()

@@ -1,0 +1,64 @@
+check: true
+report: true
+
+selective_activation_checkpoint:
+  mode: save
+  operators:
+    - deepseek_v4.indexer.topk
+    - deepseek_v4.router.histogram
+    - deepseek_v4.indexer.sparse_loss_state
+
+backends:
+  deepseek_v4.attention.grouped_output_projection:
+    use: torch_contiguous_bmm
+  parallelism.expert_dispatch:
+    use: torch_210_symm_mem
+    buffer_size_mb: 4096
+    max_output_rows: 220000
+    groups: 8
+    compute_lanes: 1
+    dispatch_window: 2
+  loss.chunked_cross_entropy:
+    use: flash
+  deepseek_v4.attention.prepare_indices:
+    use: triton
+  deepseek_v4.attention.sparse:
+    use: cuda
+  deepseek_v4.attention.sparse_block:
+    use: cuda
+  deepseek_v4.router.histogram:
+    use: triton
+  deepseek_v4.router.sequence_aux_stats:
+    use: triton
+  deepseek_v4.indexer.sparse_loss_state:
+    use: triton
+  deepseek_v4.indexer.score:
+    use: cuda
+  deepseek_v4.indexer.rotate:
+    use: fast_hadamard_transform
+  deepseek_v4.indexer.topk_indices:
+    use: cuda
+  deepseek_v4.cp.zigzag_window_indices:
+    use: triton
+  deepseek_v4.rope.prepare_cos_sin:
+    use: triton
+  deepseek_v4.rope.apply_mla:
+    use: triton
+  deepseek_v4.compressor.compress_tokens:
+    use: triton
+  deepseek_v4.rms_norm:
+    use: torch_compile
+  deepseek_v4.moe.combine:
+    use: triton
+  mhc.proj_rms_compute_h:
+    use: triton
+  mhc.sinkhorn:
+    use: triton
+  mhc.h_aggregate:
+    use: triton
+  mhc.h_post_bda:
+    use: triton
+  deepseek_v4.grouped_experts:
+    use: torch_fused_grouped_mm
+  ep.permutation:
+    use: triton_fused

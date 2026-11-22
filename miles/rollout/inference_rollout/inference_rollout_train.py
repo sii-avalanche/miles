@@ -8,6 +8,7 @@ from packaging.version import parse
 from tqdm import tqdm
 
 from miles.rollout.base_types import RolloutFnTrainOutput
+from miles.rollout.errors import FatalRolloutError
 from miles.rollout.filter_hub.base_types import MetricGatherer
 from miles.rollout.filter_hub.common_filters import apply_preput_filters
 from miles.rollout.generate_utils.prefill_logprobs import recompute_samples_rollout_logprobs_via_prefill
@@ -142,6 +143,19 @@ async def generate_rollout_async(
         for task in done:
             try:
                 group: list[Sample] = task.result()
+            except FatalRolloutError:
+                state.aborted = True
+                # Drain completed siblings too, without masking the initiating error.
+                tasks = tuple(pendings | done)
+                for pending in tasks:
+                    if not pending.done():
+                        pending.cancel()
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    pendings.clear()
+                    pbar.close()
+                raise
             except Exception as e:
                 logger.error(f"[rollout] Task raised exception: {e!r}", exc_info=True)
                 continue
