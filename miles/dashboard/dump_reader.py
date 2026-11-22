@@ -517,16 +517,31 @@ class DumpReader:
 
     # ------------------------------- L1 views -------------------------------
 
+    def _summary_path(self, rollout_id: int, evaluation: bool) -> Path:
+        return self.cache_dir / f"rollout_{'eval_' if evaluation else ''}{rollout_id}.parquet"
+
+    def cached_summary(self, rollout_id: int, *, evaluation: bool = False) -> pl.DataFrame | None:
+        """Read an up-to-date summary without materializing any rollout or train dump."""
+        cache_path = self._summary_path(rollout_id, evaluation)
+        sources_path = cache_path.with_suffix(".sources.json")
+        try:
+            sources = json.loads(sources_path.read_text())
+            if sources == self._source_stamps(rollout_id, evaluation=evaluation):
+                return pl.read_parquet(cache_path)
+        except (FileNotFoundError, json.JSONDecodeError, pl.exceptions.PolarsError):
+            pass
+        return None
+
     def summary(self, rollout_id: int, *, evaluation: bool = False) -> pl.DataFrame:
         """Per-sample summary table (one row per Sample), parquet-cached under
         ``cache_dir`` and invalidated on source mtime or SUMMARY_VERSION change."""
-        stem = f"rollout_{'eval_' if evaluation else ''}{rollout_id}"
-        cache_path = self.cache_dir / f"{stem}.parquet"
-        sources_path = self.cache_dir / f"{stem}.sources.json"
-        sources = self._source_stamps(rollout_id, evaluation=evaluation)
-        if cache_path.exists() and sources_path.exists() and json.loads(sources_path.read_text()) == sources:
-            return pl.read_parquet(cache_path)
+        cached = self.cached_summary(rollout_id, evaluation=evaluation)
+        if cached is not None:
+            return cached
 
+        cache_path = self._summary_path(rollout_id, evaluation)
+        sources_path = cache_path.with_suffix(".sources.json")
+        sources = self._source_stamps(rollout_id, evaluation=evaluation)
         joined = self.joined(rollout_id, evaluation=evaluation)
         rows = [
             self._summary_row(
@@ -557,10 +572,13 @@ class DumpReader:
     def groups(self, rollout_id: int, *, evaluation: bool = False) -> pl.DataFrame:
         """Per-GRPO-group aggregates; ``zero_std`` flags degenerate groups
         (all samples got the same reward, so advantages vanish)."""
+        return self.groups_from_summary(self.summary(rollout_id, evaluation=evaluation), evaluation=evaluation)
+
+    @staticmethod
+    def groups_from_summary(summary: pl.DataFrame, *, evaluation: bool = False) -> pl.DataFrame:
         reward_column = "reward" if evaluation else "raw_reward"
         return (
-            self.summary(rollout_id, evaluation=evaluation)
-            .group_by("group_index")
+            summary.group_by("group_index")
             .agg(
                 n=pl.len(),
                 reward_mean=pl.col(reward_column).mean(),

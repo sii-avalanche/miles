@@ -97,6 +97,7 @@ export async function renderTimeline(view, meta, route) {
   let showMem = false;
   let showAbsolute = false; // x-axis ticks: relative "+h:mm:ss" (default) vs wall-clock
   let multiNode = false;
+  const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
   const laneKey = (l) => `${l.node}:${l.gpu}`;
   // hard viewport cap (design §17): the lane view never displays more than
   // MAXW at once, so every data fetch is O(window), never O(run)
@@ -123,7 +124,9 @@ export async function renderTimeline(view, meta, route) {
     haveData = true;
   }
 
+  let laneRequest = 0;
   async function loadData() {
+    const request = ++laneRequest;
     const [topology, bubblesRes] = await Promise.all([
       api("/api/timeline/topology"),
       api("/api/timeline/bubbles"),
@@ -158,15 +161,16 @@ export async function renderTimeline(view, meta, route) {
         try { history.replaceState(null, "", `#/timeline?lanes=${encodeURIComponent(selection)}`); } catch { /* sandbox */ }
       }
     }
-    const [phasesRes, gpuRes, processesRes] = await Promise.all([
+    const [phasesRes, gpuRes, processesRes, overlay] = await Promise.all([
       api("/api/timeline/phases", { t0: f0, t1: f1, lanes: selection }),
       api("/api/timeline/gpu", { t0: f0, t1: f1, max_points: 4000, lanes: selection }),
       api("/api/timeline/gpu_processes", { t0: f0, t1: f1, lanes: selection }),
+      overlayMetric
+        ? api("/api/timeline/engine_series", { metric: overlayMetric, t0: f0, t1: f1, max_points: 4000 })
+        : null,
     ]);
-    engineSeries = overlayMetric
-      ? (await api("/api/timeline/engine_series", { metric: overlayMetric, t0: f0, t1: f1, max_points: 4000 }))
-          .series
-      : [];
+    if (request !== laneRequest) return;
+    engineSeries = overlay?.series ?? [];
     fetched = { t0: f0, t1: f1 };
     lanes = allLanes;
     resolvedKeys = null;
@@ -202,21 +206,16 @@ export async function renderTimeline(view, meta, route) {
   }
 
   // pan/zoom past the fetched bounds: debounced windowed reload
-  let reloadTimer = null;
+  let windowTimer = null;
+  let panFrame = 0;
   function afterViewChange() {
-    draw();
-    syncCarpet();
-    if (!fetched || v0 < fetched.t0 - 1e-6 || v1 > fetched.t1 + 1e-6) {
-      clearTimeout(reloadTimer);
-      reloadTimer = setTimeout(async () => {
-        try {
-          await loadData();
-        } catch {
-          return; // transient fetch failure — the next interaction retries
-        }
-        renderAll();
-      }, 300);
-    }
+    if (!panFrame) panFrame = requestAnimationFrame(() => {
+      panFrame = 0;
+      draw();
+      dataPool.pan();
+      if (manyLanes()) fleet.pan();
+    });
+    scheduleWindowLoad();
   }
 
   // external engines (no miles actor) have unknown GPU placement (gpus=[]):
@@ -263,7 +262,7 @@ export async function renderTimeline(view, meta, route) {
     );
     const absBtn = el(
       "button",
-      { class: showAbsolute ? "active" : "", onclick: () => ((showAbsolute = !showAbsolute), renderToolbar(), draw()) },
+      { class: showAbsolute ? "active" : "", onclick: () => ((showAbsolute = !showAbsolute), renderToolbar(), dataPool.redraw(), draw()) },
       ["abs time"],
     );
     toolbar.replaceChildren(
@@ -368,8 +367,9 @@ export async function renderTimeline(view, meta, route) {
       }
     },
   });
-  const fleet = createFleet({ phaseColors: PHASE_COLORS, runStart: () => T0 });
-  const dataPool = createDataPool(meta);
+  const viewport = () => (haveData ? { t0: v0, t1: v1 } : {});
+  const fleet = createFleet({ phaseColors: PHASE_COLORS, runStart: () => T0, viewport: viewport });
+  const dataPool = createDataPool(meta, () => T0, () => showAbsolute, viewport);
 
   // above this many lanes the per-rank carpet stops scaling (payload and
   // pixels are both O(lanes)); serve --dashboard-use-utilization-overview forces it
@@ -377,18 +377,35 @@ export async function renderTimeline(view, meta, route) {
 
   // the overview (carpet or fleet panels) tracks the lane view's zoom window;
   // before any data exists it asks for the (empty) server default
-  const carpetRange = () => (haveData ? { t0: v0, t1: v1 } : {});
   const manyLanes = () => meta.capabilities.use_utilization_overview || allLanes.length > CARPET_MAX_LANES;
   async function refreshOverview() {
     carpet.root.style.display = manyLanes() ? "none" : "";
     fleet.root.style.display = manyLanes() ? "" : "none";
-    await Promise.all([dataPool.refresh(carpetRange()), manyLanes() ? fleet.refresh(carpetRange()) : carpet.refresh(carpetRange())]);
+    await Promise.all([dataPool.refresh(viewport()), manyLanes() ? fleet.refresh(viewport()) : carpet.refresh(viewport())]);
   }
-  let carpetTimer = null;
-  const syncCarpet = () => {
-    clearTimeout(carpetTimer);
-    carpetTimer = setTimeout(() => refreshOverview().catch(() => {}), 250);
-  };
+  let windowRevision = 0;
+  const changingWindow = () => windowTimer !== null || editingWindow || movingWindow;
+  function scheduleWindowLoad(delay = 200) {
+    const revision = ++windowRevision;
+    loadStatus.textContent = "Loading this time window…";
+    retryWindow.hidden = true;
+    clearTimeout(windowTimer);
+    windowTimer = setTimeout(async () => {
+      try {
+        const needLanes = !fetched || v0 < fetched.t0 || v1 > fetched.t1;
+        await Promise.all([refreshOverview(), needLanes ? loadData() : null]);
+        if (revision !== windowRevision) return;
+        renderAll();
+        loadStatus.textContent = "";
+      } catch (error) {
+        if (revision !== windowRevision) return;
+        loadStatus.textContent = `Could not load this time window. ${error.message}`;
+        retryWindow.hidden = false;
+      } finally {
+        if (revision === windowRevision) windowTimer = null;
+      }
+    }, delay);
+  }
 
   // ----------------------------- bubble strip -------------------------------
   const bubbleStrip = el("div", { class: "bubblestrip" });
@@ -423,10 +440,90 @@ export async function renderTimeline(view, meta, route) {
 
   // -------------------------------- canvas ----------------------------------
   const canvas = el("canvas", { class: "timeline" });
+  const dateField = name => el("input", { type: "datetime-local", step: "1", required: "", "aria-label": name });
+  const from = dateField("Window start");
+  const to = dateField("Window end");
+  const loadStatus = el("span", { role: "status", class: "muted" });
+  const retryWindow = el("button", { type: "button", hidden: "", onclick: () => scheduleWindowLoad(0) }, ["Retry"]);
+  const editor = el("form", { class: "controls" }, [
+    el("label", {}, ["From ", from]), el("label", {}, ["To ", to]), el("button", { type: "submit" }, ["Apply"]),
+    el("span", { class: "muted" }, [Intl.DateTimeFormat().resolvedOptions().timeZone]), loadStatus, retryWindow,
+  ]);
+  const rail = el("div", { "aria-label": "Time window", style:
+    "position:relative;height:24px;background:var(--border);border-radius:4px;touch-action:none;user-select:none;cursor:pointer" });
+  const grip = side => el("span", { "data-edge": side, title: "Resize " + side, style:
+    `position:absolute;${side}:0;width:8px;top:0;bottom:0;border-${side}:3px solid var(--accent);cursor:ew-resize` });
+  const selectionBar = el("div", { title: "Drag to move the time window", style:
+    "position:absolute;height:100%;background:rgba(42,120,214,.35);border-radius:3px;cursor:grab" },
+    [grip("left"), grip("right")]);
+  rail.append(selectionBar);
+  const timeBar = el("div", { class: "panel", style: "position:sticky;top:46px;z-index:5" }, [editor, rail]);
+  let editingWindow = false;
+  let movingWindow = null;
+  function localDate(t) {
+    const date = new Date(Math.round(t) * 1000);
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+  }
+  function updateTimeBar() {
+    if (!haveData || T1 <= T0) return;
+    selectionBar.style.left = (100 * (v0 - T0) / (T1 - T0)) + "%";
+    selectionBar.style.width = (100 * (v1 - v0) / (T1 - T0)) + "%";
+    if (!editingWindow) {
+      from.value = localDate(v0);
+      to.value = localDate(v1);
+    }
+  }
+  function setWindow(a, b) {
+    v0 = a;
+    v1 = b;
+    editingWindow = false;
+    to.setCustomValidity("");
+    afterViewChange();
+  }
+  editor.oninput = () => { editingWindow = true; to.setCustomValidity(""); };
+  editor.onsubmit = ev => {
+    ev.preventDefault();
+    if (!haveData) return;
+    // Displayed bounds have one-second precision; retain fractional run edges.
+    const a = from.value === localDate(T0) ? T0 : Math.max(T0, new Date(from.value).getTime() / 1000);
+    const b = to.value === localDate(T1) ? T1 : Math.min(T1, new Date(to.value).getTime() / 1000);
+    if (!(b > a) || b - a > MAXW + 1) {
+      to.setCustomValidity("Choose an interval within this run, up to " + Math.round(MAXW / 3600) + " hours.");
+      to.reportValidity();
+      return;
+    }
+    setWindow(a, Math.min(b, a + MAXW));
+  };
+  const railTime = x => {
+    const rect = rail.getBoundingClientRect();
+    return T0 + (x - rect.left) / rect.width * (T1 - T0);
+  };
+  function moveWindow(a, span) {
+    const start = clamp(a, T0, T1 - span);
+    setWindow(start, start + span);
+  }
+  rail.onpointerdown = ev => {
+    if (!haveData || ev.button !== 0 || movingWindow) return;
+    const t = railTime(ev.clientX);
+    if (ev.target === rail) moveWindow(t - (v1 - v0) / 2, v1 - v0);
+    movingWindow = { id: ev.pointerId, edge: ev.target.dataset.edge, anchor: t, start: v0, end: v1 };
+    rail.setPointerCapture(ev.pointerId);
+  };
+  rail.onpointermove = ev => {
+    if (!movingWindow || ev.pointerId !== movingWindow.id) return;
+    const { edge, anchor, start, end } = movingWindow;
+    const delta = railTime(ev.clientX) - anchor;
+    const minimum = Math.min(1, T1 - T0);
+    if (edge === "left") setWindow(clamp(start + delta, Math.max(T0, end - MAXW), end - minimum), end);
+    else if (edge === "right") setWindow(start, clamp(end + delta, start + minimum, Math.min(T1, start + MAXW)));
+    else moveWindow(start + delta, end - start);
+  };
+  rail.onlostpointercapture = () => { movingWindow = null; };
   const overlayMax = () => Math.max(extent(...engineSeries.map((s) => s.value))[1], 1e-9);
   const memMax = () => Math.max(extent(...Object.values(gpu).map((s) => s.mem_mb))[1], 1);
 
   function draw() {
+    updateTimeBar();
     canvas.style.height = `${M_TOP + Math.max(lanes.length, 1) * LANE_H + 8}px`;
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
@@ -617,9 +714,7 @@ export async function renderTimeline(view, meta, route) {
       const rect = canvas.getBoundingClientRect();
       const dt = ((dragFrom.x - ev.clientX) / (rect.width - M_LEFT - M_RIGHT)) * (dragFrom.v1 - dragFrom.v0);
       const span = dragFrom.v1 - dragFrom.v0;
-      v0 = Math.max(T0, Math.min(dragFrom.v0 + dt, T1 - span));
-      v1 = v0 + span;
-      afterViewChange();
+      moveWindow(dragFrom.v0 + dt, span);
       return;
     }
     const rect = canvas.getBoundingClientRect();
@@ -750,6 +845,7 @@ export async function renderTimeline(view, meta, route) {
     selRow,
     mfuPanel,
     advisoryPanel,
+    timeBar,
     dataPool.root,
     carpet.root,
     fleet.root,
@@ -775,12 +871,18 @@ export async function renderTimeline(view, meta, route) {
   let intervalId = null;
   if (meta.mode === "follow") {
     intervalId = setInterval(async () => {
-      if (refreshing) return;
+      if (refreshing || changingWindow()) return;
       refreshing = true;
       try {
         // fresh global range (cheap edge-stamp read); getMeta() is cached
-        applyRange((await api("/api/meta")).time_range);
+        const revision = windowRevision;
+        const range = (await api("/api/meta")).time_range;
+        if (revision !== windowRevision || changingWindow()) return;
+        // A completed historical window does not need repeated multi-MB fetches.
+        if (haveData && range && v1 < T1 && range[0] === T0 && range[1] === T1) return;
+        applyRange(range);
         await Promise.all([loadData(), loadAdvisories()]);
+        if (revision !== windowRevision || changingWindow()) return;
         renderAll();
         await refreshOverview();
       } catch {
@@ -792,8 +894,9 @@ export async function renderTimeline(view, meta, route) {
   }
   setViewCleanup(() => {
     if (intervalId !== null) clearInterval(intervalId);
-    clearTimeout(carpetTimer);
-    clearTimeout(reloadTimer);
+    cancelAnimationFrame(panFrame);
+    ++windowRevision;
+    clearTimeout(windowTimer);
     carpet.destroy();
     window.removeEventListener("resize", onResize);
     window.removeEventListener("mouseup", onMouseUp);

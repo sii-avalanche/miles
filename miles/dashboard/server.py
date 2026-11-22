@@ -26,6 +26,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 
 from miles.dashboard.advisory import DEFAULT_LOW_MFU, compute_advisories, mfu_summary
 from miles.dashboard.dump_reader import STEP_AGGREGATE_METRICS, DumpReader, DumpStillWriting
@@ -82,6 +83,7 @@ def make_app(
     low_mfu: float = DEFAULT_LOW_MFU,
 ) -> FastAPI:
     app = FastAPI(title="miles dashboard", docs_url=None, redoc_url=None)
+    app.add_middleware(GZipMiddleware, minimum_size=32768, compresslevel=1)
 
     @app.get("/api/meta")
     def meta():
@@ -99,6 +101,7 @@ def make_app(
             engine_interval_s=store.meta.args.get("dashboard_sglang_scrape_interval", 2) if store.meta else 2,
             wandb_url=_wandb_url(store.meta.args) if store.meta else None,
             data_buffer_length=store.latest_data_buffer_length(),
+            max_weight_staleness=store.meta.args.get("max_weight_staleness") if store.meta else None,
             time_range=store.time_range(),
             rollout_ids=dict(train=ids.train, eval=ids.eval),
             metric_keys=store.metric_keys() + dump_keys,

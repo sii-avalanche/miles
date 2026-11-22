@@ -166,6 +166,8 @@ class DataBufferSample(Record):
     rollout_id: int | None = None
     trainer_model_id: str | None = None
     reason: str | None = None
+    batch_groups: int | None = None
+    batch_target_groups: int | None = None
 
 
 class TrajectoryEventKind(StrEnum):

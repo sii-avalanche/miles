@@ -218,9 +218,12 @@ def _rollout_advisories(reader: DumpReader, args: dict) -> list[Advisory]:
     if not train_ids:
         return []
     rollout_id = train_ids[-1]
-    out = []
+    summary = reader.cached_summary(rollout_id)
+    if summary is None:
+        return []
 
-    groups = reader.groups(rollout_id)
+    out = []
+    groups = reader.groups_from_summary(summary)
     with_rewards = groups.filter(groups["reward_mean"].is_not_null())
     if len(with_rewards):
         zero_std = int(with_rewards["zero_std"].sum())
@@ -235,7 +238,6 @@ def _rollout_advisories(reader: DumpReader, args: dict) -> list[Advisory]:
                 )
             out.append(Advisory(level="warning", message=message))
 
-    summary = reader.summary(rollout_id)
     if summary.height == 0:
         return out
     truncated_frac = summary["truncated"].cast(float).mean()
