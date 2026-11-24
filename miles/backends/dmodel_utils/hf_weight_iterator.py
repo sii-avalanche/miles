@@ -6,6 +6,7 @@ import torch
 from dmodel.models.registry import get_family, get_model_type_for_config
 from dmodel.utils.checkpoint.conversion_utils import load_hf_weight_map
 from dmodel.utils.checkpoint.hf_sharded import read_hf_weight_views
+from torch.distributed._functional_collectives import AsyncCollectiveTensor
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
 from miles.backends.fsdp_utils.dtensor import gather_full_param
@@ -85,15 +86,27 @@ class DModelHfWeightIterator(HfWeightIteratorBase):
 
     def _iter_hf_param_units(self, weights, *, materialize):
         state = get_model_state_dict(self.model)
-        for source in self.sources:
-            full = gather_full_param(state[source], async_op=False)
-            if materialize:
-                for expert, header, view in self.plan[source]:
-                    # Rebuild the HF layout by copying into the same view used for loading.
-                    value = full.new_empty(header.shape)
-                    value.as_strided(view.shape, view.stride()).copy_(full if expert is None else full[expert])
-                    yield [(header.key, value)]
-            del full
+        pending = None
+        try:
+            for index, source in enumerate(self.sources):
+                full = pending if pending is not None else gather_full_param(state[source], async_op=True)
+                pending = None
+                if isinstance(full, AsyncCollectiveTensor):
+                    full = full.wait()
+                if index + 1 < len(self.sources):
+                    following = state[self.sources[index + 1]]
+                    if state[source].nbytes + following.nbytes <= self.max_source_bytes:
+                        pending = gather_full_param(following, async_op=True)
+                if materialize:
+                    for expert, header, view in self.plan[source]:
+                        # Rebuild the HF layout by copying into the same view used for loading.
+                        value = full.new_empty(header.shape)
+                        value.as_strided(view.shape, view.stride()).copy_(full if expert is None else full[expert])
+                        yield [(header.key, value)]
+                del full
+        finally:
+            if isinstance(pending, AsyncCollectiveTensor):
+                pending.wait()
 
     def _iter_hf_adapter_units(self, adapter, *, materialize):
         raise NotImplementedError("DModel publication does not support LoRA")

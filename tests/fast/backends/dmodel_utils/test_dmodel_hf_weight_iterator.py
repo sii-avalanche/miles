@@ -158,8 +158,8 @@ def _gather_tracker(monkeypatch):
     refs, calls = [], []
 
     def gather(value, *, async_op):
-        assert async_op is False
-        assert all(ref() is None for ref in refs), "previous global source retained across gathers"
+        assert async_op is True
+        assert sum(ref() is not None for ref in refs) <= 1, "more than two global sources in flight"
         full = value.detach().clone()
         refs.append(weakref.ref(full))
         calls.append((tuple(value.shape), value.dtype))
@@ -308,3 +308,31 @@ def test_dense_qwen_checkpoint_roundtrip(tmp_path, monkeypatch, tied):
     assert published.keys() == expected.keys()
     for key in expected:
         torch.testing.assert_close(published[key], expected[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_publication_lookahead_respects_byte_limit_and_drains_on_close(setup, monkeypatch, overlap):
+    iterator = _build(setup)
+    state = impl.get_model_state_dict(iterator.model)
+    iterator.sources = iterator.sources[:2]
+    first, second = iterator.sources
+    iterator.max_source_bytes = state[first].nbytes + state[second].nbytes - int(not overlap)
+    handles = []
+
+    class Handle:
+        def __init__(self, value):
+            self.value = value
+            self.waits = 0
+            handles.append(self)
+
+        def wait(self):
+            self.waits += 1
+            return self.value
+
+    monkeypatch.setattr(impl, "AsyncCollectiveTensor", Handle)
+    monkeypatch.setattr(impl, "gather_full_param", lambda value, *, async_op: Handle(value))
+    stream = iterator._iter_hf_param_units(None, materialize=True)
+    next(stream)
+    assert [handle.waits for handle in handles] == ([1, 0] if overlap else [1])
+    stream.close()
+    assert all(handle.waits == 1 for handle in handles)
