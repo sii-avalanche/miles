@@ -15,6 +15,7 @@ from tqdm import tqdm
 from miles.rollout.base_types import GenerateFnInput, RolloutFnEvalOutput, RolloutFnTrainOutput
 from miles.rollout.filter_hub.base_types import MetricGatherer
 from miles.rollout.filter_hub.common_filters import apply_preput_filters
+from miles.rollout.generate_utils.group import generate_group
 from miles.rollout.generate_utils.rollout_topk_logprobs import (
     append_rollout_topk_logprobs,
     configure_rollout_topk_logprobs_request,
@@ -401,23 +402,21 @@ async def generate_and_rm_group(
             if sample.routing_key is None:
                 sample.routing_key = str(uuid.uuid4())
 
-    member_sampling_params = []
-    for idx in range(len(group)):
-        current_sampling_params = sampling_params.copy()
+    def member_params(idx):
+        params = sampling_params.copy()
         if getattr(args, "sglang_enable_deterministic_inference", False):
-            seed = state.group_sampling_seeds[idx]
-            current_sampling_params["sampling_seed"] = seed
-        member_sampling_params.append(current_sampling_params)
+            params["sampling_seed"] = state.group_sampling_seeds[idx]
+        return params
 
     if state.avacore is not None and state.avacore.grouped:
-        return await state.avacore.generate_group(group, member_sampling_params, state)
+        return await state.avacore.generate_group(group, [member_params(i) for i in range(len(group))], state)
 
-    tasks = [
-        asyncio.create_task(generate_and_rm(args, sample, params, evaluation=evaluation, timeout=timeout))
-        for sample, params in zip(group, member_sampling_params, strict=True)
-    ]
+    async def generate_sample(idx, sample):
+        return await generate_and_rm(args, sample, member_params(idx), evaluation=evaluation, timeout=timeout)
 
-    group = await asyncio.gather(*tasks)
+    group = await generate_group(
+        group, generate_sample, max_retries=0 if evaluation else getattr(args, "rollout_sample_max_retries", 0)
+    )
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:

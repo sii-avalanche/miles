@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from miles.rollout.data_source import DataSource
+from miles.rollout.errors import RolloutSampleError as RolloutSampleError
 from miles.utils.types import Sample
 
 if TYPE_CHECKING:

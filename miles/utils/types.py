@@ -376,12 +376,15 @@ class Sample:
         self.rollout_routed_experts = None
         self.rollout_indexer_topk = None
         self.status = Sample.Status.ABORTED
+        self.teacher_log_probs = None
+        self.opd_reverse_kl = None
         self.trainer_model_id = None
         self.non_generation_time = 0.0
         self.spec_info = Sample.SpecInfo()
         self.prefix_cache_info = Sample.PrefixCacheInfo()
         self.remove_sample = False
         self.train_metadata = None
+        self.branches = []
 
     @property
     def all_weight_version_spans(self) -> list[WeightVersionSpan]:

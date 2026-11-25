@@ -15,7 +15,13 @@ import pytest
 import miles.rollout.fully_async_data_buffer as data_buffer
 import miles.rollout.fully_async_rollout as fully_async
 import miles.rollout.inference_rollout.inference_rollout_common as rollout_common
-from miles.rollout.base_types import BaseRolloutFn, RolloutFnConstructorInput, RolloutFnEvalInput, RolloutFnTrainInput
+from miles.rollout.base_types import (
+    BaseRolloutFn,
+    RolloutFnConstructorInput,
+    RolloutFnEvalInput,
+    RolloutFnTrainInput,
+    RolloutSampleError,
+)
 from miles.rollout.filter_hub.base_types import FilterOutput
 from miles.utils.types import Sample, WeightVersionSpan, WeightVersionsPerCall
 
@@ -127,6 +133,93 @@ async def test_drain_collects_batch_sorted_with_metrics(monkeypatch):
     # The worker persists across calls; a second drain works on the same instance.
     output2 = await fn(RolloutFnTrainInput(rollout_id=1))
     assert len(output2.samples) == 3
+
+
+@pytest.mark.parametrize("granularity", ["sample", "group"])
+async def test_failed_trajectory_is_retried_before_buffering(monkeypatch, granularity):
+    prompt_group = make_group(1, weight_versions=["3"])
+    data_source = FakeDataSource(scripted=[prompt_group])
+    calls = []
+
+    async def generate_sample(state, sample, sampling_params, evaluation=False):
+        if sample.group_index == 1:
+            calls.append(sample.index)
+            if sample is prompt_group[0] and calls.count(sample.index) == 1:
+                raise RuntimeError("transient trial failure")
+            sample.status, sample.reward = Sample.Status.COMPLETED, 1
+            sample.tokens, sample.response, sample.response_length = [1, 2], "ok", 1
+            if sample is prompt_group[0]:
+                sample.weight_versions = [
+                    WeightVersionsPerCall(spans=[WeightVersionSpan(version="4", abs_start=1, abs_end=2)])
+                ]
+        return sample
+
+    monkeypatch.setattr(rollout_common, "generate_and_rm", generate_sample)
+    monkeypatch.setattr(rollout_common, "policy_uses_routing_key", lambda args: False)
+    args = make_args(
+        rollout_batch_size=1,
+        async_max_concurrent_samples=2,
+        rollout_submission_granularity=granularity,
+        group_rm=False,
+        rollout_sample_max_retries=1,
+        max_weight_staleness=1,
+    )
+    fn = make_fn(monkeypatch, args, data_source, generate=rollout_common.generate_and_rm_group)
+    try:
+        output = await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=0, weight_version=4)), timeout=3)
+        assert output.samples == [prompt_group]
+        assert calls.count(prompt_group[0].index) == 2
+        assert calls.count(prompt_group[1].index) == 1
+        assert prompt_group[1].oldest_weight_version == 3
+        assert data_source.recycled == []
+        assert not fn._worker.done()
+    finally:
+        fn._worker.cancel()
+        await asyncio.gather(fn._worker, return_exceptions=True)
+
+
+@pytest.mark.parametrize("granularity", ["sample", "group"])
+async def test_exhausted_trial_does_not_stop_later_batches(monkeypatch, granularity):
+    prompt_group = make_group(1)
+    data_source = FakeDataSource(scripted=[prompt_group])
+    calls = []
+    sibling_done = asyncio.Event()
+
+    async def generate_sample(state, sample, sampling_params, evaluation=False):
+        await asyncio.sleep(0)
+        if sample.group_index == 1:
+            calls.append(sample.index)
+            if sample is prompt_group[0]:
+                await sibling_done.wait()
+                raise RolloutSampleError("agent timed out")
+            sibling_done.set()
+        return sample
+
+    monkeypatch.setattr(rollout_common, "generate_and_rm", generate_sample)
+    monkeypatch.setattr(rollout_common, "policy_uses_routing_key", lambda args: False)
+    args = make_args(
+        rollout_batch_size=2,
+        async_max_concurrent_samples=2,
+        rollout_submission_granularity=granularity,
+        group_rm=False,
+        rollout_sample_max_retries=1,
+    )
+    fn = make_fn(monkeypatch, args, data_source, generate=rollout_common.generate_and_rm_group)
+    try:
+        output = await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=0)), timeout=5)
+        assert output.metrics["rollout/fully_async/aborted_groups_filtered"] == 1
+        assert calls.count(prompt_group[0].index) == 2
+        assert calls.count(prompt_group[1].index) == 1
+        assert prompt_group[1].status == Sample.Status.COMPLETED
+        assert data_source.recycled == []
+        output2 = await asyncio.wait_for(fn(RolloutFnTrainInput(rollout_id=1)), timeout=5)
+        for batch in (output, output2):
+            assert len(batch.samples) == 2
+            assert all(len(group) == 2 and group[0].group_index != 1 for group in batch.samples)
+        assert not fn._worker.done()
+    finally:
+        fn._worker.cancel()
+        await asyncio.gather(fn._worker, return_exceptions=True)
 
 
 async def test_eval_without_fleet_pauses_producer(monkeypatch):

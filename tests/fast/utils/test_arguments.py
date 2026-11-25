@@ -88,6 +88,15 @@ def _clear_mooncake_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.mark.parametrize("extra,expected", [([], 0), (["--rollout-sample-max-retries", "2"], 2)])
+def test_rollout_sample_retry_budget(extra, expected):
+    with patch.object(sys, "argv", ["test"] + REQUIRED_ARGS + extra):
+        parser = argparse.ArgumentParser()
+        get_miles_extra_args_provider()(parser)
+        args, _ = parser.parse_known_args()
+    assert args.rollout_sample_max_retries == expected
+
+
 def make_class_with_add_arguments():
     class MyFn:
         @classmethod
