@@ -232,7 +232,8 @@ class AvaCoreRollout:
             store.rl_run(
                 model=self.recording["model"],
                 run=self.recording["run"],
-                collection=Path(self.args.prompt_data).stem,
+                collection=self.recording.get("collection", Path(self.args.prompt_data).stem),
+                collection_version=self.recording.get("collection_version"),
                 sampling_params=sampling_params,
                 config=self.config,
                 schema=Schema(),
