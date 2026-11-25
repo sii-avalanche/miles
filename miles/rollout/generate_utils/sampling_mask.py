@@ -1,6 +1,9 @@
 from argparse import Namespace
 from collections.abc import Mapping, Sequence
 
+import numpy as np
+import torch
+
 from miles.utils.sampling_mask import RolloutSamplingMask
 from miles.utils.types import Sample
 
@@ -89,6 +92,77 @@ def _sampling_mask_from_supports(
     return RolloutSamplingMask.from_mask_list(supports)
 
 
+def decode_binary_sampling_csr(
+    supports: Mapping, log_probs: Mapping, rows: int, mode: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if (
+        not isinstance(supports, Mapping)
+        or not isinstance(log_probs, Mapping)
+        or supports.get("version") != 1
+        or log_probs.get("version") != 1
+        or supports.get("num_rows") != rows
+        or log_probs.get("num_rows") != rows
+        or log_probs.get("mode") != mode
+    ):
+        raise ValueError("Unsupported binary sampling CSR version, mode, or row count")
+    lengths_raw, ids_raw, logps_raw = (
+        supports.get("lengths_i32_le"),
+        supports.get("ids_i32_le"),
+        log_probs.get("logps_f32_le"),
+    )
+    if not (isinstance(lengths_raw, bytes) and isinstance(ids_raw, bytes) and isinstance(logps_raw, bytes)):
+        raise ValueError("Binary sampling CSR arrays must be bytes")
+    if len(lengths_raw) != rows * 4:
+        raise ValueError("Binary sampling CSR lengths byte size mismatch")
+    lengths = np.frombuffer(lengths_raw, dtype="<i4")
+    if np.any(lengths < 0):
+        raise ValueError("Invalid negative binary sampling CSR length")
+    total = int(lengths.sum(dtype=np.int64))
+    expected_logps = total if mode == "support" else rows
+    if len(ids_raw) != total * 4 or len(logps_raw) != expected_logps * 4:
+        raise ValueError("Binary sampling CSR byte size mismatch")
+    flat_ids = np.frombuffer(ids_raw, dtype="<i4")
+    flat_logps = np.frombuffer(logps_raw, dtype="<f4")
+    if np.any(flat_ids < 0) or np.isnan(flat_logps).any() or np.isposinf(flat_logps).any():
+        raise ValueError("Invalid binary sampling CSR values")
+    return lengths, flat_ids, flat_logps
+
+
+def _decode_binary_sampling_metadata(
+    output_token_ids: Sequence[int],
+    supports: Mapping,
+    log_probs: Mapping,
+    sampling_logprobs_mode: str,
+) -> tuple[RolloutSamplingMask, list[float]]:
+    if sampling_logprobs_mode not in ("support", "selected"):
+        raise ValueError(f"Unsupported sampling logprobs mode: {sampling_logprobs_mode}")
+    n = len(output_token_ids)
+    lengths, flat_ids, flat_logps = decode_binary_sampling_csr(supports, log_probs, n, sampling_logprobs_mode)
+    if n == 0:
+        return RolloutSamplingMask.from_mask_list([]), []
+    if np.any(lengths <= 0):
+        raise ValueError("sampling support must contain at least one token")
+    offsets = np.concatenate(([0], np.cumsum(lengths, dtype=np.int64)))
+    row_indices = np.repeat(np.arange(n, dtype=np.int64), lengths)
+    matches = flat_ids.astype(np.int64) == np.asarray(output_token_ids, dtype=np.int64)[row_indices]
+    match_counts = np.bincount(row_indices[matches], minlength=n)
+    if np.any(match_counts == 0):
+        raise ValueError("sampled token is absent from its sampling support")
+    if sampling_logprobs_mode == "support":
+        if np.any(match_counts != 1):
+            raise ValueError("Sampled token must occur exactly once in its sampling support")
+        selected = flat_logps[matches].astype(float).tolist()
+    else:
+        selected = flat_logps.astype(float).tolist()
+    return (
+        RolloutSamplingMask(
+            ids=torch.from_numpy(flat_ids.astype(np.int32, copy=True)),
+            offsets=torch.from_numpy(offsets),
+        ),
+        selected,
+    )
+
+
 def append_sampling_metadata(
     sample: Sample,
     output_token_ids: Sequence[int],
@@ -110,6 +184,14 @@ def append_sampling_metadata(
             "output_token_sampling_logprobs; use an SGLang build with the "
             "native return_sampling_mask primitive"
         )
+    if isinstance(supports, Mapping) and isinstance(log_probs, Mapping):
+        sampling_mask, selected = _decode_binary_sampling_metadata(
+            output_token_ids, supports, log_probs, sampling_logprobs_mode
+        )
+        _append_sampling_mask(sample, sampling_mask)
+        return selected
+    if isinstance(supports, Mapping) or isinstance(log_probs, Mapping):
+        raise ValueError("output_token_sampling_mask and output_token_sampling_logprobs must use matching formats")
     if len(log_probs) != len(output_token_ids):
         raise ValueError(f"sampling log-prob length {len(log_probs)} != output token length {len(output_token_ids)}")
 

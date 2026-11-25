@@ -55,8 +55,11 @@ def append_rollout_topk_logprobs(
     support_mode = sampling_logprobs_mode == "support"
     field = "output_token_sampling_logprobs" if support_mode else "output_top_logprobs"
     payload = meta.get(field)
-    if not support_mode and isinstance(payload, dict):
-        ids, logps = _decode_binary_candidates(payload, n, k)
+    if isinstance(payload, dict):
+        if support_mode:
+            ids, logps = _decode_binary_support_candidates(meta.get("output_token_sampling_mask"), payload, n, k)
+        else:
+            ids, logps = _decode_binary_candidates(payload, n, k)
         for name, values in (("rollout_topk_token_ids", ids), ("rollout_topk_log_probs", logps)):
             previous = getattr(sample, name)
             setattr(sample, name, values if previous is None else np.concatenate((previous, values)))
@@ -167,4 +170,21 @@ def _decode_binary_candidates(payload, rows: int, width: int):
         raise ValueError("Invalid binary candidate values")
     if np.any((ids == -1) & ~np.isneginf(logps)):
         raise ValueError("Invalid binary candidate padding")
+    return ids, logps
+
+
+def _decode_binary_support_candidates(mask_payload, logprobs_payload, rows: int, width: int):
+    from miles.rollout.generate_utils.sampling_mask import decode_binary_sampling_csr
+
+    lengths, flat_ids, flat_logps = decode_binary_sampling_csr(mask_payload, logprobs_payload, rows, "support")
+    if np.any(lengths > width):
+        raise ValueError("Rollout top-k logprobs sampling support exceeds --rollout-top-logprobs-num")
+    ids = np.full((rows, width), -1, dtype=np.int32)
+    logps = np.full((rows, width), -np.inf, dtype=np.float32)
+    if flat_ids.size:
+        row_idx = np.repeat(np.arange(rows, dtype=np.int64), lengths)
+        starts = np.cumsum(lengths, dtype=np.int64) - lengths
+        col_idx = np.arange(flat_ids.size, dtype=np.int64) - np.repeat(starts, lengths)
+        ids[row_idx, col_idx] = flat_ids
+        logps[row_idx, col_idx] = flat_logps
     return ids, logps
