@@ -128,7 +128,10 @@ def compute_advantages_and_returns(
         pairs = list(zip(advantages, local_weights, strict=True))
         if any(adv.shape != weight.shape for adv, weight in pairs):
             raise ValueError("Turn credit and local advantages must have the same shape")
-        advantages = [adv * weight.to(adv) for adv, weight in pairs]
+        if getattr(args, "turn_reward_mode", "multiply") == "add":
+            advantages = [adv + weight.to(adv) for adv, weight in pairs]
+        else:
+            advantages = [adv * weight.to(adv) for adv, weight in pairs]
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns

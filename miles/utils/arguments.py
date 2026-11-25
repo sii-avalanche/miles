@@ -1795,6 +1795,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--quantile-k", type=float, default=None, help="QAE quantile k")
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
+                "--turn-reward-mode",
+                choices=["multiply", "add"],
+                default="multiply",
+                help="Combine audited turn credit with advantages after normalization: "
+                "multiply by outcome plus offset (default), or add the offset directly.",
+            )
+            parser.add_argument(
                 "--disable-grpo-std-normalization",
                 action="store_false",
                 dest="grpo_std_normalization",

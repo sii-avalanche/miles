@@ -58,10 +58,13 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
 
 def _turn_weights(args, sample: Sample) -> list[float]:
     offsets = sample.turn_advantage_offsets
+    additive = getattr(args, "turn_reward_mode", "multiply") == "add"
     if offsets is None:
-        return [1.0] * sample.response_length
+        return [0.0 if additive else 1.0] * sample.response_length
     if len(offsets) != sample.response_length:
         raise ValueError("Turn credit must align with the complete response")
+    if additive:
+        return list(offsets)
     outcome = sample.get_reward_value(args)
     return [outcome + offset for offset in offsets]
 
