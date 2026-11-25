@@ -1,5 +1,7 @@
 import asyncio
 import copy
+import importlib
+import json
 import logging
 import os
 from argparse import Namespace
@@ -14,13 +16,13 @@ import numpy as np
 import pybase64
 from ava_core.config import interpolated, launch_converter
 from ava_core.core import Schema, Trace
-from ava_core.core.trace import iter_trace_nodes
+from ava_core.core.trace import encode_traces, iter_trace_nodes
 from ava_core.generate.core import GenerateFunction
 from ava_core.generate.core import Sample as Row
 from ava_core.rewards import RewardFunction
 from ava_core.rewards.core import GroupRewardFunction, Reward
 from ava_core.runner import RECOVERABLE_ERRORS
-from ava_core.store.core import Run
+from ava_core.store.core import STORED, Run
 from ava_core.store.postgres import PostgresBackend
 
 from miles.rollout.avacore_vision import training_images
@@ -68,6 +70,8 @@ class AvaCoreRollout:
         self.stack = AsyncExitStack()
         self.writes: set[asyncio.Task[None]] = set()
         self.failed_writes = 0
+        self.local_outbox = None
+        self.local_outbox_lock = asyncio.Lock()
 
     async def generate(
         self,
@@ -214,9 +218,12 @@ class AvaCoreRollout:
         if not samples:
             raise ValueError("AvaCore rollout contains no generated training tokens")
         if self.recording is not None:
-            write = asyncio.create_task(self.record(row, sample, traces, reward, sampling_params))
-            self.writes.add(write)
-            write.add_done_callback(self.writes.discard)
+            if self.recording.get("backend") == "local_spool":
+                await self.record_to_local_spool(row, sample, traces, reward, sampling_params)
+            else:
+                write = asyncio.create_task(self.record(row, sample, traces, reward, sampling_params))
+                self.writes.add(write)
+                write.add_done_callback(self.writes.discard)
         if len(samples) > 1:
             rollout_id = sample.rollout_id if sample.rollout_id is not None else sample.index
             if rollout_id is None:
@@ -224,6 +231,72 @@ class AvaCoreRollout:
             for output in samples:
                 output.rollout_id = rollout_id
         return samples
+
+    def recording_identity(self) -> dict[str, Any]:
+        assert self.recording is not None
+        identity = {
+            "model": self.recording["model"],
+            "run": self.recording["run"],
+            "collection": self.recording.get("collection", Path(self.args.prompt_data).stem),
+        }
+        if "collection_version" in self.recording:
+            identity["collection_version"] = self.recording["collection_version"]
+        return identity
+
+    async def record_to_local_spool(
+        self, row: Row, sample: Sample, traces: tuple[Trace, ...], reward: Reward, sampling_params: dict[str, Any]
+    ) -> None:
+        """Persist a scored rollout on shared storage before returning it to training."""
+        assert self.recording is not None and sample.index is not None
+        identity = self.recording_identity()
+        async with self.local_outbox_lock:
+            if self.local_outbox is None:
+                module = importlib.import_module("avatrain.local_recording")
+                outbox = module.LocalRecording(
+                    self.recording["spool_dir"],
+                    module.PostgresWriter(self.recording["postgres"]),
+                    max_bytes=self.recording.get("max_spool_bytes", 10 * 1024**3),
+                )
+                try:
+                    if counters_file := self.recording.get("initial_counters_file"):
+                        snapshot = await asyncio.to_thread(lambda: json.loads(Path(counters_file).read_text()))
+                        if snapshot["identity"] != identity:
+                            raise ValueError("Recording trial counter snapshot does not match the selected run")
+                        await outbox.seed(identity, snapshot["counters"])
+                    else:
+                        await outbox.resume(identity)
+                    await outbox.start()
+                except BaseException:
+                    await outbox.close()
+                    raise
+                self.local_outbox = outbox
+        query_id = str(sample.metadata["_index"])
+        trial_id = await asyncio.to_thread(self.local_outbox.allocate, identity, query_id)
+        version = next(
+            (
+                node.message.metadata["weight_version"]
+                for node in reversed(traces[0].prefixes)
+                if node.generated and "weight_version" in node.message.metadata
+            ),
+            None,
+        )
+        record = {
+            "identity": identity,
+            "query_id": query_id,
+            "trial_id": trial_id,
+            "instance": dict(row),
+            "trace_graph": await asyncio.to_thread(encode_traces, traces),
+            "reward": STORED.unstructure(reward),
+            "sampling_params": sampling_params,
+            "config": self.config,
+            "metadata": {
+                "group_index": sample.group_index,
+                "sample_index": sample.index,
+                "epoch": sample.epoch,
+                "weight_version": version,
+            },
+        }
+        await self.local_outbox.enqueue(record)
 
     async def open(self, sampling_params: dict[str, Any]) -> Run:
         assert self.recording is not None
