@@ -8,6 +8,7 @@ from miles.rollout.fully_async_data_buffer import (
     DataBuffer,
     DataBufferConstructorInput,
     DataBufferInput,
+    DefaultDataBuffer,
     DefaultMultiDataBuffer,
 )
 
@@ -79,7 +80,7 @@ class TestTheMetricsOfOnePolicy:
 
 from tests.fast.fixtures.megatron_config_fixtures import encode_megatron_config
 
-from miles.utils.types import Sample
+from miles.utils.types import Sample, WeightVersionsPerCall, WeightVersionSpan
 
 
 def _make_args() -> Namespace:
@@ -124,3 +125,48 @@ class TestPerPolicyMetrics:
         assert buffer.get_metrics("solver")["rollout/raw_reward_unfiltered"] == 1.0
         assert buffer.get_metrics("verifier")["rollout/raw_reward_unfiltered"] == 3.0
         assert "rollout/raw_reward_unfiltered" not in buffer.get_metrics("verifier")
+
+
+class TestDataBufferSamplingMode:
+    def _single_buffer(self, *, sampling_mode: str, capacity_factor: float = 16.0, seed: int = 42) -> DefaultDataBuffer:
+        args = Namespace(
+            async_data_buffer_capacity_factor=capacity_factor,
+            async_data_buffer_sampling_mode=sampling_mode,
+            dynamic_sampling_filter_path=None,
+            max_weight_staleness=None,
+            reward_key=None,
+            rollout_batch_size=1,
+            seed=seed,
+            use_miles_dashboard=True,
+        )
+        return DefaultDataBuffer(DataBufferConstructorInput(args=args, unused_handler_fn=_ignore_group))
+
+    async def test_fifo_dequeues_in_insertion_order(self) -> None:
+        buf = self._single_buffer(sampling_mode="fifo")
+        for i in range(8):
+            g = [_make_sample(index=i, reward=1.0, trainer_model_id="solver")]
+            await buf.put(DataBufferInput(prompt_group=g, group=g))
+
+        got = [(await buf.get()).group[0].index for _ in range(8)]
+        assert got == list(range(8))
+        assert not buf._queued_versions
+        assert not buf._version_counts
+
+    async def test_random_dequeues_all_groups_non_fifo_and_tracks_dashboard_versions(self) -> None:
+        buf = self._single_buffer(sampling_mode="random", seed=123)
+        for i in range(12):
+            s = _make_sample(index=i, reward=1.0, trainer_model_id="solver")
+            s.weight_versions = [WeightVersionsPerCall(spans=[WeightVersionSpan(version=str(i), abs_start=0, abs_end=1)])]
+            g = [s]
+            await buf.put(DataBufferInput(prompt_group=g, group=g))
+
+        got = [(await buf.get()).group[0].index for _ in range(12)]
+        assert sorted(got) == list(range(12))
+        assert got != list(range(12))
+        assert not buf._queued_versions
+        assert not buf._version_counts
+        assert buf._mixed_groups == 0
+
+    def test_invalid_sampling_mode_raises(self) -> None:
+        with pytest.raises(ValueError, match="async_data_buffer_sampling_mode"):
+            self._single_buffer(sampling_mode="invalid")
