@@ -8,8 +8,9 @@ from pathlib import Path
 
 import torch
 
-from miles.rollout.continuous_sec import METADATA_KEY, ContinuousSEC, curriculum_records
+from miles.rollout.continuous_sec import METADATA_KEY as SEC_METADATA_KEY, ContinuousSEC, curriculum_records
 from miles.rollout.curriculum_config import SECConfig
+from miles.rollout.curriculum_strategies import DAREConfig, DARECurriculum, DOTSConfig, DOTSCurriculum, prepare_records
 from miles.utils.data import Dataset
 from miles.utils.function_registry import load_function
 from miles.utils.processing_utils import load_processor, load_tokenizer
@@ -113,11 +114,12 @@ class RolloutDataSource(DataSource):
                             yield record
 
             if getattr(args, "curriculum_enabled", False):
+                strategy = getattr(args, "curriculum_strategy", "continuous_sec")
                 original_filter = data_filter
 
                 def data_filter(records):
                     filtered = original_filter(records) if original_filter is not None else records
-                    return curriculum_records(args, filtered)
+                    return curriculum_records(args, filtered) if strategy == "continuous_sec" else prepare_records(args, filtered, strategy)
 
             self.dataset = Dataset(
                 args.prompt_data,
@@ -139,16 +141,38 @@ class RolloutDataSource(DataSource):
 
             self.tokenizer = tokenizer
             if getattr(args, "curriculum_enabled", False):
-                self.curriculum = ContinuousSEC(
-                    [sample.metadata[METADATA_KEY] for sample in self.dataset.origin_samples],
-                    config=SECConfig.from_args(args), seed=self.seed,
-                    standardize=args.grpo_std_normalization, quantile=args.quantile_k,
-                )
+                strategy = getattr(args, "curriculum_strategy", "continuous_sec")
+                if strategy == "continuous_sec":
+                    meta_key = SEC_METADATA_KEY
+                    self.curriculum = ContinuousSEC(
+                        [sample.metadata[meta_key] for sample in self.dataset.origin_samples],
+                        config=SECConfig.from_args(args),
+                        seed=self.seed,
+                        standardize=args.grpo_std_normalization,
+                        quantile=args.quantile_k,
+                    )
+                elif strategy == "dare":
+                    meta_key = DARECurriculum.METADATA_KEY
+                    self.curriculum = DARECurriculum(
+                        [sample.metadata[meta_key] for sample in self.dataset.origin_samples],
+                        config=DAREConfig.from_args(args),
+                        seed=self.seed,
+                    )
+                elif strategy == "dots":
+                    meta_key = DOTSCurriculum.METADATA_KEY
+                    self.curriculum = DOTSCurriculum(
+                        [sample.metadata[meta_key] for sample in self.dataset.origin_samples],
+                        config=DOTSConfig.from_args(args),
+                        seed=self.seed,
+                    )
+                else:
+                    raise ValueError(f"Unsupported curriculum_strategy: {strategy!r}")
+                self._curriculum_metadata_key = meta_key
                 self._curriculum_prompts = {
-                    sample.metadata[METADATA_KEY]["question_id"]: sample for sample in self.dataset.origin_samples
+                    sample.metadata[meta_key]["question_id"]: sample for sample in self.dataset.origin_samples
                 }
                 if len(self._curriculum_prompts) < args.rollout_batch_size:
-                    raise ValueError("SEC needs at least rollout_batch_size distinct questions to form a batch")
+                    raise ValueError(f"Curriculum ({strategy}) needs at least rollout_batch_size distinct questions")
                 get_monitor(args).register("curriculum", self.curriculum.metrics)
         else:
             self.dataset = None
@@ -287,7 +311,8 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             ), f"the length of the elements of samples must be equal to n_samples_per_prompt, got {len(samples[i])} != {self.args.n_samples_per_prompt}"
             group = samples[i]  # type: ignore
             if self.curriculum is not None:
-                self.curriculum.reserve(group[0].metadata[METADATA_KEY]["question_id"])
+                meta_key = getattr(self, "_curriculum_metadata_key", SEC_METADATA_KEY)
+                self.curriculum.reserve(group[0].metadata[meta_key]["question_id"])
             self.buffer.append(group)
 
     # TODO remove

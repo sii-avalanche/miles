@@ -131,7 +131,16 @@ async def _generate_rollout_async(
     data = []
     all_data = []
     submitted = {}
-    monitor.update({"batch/active": 1, "batch/ready_groups": 0})
+    if (observer := getattr(state, "curriculum_observer", None)) is not None:
+        curriculum = getattr(observer, "curriculum", None)
+        if curriculum is not None and hasattr(curriculum, "target_replay_count") and hasattr(curriculum, "pop_replay_groups"):
+            replay_budget = curriculum.target_replay_count(target_data_size)
+            if replay_budget > 0:
+                replayed = curriculum.pop_replay_groups(replay_budget, observer.policy_version)
+                if replayed:
+                    data.extend(replayed)
+                    all_data.extend(replayed)
+    monitor.update({"batch/active": 1, "batch/ready_groups": len(data)})
     monitor.register(
         "batch",
         lambda: {
@@ -145,6 +154,8 @@ async def _generate_rollout_async(
     )
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
+    if data:
+        pbar.update(len(data) * args.n_samples_per_prompt)
     while len(data) < target_data_size:
         while scheduler.has_capacity(pending_groups=len(pendings), group_budget=target_data_size - len(data)):
             # get samples from the buffer and submit the generation requests.
