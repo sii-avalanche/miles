@@ -54,7 +54,7 @@ class TestConvertSamplesToTrainData:
             assert key in out, f"missing required key {key}"
         assert len(out["tokens"]) == len(samples)
 
-    def test_turn_weights_use_raw_outcome_before_group_centering(self):
+    def test_turn_weights_preserve_raw_turn_offsets(self):
         args = make_args(advantage_estimator="grpo", rewards_normalization=True, grpo_std_normalization=False)
         samples = [
             make_sample(index=0, reward=0.5, turn_advantage_offsets=[0.15, 0.15, 0.0, -0.2]),
@@ -62,8 +62,8 @@ class TestConvertSamplesToTrainData:
         ]
         out = convert_samples_to_train_data(args, samples, {"prompt_group_sizes": [2]}, None, None)
         assert out["rewards"] == [0.25, -0.25]
-        assert out["turn_advantage_weights"][0] == pytest.approx([0.65, 0.65, 0.5, 0.3])
-        assert out["turn_advantage_weights"][1] == [1.0] * 4
+        assert out["turn_advantage_weights"][0] == pytest.approx([0.15, 0.15, 0.0, -0.2])
+        assert out["turn_advantage_weights"][1] == [0.0] * 4
 
     def test_loss_mask_none_filled_with_ones(self):
         args = make_args(rewards_normalization=False)
