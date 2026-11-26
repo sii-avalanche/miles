@@ -949,6 +949,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--async-data-buffer-sampling-mode",
+                type=str,
+                choices=["fifo", "random"],
+                default="fifo",
+                help=(
+                    "Dequeue order for the built-in fully async finished-group data buffer: "
+                    "fifo (default) consumes oldest groups first; random samples uniformly from "
+                    "buffered groups to reduce average rollout age under backlog."
+                ),
+            )
+            parser.add_argument(
                 "--async-unused-samples-handler",
                 type=str,
                 choices=["retry", "drop"],

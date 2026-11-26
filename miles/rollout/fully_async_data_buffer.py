@@ -9,9 +9,10 @@ Every group-level decision lives here — what to keep, what to hand to
 
 import asyncio
 import logging
+import random
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 
@@ -141,6 +142,10 @@ class DefaultDataBuffer(DataBuffer):
         assert args.async_data_buffer_capacity_factor > 0
         self._capacity = int(args.async_data_buffer_capacity_factor * args.rollout_batch_size)
         assert self._capacity >= 1
+        self._sampling_mode = getattr(args, "async_data_buffer_sampling_mode", "fifo")
+        if self._sampling_mode not in ("fifo", "random"):
+            raise ValueError(f"Unsupported async_data_buffer_sampling_mode: {self._sampling_mode!r}")
+        self._rng = random.Random(getattr(args, "seed", None))
 
         self._unused_handler_fn = input.unused_handler_fn
         self._dynamic_filter = load_function(args.dynamic_sampling_filter_path)
@@ -149,7 +154,7 @@ class DefaultDataBuffer(DataBuffer):
         self._dashboard_enabled = getattr(args, "use_miles_dashboard", False)
         self._trainer_model_id = input.trainer_model_id
         self._published_version: int | None = None
-        self._queued_versions = deque()
+        self._queued_versions: list[tuple[int | None, int]] = []
         self._version_counts = Counter()
         self._mixed_groups = 0
 
@@ -225,9 +230,10 @@ class DefaultDataBuffer(DataBuffer):
             while True:
                 while not self._buffer:
                     await self._cond.wait()
-                entry = self._buffer.pop(0)
+                idx = 0 if self._sampling_mode == "fifo" else self._rng.randrange(len(self._buffer))
+                entry = self._buffer.pop(idx)
                 if self._dashboard_enabled:
-                    version, mixed = self._queued_versions.popleft()
+                    version, mixed = self._queued_versions.pop(idx)
                     self._version_counts[version] -= 1
                     if not self._version_counts[version]:
                         del self._version_counts[version]
