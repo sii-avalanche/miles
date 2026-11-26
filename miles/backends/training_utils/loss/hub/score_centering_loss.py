@@ -2,6 +2,7 @@
 
 from argparse import Namespace
 from collections.abc import Callable
+import math
 
 import torch
 
@@ -154,6 +155,22 @@ def _regularization(
     return loss, metrics
 
 
+def _state_kl(
+    train_head: torch.Tensor,
+    rollout_head: torch.Tensor,
+    head_mask: torch.Tensor,
+    active: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    with torch.no_grad():
+        p = train_head.exp().masked_fill(~head_mask, 0.0)
+        q = rollout_head.exp().masked_fill(~head_mask, 0.0)
+        head_kl = torch.where(head_mask & (q > 0), q * (rollout_head - p.clamp_min(eps).log()), 0.0).sum(-1)
+        q_tail, p_tail = (1 - q.sum(-1)).clamp_min(0.0), (1 - p.sum(-1)).clamp_min(eps)
+        tail_kl = torch.where(q_tail > eps, q_tail * (q_tail.clamp_min(eps).log() - p_tail.log()), 0.0)
+        return torch.where(active, (head_kl + tail_kl).clamp_min(0.0), 0.0)
+
+
 def score_centering_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -175,13 +192,23 @@ def score_centering_loss_function(
     advantages = torch.where(active, torch.cat(batch["advantages"]).detach(), 0.0)
     ids = _local_candidates(args, batch, "rollout_topk_token_ids", logits.device)
     head = _local_candidates(args, batch, "rollout_topk_log_probs", logits.device)
+    head_mask = (ids >= 0) & active.unsqueeze(-1)
+    state_kl = _state_kl(selected[:, 1:].detach(), head.detach(), head_mask, active)
+    state_kl_threshold = getattr(args, "score_centering_state_kl_mask_threshold", None)
+    if state_kl_threshold is not None:
+        if not math.isfinite(state_kl_threshold) or state_kl_threshold < 0:
+            raise ValueError("--score-centering-state-kl-mask-threshold must be finite and non-negative")
+        state_masked = active & (state_kl > state_kl_threshold)
+        advantages = torch.where(state_masked, 0.0, advantages)
+    else:
+        state_masked = torch.zeros_like(active)
     token_loss, metrics = score_centering_loss(
         ScoreCenteringInputs(
             train_log_probs=selected[:, 0],
             train_head_log_probs=selected[:, 1:],
             rollout_log_probs=rollout,
             rollout_head_log_probs=head,
-            head_mask=(ids >= 0) & active.unsqueeze(-1),
+            head_mask=head_mask,
             advantages=advantages,
             mode=args.score_centering_is,
             tis_clip=args.score_centering_tis_clip,
@@ -197,6 +224,8 @@ def score_centering_loss_function(
     )
     loss = loss + pg_loss
     log.update({key: sum_of_sample_mean(value).detach() for key, value in metrics.as_log_dict().items()})
+    log["sc_state_kl"] = sum_of_sample_mean(state_kl).detach()
+    log["sc_state_kl_masked"] = sum_of_sample_mean(state_masked.to(state_kl.dtype)).detach()
     log.update(loss=loss.detach(), pg_loss=pg_loss.detach())
     train_log_probs = torch.where(active, selected[:, 0].detach(), 0.0)
     log["train_rollout_logprob_abs_diff"] = sum_of_sample_mean((train_log_probs - rollout).abs()).detach()
