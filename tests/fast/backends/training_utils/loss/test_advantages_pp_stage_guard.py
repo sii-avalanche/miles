@@ -64,14 +64,21 @@ def test_last_pp_stage_computes_advantages_with_rollout_log_probs() -> None:
     assert rollout_data["advantages"][0].shape == (4,)
 
 
-@pytest.mark.parametrize("grpo_advantage", [0.8, -0.8, 0.0])
-def test_grpo_turn_weights_scale_outcome_advantage(grpo_advantage):
+@pytest.mark.parametrize(
+    ("grpo_advantage", "expected_values"),
+    [
+        (0.8, [1.0, 1.0, 0.8, 0.64]),
+        (-0.8, [-0.6, -0.6, -0.8, -0.96]),
+        (0.0, [0.0, 0.0, 0.0, 0.0]),
+    ],
+)
+def test_grpo_turn_weights_scale_outcome_advantage(grpo_advantage, expected_values):
     make_parallel_state()
     data = _rollout_data("rollout_log_probs", with_values=False)
     data["rewards"] = [grpo_advantage]
-    data["turn_advantage_weights"] = [[0.65, 0.65, 0.5, 0.3]]
+    data["turn_advantage_weights"] = [[0.25, 0.25, 0.0, -0.2]]
     args = make_args(advantage_estimator="grpo", use_rollout_logprobs=True, kl_coef=0.0, normalize_advantages=False)
     compute_advantages_and_returns(args, data)
-    expected = torch.tensor([0.52, 0.52, 0.40, 0.24]) * (grpo_advantage / 0.8)
+    expected = torch.tensor(expected_values)
     torch.testing.assert_close(data["advantages"][0], expected)
     torch.testing.assert_close(data["returns"][0], torch.full_like(expected, grpo_advantage))
