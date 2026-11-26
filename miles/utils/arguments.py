@@ -1734,6 +1734,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
             parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
             parser.add_argument("--score-centering-mis-high", type=float, default=5.0)
+            parser.add_argument("--score-centering-state-kl-mask-threshold", type=float, default=None)
             parser.add_argument(
                 "--kl-loss-type",
                 type=str,

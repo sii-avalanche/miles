@@ -380,3 +380,16 @@ def test_selected_log_probs_gradcheck_and_empty_response() -> None:
     assert result.shape == (0, 3)
     result.sum().backward()
     torch.testing.assert_close(logits.grad, torch.zeros_like(logits))
+
+
+def test_state_kl_helper_matches_head_plus_tail_kl() -> None:
+    from miles.backends.training_utils.loss.hub.score_centering_loss import _state_kl
+
+    q_head = torch.tensor([[0.6, 0.3], [0.8, 0.1]]).log()
+    p_head = torch.tensor([[0.6, 0.3], [0.1, 0.8]]).log()
+    head_mask = torch.ones((2, 2), dtype=torch.bool)
+    active = torch.tensor([True, True])
+    actual = _state_kl(p_head, q_head, head_mask, active)
+    torch.testing.assert_close(actual, torch.tensor([0.0, 0.7 * math.log(8.0)]), atol=1e-5, rtol=1e-5)
+    # Inactive tokens always report 0.0 KL.
+    torch.testing.assert_close(_state_kl(p_head, q_head, head_mask, torch.tensor([True, False])), torch.zeros(2))
